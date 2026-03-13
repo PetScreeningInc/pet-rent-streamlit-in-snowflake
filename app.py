@@ -1795,7 +1795,7 @@ def build_individual_property_charts(
             launch_month = datetime(launch_dt.year, launch_dt.month, 1)
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
-            elif a and a["n_pre"] > 0:
+            elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
                 sign = "+" if a["diff_monthly"] >= 0 else ""
                 color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
                 arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
@@ -1804,6 +1804,8 @@ def build_individual_property_charts(
                     f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
                     f'</span></b>'
                 )
+            elif a and a["n_pre"] > 0 and not a.get("baseline_reliable", True):
+                short += f'  <span style="color:#999;font-size:0.85em">insufficient baseline</span>'
             else:
                 short += f' Launched {launch_dt.strftime("%b %Y")}'
         else:
@@ -2086,7 +2088,8 @@ def generate_html_report(
     # ── KPI summary ───────────────────────────────────────────────────
     comparable = {}
     if launch_analysis:
-        comparable = {p: a for p, a in launch_analysis.items() if a["n_pre"] > 0}
+        comparable = {p: a for p, a in launch_analysis.items()
+                      if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -2103,7 +2106,7 @@ def generate_html_report(
         sorted_la = sorted(launch_analysis.items(), key=lambda x: -x[1].get("diff_monthly", 0))
         for prop, a in sorted_la:
             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-            if a["n_pre"] > 0:
+            if a["n_pre"] > 0 and a.get("baseline_reliable", True):
                 s_m = "+" if a["diff_monthly"] >= 0 else ""
                 s_t = "+" if a["diff_total"] >= 0 else ""
                 color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
@@ -2115,7 +2118,17 @@ def generate_html_report(
                     <td>${a["post_monthly_avg"]:,.0f}</td>
                     <td style="color:{color};font-weight:bold">{s_m}${a["diff_monthly"]:,.0f}/mo</td>
                     <td style="color:{color};font-weight:bold">{s_t}${a["diff_total"]:,.0f}</td>
-                    <td>{a["n_pre"]}mo before · {a["n_post"]}mo after{'' if a.get('baseline_reliable', True) else ' <span style="color:#CF5A3F;font-size:0.8em">(low data)</span>'}</td>
+                    <td>{a["n_pre"]}mo before · {a["n_post"]}mo after</td>
+                </tr>"""
+            elif a["n_pre"] > 0 and not a.get("baseline_reliable", True):
+                impact_rows_html += f"""
+                <tr>
+                    <td>{short}</td>
+                    <td>{a["launch_month"].strftime("%b %Y")}</td>
+                    <td>${a["pre_avg"]:,.0f}</td>
+                    <td>${a["post_monthly_avg"]:,.0f}</td>
+                    <td colspan="2" style="text-align:center;color:#999">Insufficient baseline ({a["n_pre"]}mo)</td>
+                    <td>{a["n_pre"]}mo before · {a["n_post"]}mo after <span style="color:#CF5A3F;font-size:0.8em">(low data)</span></td>
                 </tr>"""
             else:
                 impact_rows_html += f"""
@@ -3519,6 +3532,16 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     pmc_system = st.session_state.get("pmc_system", "yardi")
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have charge data ──────────────
+    # Without this, properties not in the API export (no charges at all)
+    # would have ALL their PetScreening profiles flagged as "missing,"
+    # inflating the count with unknowns.
+    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return pd.DataFrame()
+
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
     # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
@@ -3688,6 +3711,16 @@ def fetch_missing_pet_rent_by_property(
     pmc_system = st.session_state.get("pmc_system", "yardi")
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have charge data ──────────────
+    # Without this, properties not in the API export (no charges at all)
+    # would have ALL their PetScreening profiles flagged as "missing,"
+    # inflating the count with unknowns.
+    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return {}
+
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
     # ── Step 1: From LIVE API data, classify charge codes and compute avg fees ──
@@ -3963,6 +3996,13 @@ def fetch_suspected_undisclosed_by_property(
     pmc_system = st.session_state.get("pmc_system", "yardi")
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have charge data ──────────────
+    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return {}
+
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
     # ── Step 1: Reuse the same charge classification & avg fee logic ──
@@ -5143,7 +5183,8 @@ if st.session_state.all_charges_df is not None:
                 # ═══════════════════════════════════════════════════════════
 
                 if launch_analysis:
-                    comparable = {p: a for p, a in launch_analysis.items() if a["n_pre"] > 0}
+                    comparable = {p: a for p, a in launch_analysis.items()
+                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
                     n_no_pre = len(launch_analysis) - len(comparable)
 
                     if comparable:
@@ -5701,8 +5742,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         for prop, a in launch_analysis.items():
                             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                            # Properties with no pre-launch months can't be compared
-                            has_comparison = a["n_pre"] > 0
+                            # Properties need pre-launch months AND reliable baseline to compare
+                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True)
 
                             if has_comparison:
                                 sign_m = "+" if a["diff_monthly"] >= 0 else ""
@@ -5978,8 +6019,9 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _launch_dates = _cd.get("launch_dates", {})
                 _launch_analysis = compute_launch_analysis(_monthly_by_prop, _months, _launch_dates)
 
-                # Comparable properties (with pre & post data)
-                _comparable = {p: a for p, a in _launch_analysis.items() if a["n_pre"] > 0} if _launch_analysis else {}
+                # Comparable properties (with reliable pre & post data)
+                _comparable = {p: a for p, a in _launch_analysis.items()
+                               if a["n_pre"] > 0 and a.get("baseline_reliable", True)} if _launch_analysis else {}
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 
