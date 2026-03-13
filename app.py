@@ -5027,6 +5027,39 @@ if st.session_state.all_charges_df is not None:
                 window_end = datetime(today.year, today.month, 1)
                 months = [m.to_pydatetime() for m in pd.date_range(start=window_start, end=window_end, freq='MS')]
 
+                # ── Classify charge codes as recurring vs one-time ──────────
+                # Entrata: use explicit `frequency` field when available.
+                # Yardi: infer from median date span per (property, charge_code).
+                #   Median span > 60 days → recurring (charged monthly)
+                #   Median span ≤ 60 days → one-time (deposit/fee)
+                # One-time charges only count in their from_date month.
+                _has_frequency = any('frequency' in rec for rec in cd["parsed_charges"])
+                _code_class = {}  # {(property_name, charge_code): "recurring" | "onetime"}
+
+                # Group records by (property_name, charge_code)
+                _by_prop_code = defaultdict(list)
+                for rec in cd["parsed_charges"]:
+                    key = (rec["property_name"], rec["charge_code"])
+                    _by_prop_code[key].append(rec)
+
+                for (pname, code), recs in _by_prop_code.items():
+                    if _has_frequency:
+                        freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency')]
+                        onetime_count = sum(1 for f in freqs if f == 'one-time')
+                        monthly_count = sum(1 for f in freqs if f in ('monthly', 'recurring'))
+                        _code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
+                    else:
+                        spans = []
+                        for r in recs:
+                            f, t = r.get("from_date"), r.get("_raw_to_date") if "_raw_to_date" in r else r.get("to_date")
+                            if f and t and not pd.isna(f) and not pd.isna(t):
+                                try:
+                                    spans.append((t - f).days)
+                                except (TypeError, AttributeError):
+                                    pass
+                        median_span = float(np.median(spans)) if spans else 0
+                        _code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+
                 # Aggregate charges into monthly buckets
                 monthly_portfolio = defaultdict(float)
                 monthly_portfolio_count = defaultdict(int)
@@ -5042,7 +5075,12 @@ if st.session_state.all_charges_df is not None:
                         continue
 
                     charge_start = datetime(int(from_dt.year), int(from_dt.month), 1)
-                    if to_dt is not None and not pd.isna(to_dt) and isinstance(to_dt, datetime):
+
+                    # One-time charges (deposits/fees): only count in the from_date month
+                    charge_type = _code_class.get((prop, rec.get("charge_code")), "recurring")
+                    if charge_type == "onetime":
+                        charge_end = charge_start
+                    elif to_dt is not None and not pd.isna(to_dt) and isinstance(to_dt, datetime):
                         charge_end = datetime(int(to_dt.year), int(to_dt.month), 1)
                     else:
                         charge_end = window_end
