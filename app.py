@@ -4564,15 +4564,10 @@ with st.sidebar:
         if choice:
             selected_property_id = prop_options[choice]
 
-    st.divider()
-    st.subheader("Display Window")
-    lookback_months = st.slider(
-        "Months of history to display:",
-        min_value=6, max_value=60, value=24, step=6,
-        help="Controls how many months of data are shown on charts. "
-             "The API always fetches the full range so numbers stay consistent "
-             "regardless of this setting.",
-    )
+    # Display window is now derived from the data (no slider).
+    # Set a large default; the actual window will be clamped to the
+    # earliest charge date once data is loaded.
+    lookback_months = 120  # 10 years — effectively "all data"
 
     st.divider()
     fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
@@ -5017,14 +5012,21 @@ if st.session_state.all_charges_df is not None:
                 launch_dates = cd["launch_dates"]
                 label = cd["label"]
 
-                # Build the display window from the LIVE slider (not a stored value)
+                # Build the display window from the actual data range
                 today = datetime.now()
-                lb = lookback_months  # live slider value from sidebar
-                # IMPORTANT: strip time components so month keys are midnight-aligned
-                # (datetime.now() has h/m/s/µs which would poison pd.date_range month keys)
-                window_start = datetime(today.year, today.month, 1) - timedelta(days=lb * 30)
-                window_start = datetime(window_start.year, window_start.month, 1)  # clean midnight
                 window_end = datetime(today.year, today.month, 1)
+
+                # Find the earliest charge date in the data
+                _earliest = None
+                for rec in cd["parsed_charges"]:
+                    fd = rec.get("from_date")
+                    if fd is not None and not pd.isna(fd):
+                        fd_clean = datetime(int(fd.year), int(fd.month), 1)
+                        if _earliest is None or fd_clean < _earliest:
+                            _earliest = fd_clean
+                window_start = _earliest if _earliest else datetime(today.year - 5, today.month, 1)
+                # IMPORTANT: strip time components so month keys are midnight-aligned
+                window_start = datetime(window_start.year, window_start.month, 1)
                 months = [m.to_pydatetime() for m in pd.date_range(start=window_start, end=window_end, freq='MS')]
 
                 # ── Classify charge codes as recurring vs one-time ──────────
@@ -6028,11 +6030,41 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 # ── Rebuild the same aggregates used in the charts tab ──
                 _today = datetime.now()
-                _lb = lookback_months
-                _ws = datetime(_today.year, _today.month, 1) - timedelta(days=_lb * 30)
-                _ws = datetime(_ws.year, _ws.month, 1)
                 _we = datetime(_today.year, _today.month, 1)
+                # Derive window from data (same as charts tab)
+                _earliest = None
+                for rec in _cd["parsed_charges"]:
+                    fd = rec.get("from_date")
+                    if fd is not None and not pd.isna(fd):
+                        fd_clean = datetime(int(fd.year), int(fd.month), 1)
+                        if _earliest is None or fd_clean < _earliest:
+                            _earliest = fd_clean
+                _ws = _earliest if _earliest else datetime(_today.year - 5, _today.month, 1)
+                _ws = datetime(_ws.year, _ws.month, 1)
                 _months = [m.to_pydatetime() for m in pd.date_range(start=_ws, end=_we, freq='MS')]
+
+                # Classify charge codes (same logic as charts tab)
+                _has_freq2 = any('frequency' in rec for rec in _cd["parsed_charges"])
+                _cc2 = {}
+                _by_pc2 = defaultdict(list)
+                for rec in _cd["parsed_charges"]:
+                    _by_pc2[(rec["property_name"], rec["charge_code"])].append(rec)
+                for (pn, cc), recs in _by_pc2.items():
+                    if _has_freq2:
+                        freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency')]
+                        ot = sum(1 for f in freqs if f == 'one-time')
+                        mo = sum(1 for f in freqs if f in ('monthly', 'recurring'))
+                        _cc2[(pn, cc)] = "onetime" if ot > mo else "recurring"
+                    else:
+                        spans = []
+                        for r in recs:
+                            f, t = r.get("from_date"), r.get("_raw_to_date") if "_raw_to_date" in r else r.get("to_date")
+                            if f and t and not pd.isna(f) and not pd.isna(t):
+                                try:
+                                    spans.append((t - f).days)
+                                except (TypeError, AttributeError):
+                                    pass
+                        _cc2[(pn, cc)] = "recurring" if (float(np.median(spans)) if spans else 0) > 60 else "onetime"
 
                 _monthly_portfolio = defaultdict(float)
                 _monthly_by_prop = defaultdict(lambda: defaultdict(float))
@@ -6044,7 +6076,10 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     if from_dt is None or pd.isna(from_dt) or amt <= 0:
                         continue
                     cs = datetime(int(from_dt.year), int(from_dt.month), 1)
-                    if to_dt is not None and not pd.isna(to_dt) and isinstance(to_dt, datetime):
+                    _ct2 = _cc2.get((prop, rec.get("charge_code")), "recurring")
+                    if _ct2 == "onetime":
+                        ce = cs
+                    elif to_dt is not None and not pd.isna(to_dt) and isinstance(to_dt, datetime):
                         ce = datetime(int(to_dt.year), int(to_dt.month), 1)
                     else:
                         ce = _we
