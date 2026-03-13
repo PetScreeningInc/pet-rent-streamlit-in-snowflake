@@ -4719,6 +4719,142 @@ if st.session_state.all_charges_df is not None:
     else:
         st.divider()
 
+        # ─── Raw Data Exports (for Snowflake validation) ─────────────
+        with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
+            st.markdown(
+                "Download the raw data that the app uses so you can upload it to "
+                "Snowflake and independently recreate/validate the numbers with SQL."
+            )
+
+            pmc_sys = st.session_state.get("pmc_system", "yardi")
+            props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
+            exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
+
+            with exp_c1:
+                st.markdown("**1. All API Charges**")
+                st.caption("Every charge line from the API (all tenants, all codes). This is the full rent roll.")
+                st.download_button(
+                    "Download all_charges.csv",
+                    data=df.to_csv(index=False),
+                    file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    key="dl_all_charges",
+                )
+
+            with exp_c2:
+                st.markdown("**2. Pet Charges Only**")
+                st.caption("Filtered to your selected pet charge codes only.")
+                _pet_only = df[df['charge_code'].isin(selected_codes)]
+                st.download_button(
+                    "Download pet_charges.csv",
+                    data=_pet_only.to_csv(index=False),
+                    file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    key="dl_pet_charges",
+                )
+
+            with exp_c3:
+                st.markdown("**3. Paying Tenant Sets**")
+                st.caption("Every (property_id, tenant_code) and (property_id, email) pair identified as paying after unit/lease expansion.")
+                _pay_tc, _pay_em = _build_paying_sets(df, selected_codes)
+                _pay_tc_df = pd.DataFrame(list(_pay_tc), columns=["property_id", "tenant_code"])
+                _pay_em_df = pd.DataFrame(list(_pay_em), columns=["property_id", "email"])
+                _pay_combined = pd.concat([
+                    _pay_tc_df.assign(match_type="tenant_code", match_key=_pay_tc_df["tenant_code"]).drop(columns=["tenant_code"]),
+                    _pay_em_df.assign(match_type="email", match_key=_pay_em_df["email"]).drop(columns=["email"]),
+                ], ignore_index=True)
+                st.download_button(
+                    "Download paying_tenants.csv",
+                    data=_pay_combined.to_csv(index=False),
+                    file_name=f"paying_tenants_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    key="dl_paying_sets",
+                )
+
+            with exp_c4:
+                st.markdown("**4. PS Profiles + Paying Flag**")
+                st.caption("PetScreening profiles from Snowflake with the paying flag applied — the raw join result before final filtering.")
+                if st.button("Generate Profiles Export", key="gen_profiles_export"):
+                    with st.spinner("Querying Snowflake for profiles..."):
+                        _conn = get_snowflake_connection()
+                        _cur = _conn.cursor(snowflake.connector.DictCursor)
+                        _sql = f"""
+                        SELECT DISTINCT
+                            du.property_id,
+                            p.property_name,
+                            COALESCE(
+                                l.lease_source_external_id:tenant_code::STRING,
+                                l.lease_source_external_id:"customerId"::STRING,
+                                l.lease_source_external_id:"customer_id"::STRING
+                            ) AS tenant_code,
+                            ue.user_email,
+                            ue.user_first_name,
+                            ue.user_last_name,
+                            ue.compliance_status,
+                            ue.user_pet_type,
+                            ue.user_pet_status,
+                            ue.user_profile_url
+                        FROM PROD.common.d_units du
+                        JOIN PROD.common.d_properties p ON du.property_id = p.property_id
+                        JOIN PROD.petscreening.petscreening__user_enriched ue ON ue.unit_id = du.unit_id
+                        JOIN PROD.common.f_leases l ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+                        WHERE du.unit_source = '{pmc_sys}'
+                          AND du.property_id IN ({props_str_export})
+                          AND ue.compliance_status = 'compliant'
+                          AND ue.user_pet_type = 'household'
+                          AND ue.user_pet_status = 'active'
+                          AND ue.user_email IS NOT NULL
+                          AND TRIM(ue.user_email) <> ''
+                          AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+                        """
+                        _cur.execute(_sql)
+                        _profiles = pd.DataFrame(_cur.fetchall())
+                        if not _profiles.empty:
+                            _profiles = _apply_paying_flag(_profiles, _pay_tc, _pay_em)
+                            st.session_state["_export_profiles_df"] = _profiles
+                            st.success(f"Loaded {len(_profiles):,} profiles. {(_profiles['pet_rent_paid'] == 1).sum():,} paying, {(_profiles['pet_rent_paid'] == 0).sum():,} not paying.")
+                        else:
+                            st.warning("No profiles found.")
+
+                if "_export_profiles_df" in st.session_state and st.session_state["_export_profiles_df"] is not None:
+                    _prof_df = st.session_state["_export_profiles_df"]
+                    st.download_button(
+                        "Download profiles_with_flag.csv",
+                        data=_prof_df.to_csv(index=False),
+                        file_name=f"profiles_with_paying_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        key="dl_profiles_flag",
+                    )
+
+            st.divider()
+            st.markdown("##### Snowflake Upload Instructions")
+            st.code(
+                "-- 1. Create a stage and file format\n"
+                "CREATE OR REPLACE FILE FORMAT my_csv_format TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '\"' SKIP_HEADER = 1;\n"
+                "CREATE OR REPLACE STAGE my_validation_stage FILE_FORMAT = my_csv_format;\n\n"
+                "-- 2. Upload via SnowSQL or Snowsight UI\n"
+                "PUT file:///path/to/all_charges_*.csv @my_validation_stage;\n\n"
+                "-- 3. Create table and load\n"
+                "CREATE OR REPLACE TABLE sandbox.validation.api_charges AS\n"
+                "SELECT $1 as parent_company, $2 as property_id, $3 as property_name,\n"
+                "       $4 as property_code, $5 as launch_date, $6 as unit_code,\n"
+                "       $7 as unit_type, $8 as market_rent, $9 as tenant_code,\n"
+                "       $10 as first_name, $11 as last_name, $12 as tenant_status,\n"
+                "       $13 as lease_from, $14 as lease_to, $15 as move_in,\n"
+                "       $16 as move_out, $17 as email, $18 as charge_code,\n"
+                "       $19 as charge_type, $20 as charge_amount,\n"
+                "       $21 as charge_from_date, $22 as charge_to_date\n"
+                "FROM @my_validation_stage/all_charges_*.csv;\n\n"
+                "-- 4. Validate: count pet charges\n"
+                "SELECT charge_code, COUNT(*) as cnt, SUM(charge_amount::float) as total\n"
+                "FROM sandbox.validation.api_charges\n"
+                "WHERE charge_code ILIKE '%pet%'\n"
+                "GROUP BY 1 ORDER BY 2 DESC;",
+                language="sql",
+            )
+
+        st.divider()
+
         # ═══════════════════════════════════════════════════════════════
         # TABS: Charts  |  Missing Pet Rent Report
         # ═══════════════════════════════════════════════════════════════
