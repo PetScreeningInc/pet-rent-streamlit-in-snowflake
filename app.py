@@ -5,6 +5,7 @@ pet/fee collection over time per property and parent company.
 """
 
 import os
+import io
 import json
 import xml.etree.ElementTree as ET
 import urllib.parse
@@ -2770,6 +2771,234 @@ window.addEventListener('resize', resizePlotlyCharts);
 </body>
 </html>"""
     return html
+
+
+def generate_tranche_pdf(
+    label, today_str, pre_baseline, comparable_count,
+    t1_mo, t1_total, t1_pct, t1_months,
+    t2_tenants, t2_mo, t2_props, t1_t2_combined, t1_t2_pct,
+    t3_adoption, t3_additional, t3_total_impact, t3_pct,
+    adopt_type_label, current_monthly_rev,
+    n_props_total, n_with_launch, n_props_with_data,
+    include_pm=False, pm_rows=None,
+):
+    """Generate a branded PDF of the tranche-based impact analysis.
+
+    Returns PDF bytes ready for st.download_button.
+    """
+    from fpdf import FPDF
+
+    class PDF(FPDF):
+        def header(self):
+            self.set_fill_color(31, 34, 87)  # #1F2257
+            self.rect(0, 0, 210, 32, 'F')
+            self.set_font('Helvetica', 'B', 16)
+            self.set_text_color(226, 171, 88)  # #E2AB58
+            self.set_xy(15, 8)
+            self.cell(0, 8, 'PetScreening Impact Analysis', ln=True)
+            self.set_font('Helvetica', '', 10)
+            self.set_text_color(218, 235, 245)  # #DAEBF5
+            self.set_xy(15, 18)
+            self.cell(0, 6, f'{label}  |  {today_str}', ln=True)
+            self.ln(12)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(150, 150, 150)
+            self.cell(0, 10, f'PetScreening Impact Analysis  |  {label}  |  Page {self.page_no()}', align='C')
+
+    pdf = PDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    # Colors
+    dark_blue = (31, 34, 87)
+    green = (103, 120, 72)
+    orange = (221, 123, 69)
+    warm = (177, 116, 85)
+    body_gray = (79, 81, 85)
+    light_gray = (99, 101, 105)
+
+    def section_header(title, subtitle, color):
+        pdf.set_font('Helvetica', 'B', 14)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 8, title, ln=True)
+        pdf.set_font('Helvetica', '', 9)
+        pdf.set_text_color(*color)
+        pdf.cell(0, 5, subtitle.upper(), ln=True)
+        pdf.ln(3)
+
+    def body_text(text):
+        pdf.set_font('Helvetica', '', 10)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(0, 5.5, text)
+        pdf.ln(2)
+
+    def footnote(text):
+        pdf.set_font('Helvetica', 'I', 8)
+        pdf.set_text_color(*light_gray)
+        pdf.multi_cell(0, 4.5, text)
+        pdf.ln(1)
+
+    def divider():
+        pdf.set_draw_color(232, 228, 218)
+        y = pdf.get_y()
+        pdf.line(15, y, 195, y)
+        pdf.ln(6)
+
+    # ── Tranche 1 ──
+    if comparable_count > 0 and t1_mo != 0:
+        section_header("Value Already Created", "What PetScreening has already delivered", green)
+        pct_str = f" - a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
+        body_text(
+            f"PetScreening has generated an incremental ${t1_mo:,.0f}/month in pet fee revenue "
+            f"above your pre-launch baseline{pct_str} that is already flowing through your books."
+        )
+        body_text(
+            f"Across {t1_months} months, this has compounded to ${t1_total:,.0f} in cumulative "
+            f"revenue that would not have existed without the program."
+        )
+        footnote(
+            f"Based on {comparable_count} properties with reliable pre-launch baselines. "
+            f"Pre-PS baseline: ${pre_baseline:,.0f}/mo."
+        )
+    else:
+        section_header("Value Already Created", "What PetScreening has already delivered", light_gray)
+        body_text("Revenue lift data not yet available. Ensure properties have pre-launch charge data.")
+
+    divider()
+
+    # ── Tranche 2 ──
+    if t2_tenants > 0:
+        section_header("Money on the Table", "Revenue you've already earned but aren't collecting", orange)
+        body_text(
+            f"Right now, {t2_tenants:,} tenants have completed a PetScreening household profile "
+            f"- meaning they have declared a pet and gone through the screening process - "
+            f"but are not being charged pet rent."
+        )
+        body_text(
+            "This is not an adoption problem or a policy problem. These residents have already "
+            "raised their hand. Closing this gap is a billing correction, not a sales effort."
+        )
+        body_text(f"That's ${t2_mo:,.0f}/month sitting uncollected, across {t2_props} of your properties.")
+        if comparable_count > 0 and t1_mo > 0 and t2_mo > 0:
+            pct_str = f" - a {t1_t2_pct:.1f}% lift over your pre-PS baseline" if t1_t2_pct > 0 else ""
+            body_text(
+                f"Combined with the value already created, your hard dollar impact reaches "
+                f"${t1_t2_combined:,.0f}/month{pct_str}."
+            )
+    else:
+        section_header("Money on the Table", "Revenue you've already earned but aren't collecting", light_gray)
+        body_text("Enable 'Show uncollected pet rent' on the Charts tab to populate this section.")
+
+    divider()
+
+    # ── Tranche 3 ──
+    if t3_adoption is not None and t3_additional > 0:
+        section_header("The Extrapolated Potential", "What full program execution is worth", warm)
+        body_text(
+            f"Your portfolio is currently running at {t3_adoption:.1f}% {adopt_type_label.lower()} "
+            f"adoption. Closing that gap to 100% - through consistent screening enforcement at "
+            f"move-in and renewal - unlocks an additional ${t3_additional:,.0f}/month."
+        )
+        body_text(
+            f"This projection is linear and assumes the remaining {adopt_type_label.lower()}s "
+            f"perform similarly to those already enrolled, so treat it as a ceiling rather than "
+            f"a guarantee."
+        )
+        if pre_baseline > 0 and t3_total_impact > 0:
+            pct_str = f" - a {t3_pct:.1f}% increase over your pre-PS baseline of ${pre_baseline:,.0f}" if t3_pct > 0 else ""
+            body_text(
+                f"If captured, total attributable PetScreening impact reaches "
+                f"${t3_total_impact:,.0f}/month{pct_str}."
+            )
+    else:
+        section_header("The Extrapolated Potential", "What full program execution is worth", light_gray)
+        body_text("Enable the adoption overlay on the Charts tab to see the 100% projection.")
+
+    divider()
+
+    # ── The Arc ──
+    pdf.set_fill_color(249, 244, 230)
+    pdf.set_draw_color(226, 171, 88)
+    y = pdf.get_y()
+    pdf.rect(15, y, 180, 22, 'DF')
+    pdf.set_xy(18, y + 4)
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(*body_gray)
+    pdf.multi_cell(174, 5,
+        "The arc is simple: Tranche 1 was built for you. Tranche 2 requires a billing audit. "
+        "Tranche 3 requires operational discipline. The infrastructure is already in place for all three."
+    )
+    pdf.ln(8)
+
+    # ── Key Metrics Table ──
+    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_text_color(*dark_blue)
+    pdf.cell(0, 8, 'Key Metrics', ln=True)
+    pdf.ln(2)
+
+    metrics = []
+    metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo"))
+    metrics.append(("Current Monthly Revenue", f"${current_monthly_rev:,.0f}/mo"))
+    if comparable_count > 0:
+        metrics.append(("Tranche 1: Monthly Lift", f"+${t1_mo:,.0f}/mo"))
+        metrics.append(("Tranche 1: Cumulative", f"${t1_total:,.0f}"))
+    if t2_tenants > 0:
+        metrics.append(("Tranche 2: Tenants Not Paying", f"{t2_tenants:,}"))
+        metrics.append(("Tranche 2: Uncollected", f"${t2_mo:,.0f}/mo"))
+    if t3_adoption is not None:
+        metrics.append((f"Tranche 3: {adopt_type_label} Adoption", f"{t3_adoption:.1f}%"))
+    if t3_additional > 0:
+        metrics.append(("Tranche 3: Additional Opportunity", f"+${t3_additional:,.0f}/mo"))
+    metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}"))
+    metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}"))
+
+    pdf.set_font('Helvetica', '', 9)
+    for label_m, value_m in metrics:
+        pdf.set_text_color(*body_gray)
+        pdf.cell(95, 6, label_m)
+        pdf.set_text_color(*dark_blue)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(0, 6, value_m, ln=True)
+        pdf.set_font('Helvetica', '', 9)
+
+    # ── Property Managers (optional) ──
+    if include_pm and pm_rows and len(pm_rows) > 0:
+        pdf.ln(6)
+        divider()
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 8, 'Property Managers', ln=True)
+        pdf.ln(2)
+
+        _pm_by_prop = defaultdict(set)
+        for r in pm_rows:
+            pname = r.get('PROPERTY_NAME', 'Unknown')
+            email = r.get('PM_EMAIL', '')
+            if email and email.strip():
+                short = pname.split(" - ", 1)[-1] if " - " in pname else pname
+                _pm_by_prop[short].add(email)
+
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_fill_color(240, 238, 232)
+        pdf.cell(90, 6, 'Property', border=1, fill=True)
+        pdf.cell(90, 6, 'Property Manager(s)', border=1, fill=True, ln=True)
+
+        pdf.set_font('Helvetica', '', 8)
+        pdf.set_text_color(*body_gray)
+        for pname in sorted(_pm_by_prop.keys()):
+            emails = sorted(_pm_by_prop[pname])
+            pdf.cell(90, 5, pname[:45], border='LR')
+            pdf.cell(90, 5, ", ".join(emails)[:80], border='LR', ln=True)
+        # Close table bottom
+        pdf.cell(180, 0, '', border='T', ln=True)
+
+    # Return bytes
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
 
 
 def generate_exec_summary_html(
@@ -6608,96 +6837,120 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                 _render_table(pd.DataFrame(_pm_table_rows))
 
                 # ═══════════════════════════════════════════════════════════════
-                #  DOWNLOAD EXECUTIVE SUMMARY (separate report — may contain PII)
+                #  DOWNLOAD IMPACT ANALYSIS
                 # ═══════════════════════════════════════════════════════════════
 
                 st.markdown("---")
                 st.markdown(
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
-                    'color:#1F2257;margin:0 0 4px 0">Download Executive Summary</p>'
+                    'color:#1F2257;margin:0 0 4px 0">Download Impact Analysis</p>'
                     '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                    'margin:0 0 16px 0">A self-contained HTML page with the KPIs above, narrative, '
-                    'and the email-all-PMs button. Share with internal stakeholders. '
-                    '<b>Note:</b> If property manager emails have been loaded, they are included.</p>',
+                    'margin:0 0 16px 0">Generate a branded report to share with stakeholders.</p>',
                     unsafe_allow_html=True,
                 )
 
-                _exec_col1, _exec_col2 = st.columns([1, 1])
+                _include_pm_in_report = False
+                _pm_cache = st.session_state.get("pm_emails_cache")
+                if _pm_cache and len(_pm_cache) > 0:
+                    _include_pm_in_report = st.checkbox(
+                        "Include property manager emails in report",
+                        value=False,
+                        key="include_pm_report",
+                    )
+
+                _exec_col1, _exec_col2, _exec_col3 = st.columns(3)
+
+                # ── Generate button ──
                 with _exec_col1:
-                    if st.button("Generate Executive Summary", use_container_width=True,
+                    if st.button("Generate Report", use_container_width=True,
                                  key="gen_exec_btn",
-                                 help="Build a branded HTML summary page with KPIs, story, and PM emails"):
-                        # Build the email content (same as above) for inclusion
+                                 help="Build branded PDF and HTML reports"):
+                        _pm_for_report = _pm_cache if _include_pm_in_report else None
+
+                        # Generate PDF
+                        pdf_bytes = generate_tranche_pdf(
+                            label=_label,
+                            today_str=_today_str,
+                            pre_baseline=_pre_baseline_total,
+                            comparable_count=len(_comparable),
+                            t1_mo=_t1_mo, t1_total=_t1_total, t1_pct=_t1_pct, t1_months=_t1_months,
+                            t2_tenants=_t2_tenants, t2_mo=_t2_mo, t2_props=_t2_props,
+                            t1_t2_combined=_t1_t2_combined, t1_t2_pct=_t1_t2_pct,
+                            t3_adoption=_t3_adoption, t3_additional=_t3_additional,
+                            t3_total_impact=_t3_total_impact, t3_pct=_t3_pct,
+                            adopt_type_label=_adopt_type_label,
+                            current_monthly_rev=_current_monthly_rev,
+                            n_props_total=n_props_total,
+                            n_with_launch=n_with_launch,
+                            n_props_with_data=n_props_with_data,
+                            include_pm=_include_pm_in_report,
+                            pm_rows=_pm_for_report,
+                        )
+                        st.session_state["exec_pdf"] = pdf_bytes
+
+                        # Generate HTML (existing)
                         _exec_email_subject = f"PetScreening Compliance Reminder — {_label}"
                         _exec_email_body_parts = [
-                            "Hi team,",
-                            "",
+                            "Hi team,", "",
                             "Quick reminder: all new leases and lease renewals require a completed PetScreening profile before move-in.",
-                            "",
-                            "This ensures we're capturing pet fee revenue for every pet-owning resident.",
+                            "", "This ensures we're capturing pet fee revenue for every pet-owning resident.",
                         ]
                         if _comparable and _agg_diff_mo > 0:
-                            _exec_email_body_parts.append(
-                                f"Properties with high PetScreening adoption are seeing +${_agg_diff_mo:,.0f}/mo more in pet fee revenue."
-                            )
+                            _exec_email_body_parts.append(f"Properties with high PetScreening adoption are seeing +${_agg_diff_mo:,.0f}/mo more in pet fee revenue.")
                         if _avg_adoption is not None:
                             _exec_email_body_parts.append(f"Current portfolio adoption: {_avg_adoption:.1f}%")
                         if _mr_total_profiles > 0 and _mr_current_mo > 0:
-                            _exec_email_body_parts.append(
-                                f"We've identified {_mr_total_profiles} tenants with completed PetScreening screening who aren't being charged pet rent "
-                                f"(~${_mr_current_mo:,.0f}/mo in uncollected revenue)."
-                            )
-                        _exec_email_body_parts += [
-                            "",
-                            "Please ensure your teams are following up with all new and renewing residents.",
-                            "",
-                            "If you have questions about the PetScreening process, please reach out.",
-                            "",
-                            "Thank you!",
-                        ]
+                            _exec_email_body_parts.append(f"We've identified {_mr_total_profiles} tenants with completed PetScreening screening who aren't being charged pet rent (~${_mr_current_mo:,.0f}/mo in uncollected revenue).")
+                        _exec_email_body_parts += ["", "Please ensure your teams are following up with all new and renewing residents.", "", "Thank you!"]
                         _exec_email_body = "\n".join(_exec_email_body_parts)
 
                         exec_html = generate_exec_summary_html(
-                            label=_label,
-                            rev_change_mo=_agg_diff_mo,
-                            rev_change_total=_agg_diff,
-                            avg_adoption=_avg_adoption,
-                            adopt_type_label=_adopt_type_label,
-                            total_projected=_total_projected,
-                            total_additional=_total_additional,
-                            n_proj_props=_n_proj_props,
-                            mr_total_profiles=_mr_total_profiles,
-                            mr_current_mo=_mr_current_mo,
-                            comparable_count=len(_comparable),
-                            current_monthly_rev=_current_monthly_rev,
-                            n_props_total=n_props_total,
-                            n_with_launch=len(_launch_in_data_wn),
-                            quick_rows=_quick_rows,
-                            pm_rows=st.session_state.get("pm_emails_cache"),
-                            email_subject=_exec_email_subject,
-                            email_body=_exec_email_body,
-                            su_total_profiles=_su_total_profiles,
-                            su_current_mo=_su_current_mo,
+                            label=_label, rev_change_mo=_agg_diff_mo, rev_change_total=_agg_diff,
+                            avg_adoption=_avg_adoption, adopt_type_label=_adopt_type_label,
+                            total_projected=_total_projected, total_additional=_total_additional,
+                            n_proj_props=_n_proj_props, mr_total_profiles=_mr_total_profiles,
+                            mr_current_mo=_mr_current_mo, comparable_count=len(_comparable),
+                            current_monthly_rev=_current_monthly_rev, n_props_total=n_props_total,
+                            n_with_launch=len(_launch_in_data_wn), quick_rows=_quick_rows,
+                            pm_rows=_pm_for_report,
+                            email_subject=_exec_email_subject, email_body=_exec_email_body,
+                            su_total_profiles=_su_total_profiles, su_current_mo=_su_current_mo,
                         )
                         st.session_state["exec_html"] = exec_html
                         st.session_state["exec_label"] = _label
-                        st.toast("Executive summary ready!")
+                        st.toast("Reports ready for download!")
 
+                # ── PDF download ──
                 with _exec_col2:
-                    if "exec_html" in st.session_state and st.session_state["exec_html"]:
-                        safe_name = st.session_state.get("exec_label", "summary").replace(" ", "_").replace("/", "-")
+                    if "exec_pdf" in st.session_state and st.session_state["exec_pdf"]:
+                        safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
                         st.download_button(
-                            label="Download Executive Summary",
-                            data=st.session_state["exec_html"],
-                            file_name=f"PetScreening_ExecSummary_{safe_name}_{datetime.now().strftime('%Y%m%d')}.html",
-                            mime="text/html",
+                            label="Download PDF",
+                            data=st.session_state["exec_pdf"],
+                            file_name=f"PetScreening_Impact_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            mime="application/pdf",
                             use_container_width=True,
-                            key="dl_exec_btn",
+                            key="dl_exec_pdf",
                         )
                     else:
-                        st.button("Download Executive Summary", disabled=True,
-                                  use_container_width=True, key="dl_exec_disabled",
-                                  help="Click 'Generate Executive Summary' first")
+                        st.button("Download PDF", disabled=True,
+                                  use_container_width=True, key="dl_pdf_disabled")
+
+                # ── HTML download ──
+                with _exec_col3:
+                    if "exec_html" in st.session_state and st.session_state["exec_html"]:
+                        safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
+                        st.download_button(
+                            label="Download HTML",
+                            data=st.session_state["exec_html"],
+                            file_name=f"PetScreening_Impact_{safe_name}_{datetime.now().strftime('%Y%m%d')}.html",
+                            mime="text/html",
+                            use_container_width=True,
+                            key="dl_exec_html",
+                        )
+                    else:
+                        st.button("Download HTML", disabled=True,
+                                  use_container_width=True, key="dl_html_disabled")
 
                 # ── Tip: enable uncollected pet rent ──
                 if _mr_total_profiles == 0:
