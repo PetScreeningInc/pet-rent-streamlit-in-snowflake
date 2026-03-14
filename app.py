@@ -592,6 +592,50 @@ def _render_table(df, height=None, hide_index=True):
     )
 
 
+# ─── Property Funnel — consistent cascade across all tabs ────────────
+def _render_property_funnel(
+    n_total=None,
+    n_api=None,
+    n_with_charges=None,
+    n_with_adoption=None,
+    n_comparable=None,
+    n_with_launch=None,
+):
+    """Render a one-line property cascade/funnel showing the filtering steps.
+
+    Shows the chain:  Total → API access → Charge data → [Adoption data] → [Comparable]
+    Each step only appears if its count is provided.
+    """
+    steps = []
+    if n_total is not None:
+        steps.append(f"<strong>{n_total}</strong> total")
+    if n_api is not None:
+        steps.append(f"<strong>{n_api}</strong> with API")
+    if n_with_charges is not None:
+        steps.append(f"<strong>{n_with_charges}</strong> with charge data")
+    if n_with_launch is not None:
+        steps.append(f"<strong>{n_with_launch}</strong> with launch date")
+    if n_with_adoption is not None:
+        steps.append(f"<strong>{n_with_adoption}</strong> with adoption data")
+    if n_comparable is not None:
+        steps.append(f"<strong>{n_comparable}</strong> comparable")
+
+    if not steps:
+        return
+
+    chain = ' <span style="color:#B17455;font-weight:600">→</span> '.join(steps)
+    st.markdown(
+        f'<div style="background:#F9F4E6;border:1px solid #E8E4DA;border-radius:8px;'
+        f'padding:10px 16px;margin-bottom:16px;font-family:Poppins,Arial,sans-serif;'
+        f'font-size:13px;color:#4F5155">'
+        f'<span style="color:#636569;font-size:11px;text-transform:uppercase;'
+        f'letter-spacing:0.5px;font-weight:600">Properties: </span>'
+        f'{chain}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ─── Snowflake connection (cached, with auto-reconnect) ─────────────
 @st.cache_resource
 def _create_snowflake_connection():
@@ -4812,6 +4856,10 @@ if "selection_label" not in st.session_state:
     st.session_state.selection_label = ""
 if "property_ids" not in st.session_state:
     st.session_state.property_ids = []
+if "total_parent_props" not in st.session_state:
+    st.session_state.total_parent_props = 0
+if "api_props_count" not in st.session_state:
+    st.session_state.api_props_count = 0
 if "chart_data" not in st.session_state:
     st.session_state.chart_data = None
 
@@ -4868,6 +4916,8 @@ if fetch_btn:
                         break
 
             api_count = len(properties)
+            st.session_state.total_parent_props = total_count if total_count else api_count
+            st.session_state.api_props_count = api_count
             if total_count and total_count > api_count:
                 st.info(
                     f"**{label}** has **{total_count}** total properties in `d_properties`.  \n"
@@ -5333,6 +5383,20 @@ if st.session_state.all_charges_df is not None:
                 st.header("Fee Collection Analysis")
 
                 latest_month = months[-1]
+
+                # ── Property funnel — consistent cascade ──────────────
+                _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
+                _funnel_comparable = {
+                    p: a for p, a in launch_analysis.items()
+                    if a["n_pre"] > 0 and a.get("baseline_reliable", True)
+                } if launch_analysis else {}
+                _render_property_funnel(
+                    n_total=st.session_state.get("total_parent_props") or None,
+                    n_api=st.session_state.get("api_props_count") or None,
+                    n_with_charges=len(monthly_by_prop),
+                    n_with_launch=len(_launch_in_data_funnel),
+                    n_comparable=len(_funnel_comparable),
+                )
 
                 # Compute a SINGLE sort order (by total revenue, descending)
                 # shared across Fee Revenue, Unit Adoption, and Resident Adoption
@@ -6459,6 +6523,16 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     unsafe_allow_html=True,
                 )
 
+                # ── Property funnel — consistent cascade ──────────────
+                _render_property_funnel(
+                    n_total=st.session_state.get("total_parent_props") or None,
+                    n_api=st.session_state.get("api_props_count") or None,
+                    n_with_charges=n_props_with_data,
+                    n_with_launch=n_with_launch,
+                    n_with_adoption=_n_proj_props if _n_proj_props > 0 else None,
+                    n_comparable=len(_comparable) if _comparable else None,
+                )
+
                 # ── Shared styles ──
                 _tranche_header = (
                     "font-family:Lora,Georgia,serif;font-size:18px;font-weight:700;"
@@ -6967,6 +7041,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
         # ─── TAB 3: Missing Pet Rent Report ─────────────────────────
         with tab_report:
             st.header("Missing Pet Rent Report")
+
+            # ── Property funnel — consistent cascade ──────────────
+            _report_n_charges = len(st.session_state.get("chart_data", {}).get("parsed_charges", []))
+            _report_n_with_charges = len(set(
+                r["property_name"] for r in (st.session_state.get("chart_data") or {}).get("parsed_charges", [])
+                if r.get("amount", 0) > 0
+            )) if _report_n_charges > 0 else None
+            _render_property_funnel(
+                n_total=st.session_state.get("total_parent_props") or None,
+                n_api=st.session_state.get("api_props_count") or None,
+                n_with_charges=_report_n_with_charges,
+            )
+
             st.markdown(
                 """
                 This report identifies **current tenants** who have an **active household pet** screening
