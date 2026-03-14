@@ -2094,7 +2094,7 @@ def generate_html_report(
     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
     n_with_launch = len(_launch_in_data)
-    n_props_total = len(monthly_by_prop)
+    n_props_total = total_properties_fetched if total_properties_fetched else len(monthly_by_prop)
     n_comparable = len(comparable)
 
     sign_mo = "+" if agg_diff_mo >= 0 else ""
@@ -5268,9 +5268,10 @@ if st.session_state.all_charges_df is not None:
                     if n_no_launch:
                         launch_detail += f"\n{n_no_launch} no launch date"
 
+                    _total_props = len(st.session_state.get("property_ids", []))
                     lcol3.metric(
                         "Launch Dates",
-                        f"{n_with_launch} of {len(monthly_by_prop)} properties",
+                        f"{n_with_launch} of {_total_props} properties",
                         help=launch_detail,
                     )
 
