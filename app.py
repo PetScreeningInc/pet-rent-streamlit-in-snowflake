@@ -3792,7 +3792,7 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     Generate the 'Missing Pet Rent' report using LIVE API rent roll data.
 
     Uses the **same** profile identification as fetch_missing_pet_rent_by_property
-    so that counts match across all tabs (Charts, What's Next, Report).
+    so that counts match across all tabs (Charts, Summary, Report).
 
     Flow:
       1. Live API data → identify tenants paying selected charge codes
@@ -5174,7 +5174,7 @@ if st.session_state.all_charges_df is not None:
         # ═══════════════════════════════════════════════════════════════
         tab_charts, tab_next, tab_report, tab_docs = st.tabs([
             "Fee Collection Charts",
-            "What's Next",
+            "Summary",
             "Missing Pet Rent Report",
             "Documentation & SQL",
         ])
@@ -6312,7 +6312,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         else:
                             st.info("No charge rows found for this property.")
 
-        # ─── TAB 2: What's Next (VP Summary) ─────────────────────────
+        # ─── TAB 2: Summary ──────────────────────────────────────
         with tab_next:
             _cd = st.session_state.get("chart_data")
             if _cd is None:
@@ -6533,187 +6533,257 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     n_comparable=len(_comparable) if _comparable else None,
                 )
 
-                # ── Shared styles ──
-                _tranche_header = (
-                    "font-family:Lora,Georgia,serif;font-size:18px;font-weight:700;"
-                    "color:#1F2257;margin:0 0 2px 0"
-                )
-                _tranche_sub = (
-                    "font-family:Poppins,Arial,sans-serif;font-size:12px;font-weight:600;"
-                    "letter-spacing:0.5px;text-transform:uppercase;margin:0 0 12px 0"
-                )
-                _tranche_body = (
-                    "font-family:Poppins,Arial,sans-serif;font-size:14px;color:#4F5155;"
-                    "line-height:1.7;margin:0"
-                )
-                _tranche_card = (
-                    "background:#FAFAF8;border:1px solid #E8E4DA;border-radius:10px;"
-                    "padding:24px 28px;margin-bottom:20px"
-                )
-                _big_num = (
-                    "font-family:Poppins,Arial,sans-serif;font-weight:700;margin:0"
+                # ═══════════════════════════════════════════════════════════════
+                #  SECTION 1: VALUE CREATED
+                # ═══════════════════════════════════════════════════════════════
+                def _summary_card(value_text, label_text, sublabel_text="", color="#677848", bg="#fff"):
+                    """Render a single big-number card."""
+                    _sub_html = ""
+                    if sublabel_text:
+                        _sub_html = f'<div style="font-size:12px;color:#86868B;margin-top:4px">{sublabel_text}</div>'
+                    return (
+                        f'<div style="background:{bg};border:1px solid #E8E4DA;border-radius:12px;'
+                        f'padding:32px 24px;text-align:center">'
+                        f'<div style="font-size:42px;font-weight:700;color:{color};letter-spacing:-1px;'
+                        f'font-family:Poppins,sans-serif">{value_text}</div>'
+                        f'<div style="font-size:13px;font-weight:600;color:#636569;margin-top:8px;'
+                        f'text-transform:uppercase;letter-spacing:0.5px">{label_text}</div>'
+                        f'{_sub_html}'
+                        f'</div>'
+                    )
+
+                _latest_str = _latest_month.strftime("%b %Y") if _latest_month else "N/A"
+
+                st.markdown(
+                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                    'color:#1F2257;margin:24px 0 12px 0">Value Created</p>',
+                    unsafe_allow_html=True,
                 )
 
-                # ═══════════════════════════════════════════════════════════════
-                #  TRANCHE 1: Value Already Created
-                # ═══════════════════════════════════════════════════════════════
-                if _comparable and _t1_mo != 0:
+                _vc1, _vc2, _vc3 = st.columns(3)
+                with _vc1:
+                    st.markdown(_summary_card(
+                        f"${_current_monthly_rev:,.0f}",
+                        "Current Monthly Revenue",
+                        _latest_str,
+                        color="#677848",
+                    ), unsafe_allow_html=True)
+                with _vc2:
+                    if _comparable and _t1_mo != 0:
+                        _sign = "+" if _t1_mo > 0 else ""
+                        st.markdown(_summary_card(
+                            f"{_sign}${_t1_mo:,.0f}/mo",
+                            "Revenue Change Since PS",
+                            f"Across {len(_comparable)} comparable properties",
+                            color="#677848" if _t1_mo > 0 else "#DD7B45",
+                        ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "N/A",
+                            "Revenue Change Since PS",
+                            "Requires launch dates and pre-launch data",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+                with _vc3:
+                    if _comparable and _t1_total != 0:
+                        _sign = "+" if _t1_total > 0 else ""
+                        st.markdown(_summary_card(
+                            f"{_sign}${_t1_total:,.0f}",
+                            "Cumulative Impact",
+                            f"Over {_t1_months} months",
+                            color="#677848" if _t1_total > 0 else "#DD7B45",
+                        ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "N/A",
+                            "Cumulative Impact",
+                            "Requires launch dates and pre-launch data",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+
+                if _comparable and _t1_mo != 0 and _pre_baseline_total > 0:
                     st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">Value Already Created</p>'
-                        f'<p style="{_tranche_sub};color:#677848">What PetScreening has already delivered</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'PetScreening has generated an incremental '
-                        f'<strong>${_t1_mo:,.0f}/month</strong> in pet fee revenue above your '
-                        f'pre-launch baseline'
-                        f'{f" — a <strong>{_t1_pct:.1f}%</strong> increase" if _t1_pct > 0 else ""}'
-                        f' that is already flowing through your books.'
-                        f'</p>'
-                        f'<p style="{_tranche_body};margin-top:12px">'
-                        f'Across {_t1_months} months, this has compounded to '
-                        f'<strong>${_t1_total:,.0f}</strong> in cumulative revenue that would not '
-                        f'have existed without the program.'
-                        f'</p>'
-                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:12px;'
-                        f'color:#636569;margin:12px 0 0 0;font-style:italic">'
-                        f'Based on {len(_comparable)} properties with reliable pre-launch baselines. '
-                        f'Pre-PS baseline: ${_pre_baseline_total:,.0f}/mo.</p>'
-                        f'</div>',
+                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        f'text-align:center;margin:8px 0 28px 0">'
+                        f'Pre-PS baseline was ${_pre_baseline_total:,.0f}/mo across {len(_comparable)} properties'
+                        f'{f" -- a {_t1_pct:.1f}% increase" if _t1_pct > 0 else ""}.</p>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
+
+                # ═══════════════════════════════════════════════════════════════
+                #  SECTION 2: REVENUE OPPORTUNITY
+                # ═══════════════════════════════════════════════════════════════
+                _has_missing_rent_data = any(
+                    k.startswith("missing_rent_") and isinstance(st.session_state[k], dict)
+                    for k in st.session_state.keys()
+                )
+
+                st.markdown(
+                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                    'color:#1F2257;margin:0 0 12px 0">Revenue Opportunity</p>',
+                    unsafe_allow_html=True,
+                )
+
+                _ro1, _ro2, _ro3 = st.columns(3)
+                with _ro1:
+                    if _has_missing_rent_data:
+                        if _t2_mo > 0:
+                            st.markdown(_summary_card(
+                                f"${_t2_mo:,.0f}/mo",
+                                "Uncollected Pet Rent",
+                                f"{_t2_props} properties affected",
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "None",
+                                "Uncollected Pet Rent",
+                                "No gaps identified",
+                                color="#677848",
+                            ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "Uncollected Pet Rent",
+                            "Enable on Charts tab to calculate",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+                with _ro2:
+                    if _has_missing_rent_data:
+                        if _t2_tenants > 0:
+                            st.markdown(_summary_card(
+                                f"{_t2_tenants:,}",
+                                "Tenants Not Paying",
+                                "With active household profiles",
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "0",
+                                "Tenants Not Paying",
+                                "All profiled tenants are paying",
+                                color="#677848",
+                            ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "Tenants Not Paying",
+                            "Enable on Charts tab to calculate",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+                with _ro3:
+                    if _t3_adoption is not None and _total_projected > 0:
+                        st.markdown(_summary_card(
+                            f"${_total_projected:,.0f}/mo",
+                            "Projected at 100% Adoption",
+                            f"Additional ${_t3_additional:,.0f}/mo opportunity",
+                            color="#B17455",
+                        ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "Projected at 100% Adoption",
+                            "Enable adoption overlay on Charts tab",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+
+                if _has_missing_rent_data and _t2_tenants == 0:
+                    st.markdown(
+                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#677848;'
+                        'text-align:center;margin:8px 0 28px 0">'
+                        'All tenants with active household profiles are paying pet rent. No gaps identified.</p>',
+                        unsafe_allow_html=True,
+                    )
+                elif _has_missing_rent_data and _t2_tenants > 0:
+                    st.markdown(
+                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        f'text-align:center;margin:8px 0 28px 0">'
+                        f'{_t2_tenants:,} tenants have completed PetScreening profiles but are not being charged pet rent.</p>',
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">Value Already Created</p>'
-                        f'<p style="{_tranche_sub};color:#636569">What PetScreening has already delivered</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'Enable the adoption overlay and ensure properties have pre-launch charge data '
-                        f'to see the revenue lift analysis.</p>'
-                        f'</div>',
+                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        'text-align:center;margin:8px 0 28px 0">'
+                        'Enable "Show uncollected pet rent" on the Charts tab to populate this section.</p>',
                         unsafe_allow_html=True,
                     )
 
                 # ═══════════════════════════════════════════════════════════════
-                #  TRANCHE 2: Money on the Table
+                #  SECTION 3: PORTFOLIO HEALTH
                 # ═══════════════════════════════════════════════════════════════
-                if _t2_tenants > 0:
-                    _t2_combined_text = ""
-                    if _comparable and _t1_mo > 0 and _t2_mo > 0:
-                        _t2_combined_text = (
-                            f'<p style="{_tranche_body};margin-top:12px">'
-                            f'Combined with the value already created, your hard dollar impact reaches '
-                            f'<strong>${_t1_t2_combined:,.0f}/month</strong>'
-                            f'{f" — a <strong>{_t1_t2_pct:.1f}%</strong> lift over your pre-PS baseline" if _t1_t2_pct > 0 else ""}.'
-                            f'</p>'
-                        )
+                st.markdown(
+                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                    'color:#1F2257;margin:0 0 12px 0">Portfolio Health</p>',
+                    unsafe_allow_html=True,
+                )
+
+                _ph1, _ph2, _ph3 = st.columns(3)
+                with _ph1:
+                    if _avg_adoption is not None:
+                        _adopt_color = "#677848" if _avg_adoption >= 70 else ("#E2AB58" if _avg_adoption >= 40 else "#DD7B45")
+                        st.markdown(_summary_card(
+                            f"{_avg_adoption:.1f}%",
+                            f"Average {_adopt_type_label} Adoption",
+                            f"Across {_n_proj_props} properties",
+                            color=_adopt_color,
+                        ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "Average Adoption",
+                            "Enable adoption overlay on Charts tab",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+                with _ph2:
+                    st.markdown(_summary_card(
+                        f"{n_with_launch} of {n_props_total}",
+                        "Properties with Launch Date",
+                        f"{n_props_with_data} have charge data",
+                        color="#1F2257",
+                    ), unsafe_allow_html=True)
+                with _ph3:
+                    if _su_total_profiles > 0:
+                        st.markdown(_summary_card(
+                            f"{_su_total_profiles:,}",
+                            "Suspected Undisclosed",
+                            f"~${_su_current_mo:,.0f}/mo potential revenue",
+                            color="#DD7B45",
+                        ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "0",
+                            "Suspected Undisclosed",
+                            "No signals detected",
+                            color="#677848",
+                        ), unsafe_allow_html=True)
+
+                if _avg_adoption is not None:
                     st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">Money on the Table</p>'
-                        f'<p style="{_tranche_sub};color:#DD7B45">Revenue you\'ve already earned but aren\'t collecting</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'Right now, <strong>{_t2_tenants:,}</strong> tenants have completed a PetScreening '
-                        f'household profile — meaning they have declared a pet and gone through the screening '
-                        f'process — but are not being charged pet rent.'
-                        f'</p>'
-                        f'<p style="{_tranche_body};margin-top:12px">'
-                        f'This is not an adoption problem or a policy problem. These residents have already '
-                        f'raised their hand. Closing this gap is a billing correction, not a sales effort.'
-                        f'</p>'
-                        f'<p style="{_tranche_body};margin-top:12px">'
-                        f'That\'s <strong>${_t2_mo:,.0f}/month</strong> sitting uncollected, '
-                        f'across <strong>{_t2_props}</strong> of your properties.'
-                        f'</p>'
-                        f'{_t2_combined_text}'
-                        f'</div>',
+                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        f'text-align:center;margin:8px 0 28px 0">'
+                        f'{_adopt_type_label} adoption averaged across properties with both revenue and adoption data.</p>',
                         unsafe_allow_html=True,
                     )
                 else:
-                    st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">Money on the Table</p>'
-                        f'<p style="{_tranche_sub};color:#636569">Revenue you\'ve already earned but aren\'t collecting</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'Enable <strong>"Show uncollected pet rent"</strong> on the Charts tab to identify '
-                        f'tenants with completed PetScreening profiles who aren\'t being charged pet rent.</p>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
 
-                # ═══════════════════════════════════════════════════════════════
-                #  TRANCHE 3: The Extrapolated Potential
-                # ═══════════════════════════════════════════════════════════════
-                if _t3_adoption is not None and _total_projected > 0:
-                    _t3_total_text = ""
-                    if _pre_baseline_total > 0 and _t3_total_impact > 0:
-                        _t3_total_text = (
-                            f'<p style="{_tranche_body};margin-top:12px">'
-                            f'If captured, total attributable PetScreening impact reaches '
-                            f'<strong>${_t3_total_impact:,.0f}/month</strong>'
-                            f'{f" — a <strong>{_t3_pct:.1f}%</strong> increase over your pre-PS baseline of ${_pre_baseline_total:,.0f}" if _t3_pct > 0 else ""}.'
-                            f'</p>'
-                        )
-                    st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">The Extrapolated Potential</p>'
-                        f'<p style="{_tranche_sub};color:#B17455">What full program execution is worth</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'Your portfolio is currently running at <strong>{_t3_adoption:.1f}% '
-                        f'{_adopt_type_label.lower()} adoption</strong>. Closing that gap to 100% — through '
-                        f'consistent screening enforcement at move-in and renewal — unlocks an additional '
-                        f'<strong>${_t3_additional:,.0f}/month</strong>.'
-                        f'</p>'
-                        f'<p style="{_tranche_body};margin-top:12px">'
-                        f'This projection is linear and assumes the remaining {_adopt_type_label.lower()}s '
-                        f'perform similarly to those already enrolled, so treat it as a ceiling rather than '
-                        f'a guarantee.'
-                        f'</p>'
-                        f'{_t3_total_text}'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f'<div style="{_tranche_card}">'
-                        f'<p style="{_tranche_header}">The Extrapolated Potential</p>'
-                        f'<p style="{_tranche_sub};color:#636569">What full program execution is worth</p>'
-                        f'<p style="{_tranche_body}">'
-                        f'Enable the <strong>adoption overlay</strong> on the Charts tab to see what '
-                        f'100% {_adopt_type_label.lower()} adoption is worth.</p>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                # ── The Arc ──
-                _has_any_data = (_comparable and _t1_mo != 0) or _t2_tenants > 0 or (_t3_adoption is not None and _total_projected > 0)
-                if _has_any_data:
-                    st.markdown(
-                        '<div style="background:#F9F4E6;border-left:4px solid #E2AB58;'
-                        'border-radius:0 8px 8px 0;padding:16px 20px;margin:8px 0 24px 0;'
-                        'font-family:Poppins,Arial,sans-serif;font-size:14px;color:#4F5155;'
-                        'line-height:1.7">'
-                        'The arc is simple: <strong>Tranche 1</strong> was built for you. '
-                        '<strong>Tranche 2</strong> requires a billing audit. '
-                        '<strong>Tranche 3</strong> requires operational discipline. '
-                        'The infrastructure is already in place for all three.'
-                        '</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                # ── Quick Stats (collapsed) ──
+                # ── Detailed metrics (collapsed) ──
                 _quick_rows = []
-                _latest_str = _latest_month.strftime("%b %Y") if _latest_month else "—"
                 _quick_rows.append({"Metric": "Pre-PS Baseline", "Value": f"${_pre_baseline_total:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
                 _quick_rows.append({"Metric": "Current Monthly Pet Fee Revenue", "Value": f"${_current_monthly_rev:,.0f}", "Period": _latest_str})
                 if _comparable:
-                    _quick_rows.append({"Metric": "Tranche 1: Monthly Revenue Lift", "Value": f"+${_t1_mo:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                    _quick_rows.append({"Metric": "Tranche 1: Cumulative Revenue", "Value": f"${_t1_total:,.0f}", "Period": f"over {_t1_months} months"})
+                    _quick_rows.append({"Metric": "Monthly Revenue Lift", "Value": f"+${_t1_mo:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
+                    _quick_rows.append({"Metric": "Cumulative Revenue Impact", "Value": f"${_t1_total:,.0f}", "Period": f"over {_t1_months} months"})
                 if _t2_tenants > 0:
-                    _quick_rows.append({"Metric": "Tranche 2: Tenants Not Paying", "Value": f"{_t2_tenants:,}", "Period": f"across {_t2_props} properties"})
-                    _quick_rows.append({"Metric": "Tranche 2: Uncollected Revenue", "Value": f"${_t2_mo:,.0f}/mo", "Period": _latest_str})
+                    _quick_rows.append({"Metric": "Tenants Not Paying", "Value": f"{_t2_tenants:,}", "Period": f"across {_t2_props} properties"})
+                    _quick_rows.append({"Metric": "Uncollected Revenue", "Value": f"${_t2_mo:,.0f}/mo", "Period": _latest_str})
                 if _t3_adoption is not None:
-                    _quick_rows.append({"Metric": f"Tranche 3: Current {_adopt_type_label} Adoption", "Value": f"{_t3_adoption:.1f}%", "Period": f"across {_n_proj_props} properties"})
+                    _quick_rows.append({"Metric": f"Current {_adopt_type_label} Adoption", "Value": f"{_t3_adoption:.1f}%", "Period": f"across {_n_proj_props} properties"})
                 if _t3_additional > 0:
-                    _quick_rows.append({"Metric": "Tranche 3: Additional Opportunity", "Value": f"+${_t3_additional:,.0f}/mo", "Period": "at 100% adoption"})
+                    _quick_rows.append({"Metric": "Additional Opportunity at 100%", "Value": f"+${_t3_additional:,.0f}/mo", "Period": "at 100% adoption"})
                 if _su_total_profiles > 0:
                     _quick_rows.append({"Metric": "Suspected Undisclosed Pets", "Value": f"{_su_total_profiles:,}", "Period": f"~${_su_current_mo:,.0f}/mo potential"})
                 _quick_rows.append({"Metric": "Properties with Launch Date", "Value": f"{n_with_launch} of {n_props_total}", "Period": ""})
@@ -7026,17 +7096,6 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.button("Download HTML", disabled=True,
                                   use_container_width=True, key="dl_html_disabled")
 
-                # ── Tip: enable uncollected pet rent ──
-                if _mr_total_profiles == 0:
-                    st.markdown("---")
-                    st.markdown(
-                        '<div style="background:#DAEBF5;border-radius:8px;padding:14px 18px;'
-                        'font-family:Poppins,Arial,sans-serif;font-size:13px;color:#1F2257">'
-                        '<strong>Tip:</strong> Enable <strong>"Show uncollected pet rent"</strong> '
-                        'on the Charts tab to see how many tenants have completed PetScreening screening but '
-                        'aren\'t paying pet rent. Those numbers will appear here automatically.</div>',
-                        unsafe_allow_html=True,
-                    )
 
         # ─── TAB 3: Missing Pet Rent Report ─────────────────────────
         with tab_report:
@@ -7097,7 +7156,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                 st.success("No missing pet rent records found — all tenants with household pets are paying!")
                             else:
                                 # Count unique TENANTS (by email) — report rows are per-pet,
-                                # but KPIs should match the Charts/What's Next tabs which count per-tenant.
+                                # but KPIs should match the Charts/Summary tabs which count per-tenant.
                                 _n_tenants = report_df['USER_EMAIL'].nunique() if 'USER_EMAIL' in report_df.columns else len(report_df)
                                 n_props = report_df['PROPERTY_NAME'].nunique() if 'PROPERTY_NAME' in report_df.columns else 0
                                 n_pets = report_df['PET_NAME'].nunique() if 'PET_NAME' in report_df.columns else 0
@@ -7108,7 +7167,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     f"({n_pets} pets across {n_props} properties)."
                                 )
 
-                                # KPI metrics — tenant count matches Charts & What's Next tabs
+                                # KPI metrics — tenant count matches Charts & Summary tabs
                                 rcol1, rcol2, rcol3 = st.columns(3)
                                 rcol1.metric("Missing Pet Rent Tenants", f"{_n_tenants:,}")
                                 rcol2.metric("Properties Affected", f"{n_props}")
@@ -7342,7 +7401,7 @@ are loaded. The app shows you how many of the total properties have API access.
 
             with st.expander("**Tenant Identification — Who counts as 'missing pet rent'?**"):
                 st.markdown("""
-The same Snowflake query is used **everywhere** (Charts tab orange bars, What's Next tab,
+The same Snowflake query is used **everywhere** (Charts tab orange bars, Summary tab,
 Missing Pet Rent Report tab) to ensure numbers match:
 
 ```sql
@@ -7753,7 +7812,7 @@ At 100% adoption → $7,692/mo. Additional = $2,692/mo.
 
 **Caveats:**
 - This is a **linear extrapolation** — the last units to comply may have fewer or no pets
-- Only properties with **both** revenue > $0 **and** adoption data are included (this is why you may see fewer properties in the "What's Next" tab than in the charts)
+- Only properties with **both** revenue > $0 **and** adoption data are included (this is why you may see fewer properties in the "Summary" tab than in the charts)
 - The adoption type (unit vs. resident) matches your Charts tab overlay selection
                 """)
 
@@ -7815,16 +7874,16 @@ use the **exact same profile identification** so the tenant counts match across 
 | **Charge estimate** | Avg charge from paying tenants at that property | Identifies tenants not paying ANY selected code |
 | **Time dimension** | Distributed across months by lease dates | Point-in-time snapshot (current tenants only) |
 
-**Important:** The KPIs in all tabs (Charts summary, What's Next, Report) use the same
+**Important:** The KPIs in all tabs (Charts summary, Summary, Report) use the same
 profile identification query (`compliant` + `household` + `active`). The Report tab's
 "Missing Pet Rent Tenants" counts unique tenants (by email), not rows (which are per-pet).
 
 Both use the **same live API data** + Snowflake profile data. Neither uses stale staging tables.
                 """)
 
-            with st.expander("**What does the 'What's Next' tab show and how is it calculated?**"):
+            with st.expander("**What does the 'Summary' tab show and how is it calculated?**"):
                 st.markdown("""
-The **What's Next** tab is designed for **VP-level skimming** — high-level numbers with a narrative.
+The **Summary** tab is designed for **VP-level skimming** — high-level numbers with a narrative.
 
 **KPIs shown (Row 1 — Revenue):**
 - **Current Monthly Pet Fee Revenue** — sum of all properties' latest-month revenue for selected charge codes
@@ -7842,7 +7901,7 @@ The **What's Next** tab is designed for **VP-level skimming** — high-level num
 **Why does the property count differ from Charts?** See the first FAQ above — adoption KPIs only include properties with BOTH revenue > $0 AND adoption data in the QBR table.
                 """)
 
-            with st.expander("**Why might the adoption % on 'What's Next' differ from Charts?**"):
+            with st.expander("**Why might the adoption % on 'Summary' differ from Charts?**"):
                 st.markdown("""
 They should now match exactly. Both use the **same calculation**:
 
@@ -7879,7 +7938,7 @@ After fetching rent roll data, the app shows **all unique charge codes** found a
 **This selection affects everything downstream:**
 - Which charges are included in the monthly revenue charts
 - Which tenants are considered "paying" for the Missing Pet Rent analysis
-- Which revenue numbers appear in KPIs and the What's Next summary
+- Which revenue numbers appear in KPIs and the Summary summary
 
 **Common pitfalls:**
 - Different properties may use **different charge code names** for the same thing (e.g., `PetRent` vs `Pet Rent` vs `Pet Fee`). If you miss one, that property's revenue will appear lower.
@@ -8194,7 +8253,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
 - **Launch date = month boundary:** The launch month is counted as post-launch. Pre-launch baseline uses the 3 months immediately before the launch month.
 - **PM emails:** Filtered to active PMs with specific permission types, using `parent_company_ancestry_id` from `user_enriched`.
 - **Suspected undisclosed exclusions:** Assistance profiles with `recommended` or `expired` status are excluded. Pet profiles with a non-empty `archive_reason` are excluded.
-- **Missing pet rent tenant criteria:** Only `compliant` + `household` + `active` tenants are considered. This is consistent across ALL tabs (Charts, What's Next, Report).
+- **Missing pet rent tenant criteria:** Only `compliant` + `household` + `active` tenants are considered. This is consistent across ALL tabs (Charts, Summary, Report).
 
 **Yardi-specific:**
 - **Charge classification:** Inferred from median date span (> 60 days = recurring, ≤ 60 = one-time). No explicit frequency field available.
