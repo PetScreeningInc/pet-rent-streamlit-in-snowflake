@@ -7043,9 +7043,11 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
             st.header("Missing Pet Rent Report")
 
             # ── Property funnel — consistent cascade ──────────────
-            _report_n_charges = len(st.session_state.get("chart_data", {}).get("parsed_charges", []))
+            _report_cd = st.session_state.get("chart_data") or {}
+            _report_parsed = _report_cd.get("parsed_charges", []) if isinstance(_report_cd, dict) else []
+            _report_n_charges = len(_report_parsed)
             _report_n_with_charges = len(set(
-                r["property_name"] for r in (st.session_state.get("chart_data") or {}).get("parsed_charges", [])
+                r["property_name"] for r in _report_parsed
                 if r.get("amount", 0) > 0
             )) if _report_n_charges > 0 else None
             _render_property_funnel(
