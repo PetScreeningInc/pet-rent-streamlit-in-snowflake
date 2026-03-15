@@ -2825,8 +2825,12 @@ def generate_tranche_pdf(
     adopt_type_label, current_monthly_rev,
     n_props_total, n_with_launch, n_props_with_data,
     include_pm=False, pm_rows=None,
+    su_total_profiles=0, su_current_mo=0, total_projected=0,
 ):
-    """Generate a branded PDF of the tranche-based impact analysis.
+    """Generate a branded PDF with card-based KPIs + narrative storytelling.
+
+    Matches the Summary tab visual style: big numbers in cards, short
+    narrative sentences, and the key metrics table Eduardo likes.
 
     Returns PDF bytes ready for st.download_button.
     """
@@ -2856,157 +2860,294 @@ def generate_tranche_pdf(
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
 
-    # Colors
+    # ── Brand colors ──
     dark_blue = (31, 34, 87)
     green = (103, 120, 72)
     orange = (221, 123, 69)
     warm = (177, 116, 85)
     body_gray = (79, 81, 85)
     light_gray = (99, 101, 105)
+    card_border = (232, 228, 218)
+    card_fill = (250, 250, 248)
 
-    def section_header(title, subtitle, color):
-        pdf.set_font('Helvetica', 'B', 14)
-        pdf.set_text_color(*dark_blue)
-        pdf.cell(0, 8, title, ln=True)
-        pdf.set_font('Helvetica', '', 9)
+    # ── Layout constants ──
+    PAGE_L = 15          # left margin
+    PAGE_R = 195         # right edge
+    USABLE_W = PAGE_R - PAGE_L  # 180mm
+    CARD_GAP = 4
+    CARD_W = (USABLE_W - 2 * CARD_GAP) / 3  # ~57.3mm
+    CARD_H = 34
+
+    # ── Helper: draw a row of 3 KPI cards ──
+    def draw_card_row(cards):
+        """Draw 3 cards side-by-side. Each card is a dict:
+        {value: str, label: str, sub: str|None, color: tuple}
+        """
+        start_y = pdf.get_y()
+        # Check if we need a page break (card row + narrative below ~55mm)
+        if start_y + CARD_H + 30 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+            start_y = pdf.get_y()
+
+        for i, card in enumerate(cards):
+            x = PAGE_L + i * (CARD_W + CARD_GAP)
+            # Card background
+            pdf.set_fill_color(*card_fill)
+            pdf.set_draw_color(*card_border)
+            pdf.rect(x, start_y, CARD_W, CARD_H, 'DF')
+            # Big number
+            pdf.set_font('Helvetica', 'B', 22)
+            pdf.set_text_color(*card.get("color", dark_blue))
+            pdf.set_xy(x + 2, start_y + 4)
+            pdf.cell(CARD_W - 4, 10, card["value"], align='C')
+            # Label
+            pdf.set_font('Helvetica', '', 8)
+            pdf.set_text_color(*light_gray)
+            pdf.set_xy(x + 2, start_y + 16)
+            pdf.cell(CARD_W - 4, 5, card["label"].upper(), align='C')
+            # Sub-label (optional)
+            if card.get("sub"):
+                pdf.set_font('Helvetica', '', 7)
+                pdf.set_text_color(150, 150, 150)
+                pdf.set_xy(x + 2, start_y + 22)
+                pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
+
+        pdf.set_y(start_y + CARD_H + 4)
+
+    # ── Helper: section heading ──
+    def section_heading(title, color=dark_blue):
+        # Check for page break
+        if pdf.get_y() + 50 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.set_font('Helvetica', 'B', 13)
         pdf.set_text_color(*color)
-        pdf.cell(0, 5, subtitle.upper(), ln=True)
+        pdf.cell(0, 8, title, ln=True)
+        # Colored underline
+        y = pdf.get_y()
+        pdf.set_draw_color(*color)
+        pdf.set_line_width(0.6)
+        pdf.line(PAGE_L, y, PAGE_L + 50, y)
+        pdf.set_line_width(0.2)
+        pdf.ln(4)
+
+    # ── Helper: narrative text ──
+    def narrative(text):
+        pdf.set_font('Helvetica', '', 9.5)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(0, 5, text)
         pdf.ln(3)
 
-    def body_text(text):
-        pdf.set_font('Helvetica', '', 10)
-        pdf.set_text_color(*body_gray)
-        pdf.multi_cell(0, 5.5, text)
-        pdf.ln(2)
-
-    def footnote(text):
-        pdf.set_font('Helvetica', 'I', 8)
-        pdf.set_text_color(*light_gray)
-        pdf.multi_cell(0, 4.5, text)
-        pdf.ln(1)
-
+    # ── Helper: divider ──
     def divider():
-        pdf.set_draw_color(232, 228, 218)
+        pdf.set_draw_color(*card_border)
         y = pdf.get_y()
-        pdf.line(15, y, 195, y)
-        pdf.ln(6)
+        pdf.line(PAGE_L, y, PAGE_R, y)
+        pdf.ln(7)
 
-    # ── Tranche 1 ──
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 1: VALUE CREATED
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Value Created", green)
+
+    _sign_t1 = "+" if t1_mo > 0 else ""
+    _t1_color = green if t1_mo >= 0 else orange
+    _cum_str = f"${t1_total:,.0f}" if comparable_count > 0 and t1_total != 0 else "--"
+
+    draw_card_row([
+        {
+            "value": f"${current_monthly_rev:,.0f}",
+            "label": "Current Monthly Revenue",
+            "sub": "Total pet fee revenue",
+            "color": dark_blue,
+        },
+        {
+            "value": f"{_sign_t1}${t1_mo:,.0f}" if comparable_count > 0 and t1_mo != 0 else "--",
+            "label": "Revenue Change Since PS",
+            "sub": f"{t1_pct:+.1f}% vs baseline" if comparable_count > 0 and t1_pct != 0 else None,
+            "color": _t1_color,
+        },
+        {
+            "value": _cum_str,
+            "label": "Cumulative Impact",
+            "sub": f"Over {t1_months} months" if comparable_count > 0 and t1_months > 0 else None,
+            "color": green if t1_total > 0 else dark_blue,
+        },
+    ])
+
     if comparable_count > 0 and t1_mo != 0:
-        section_header("Value Already Created", "What PetScreening has already delivered", green)
-        pct_str = f" - a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
-        body_text(
-            f"PetScreening has generated an incremental ${t1_mo:,.0f}/month in pet fee revenue "
-            f"above your pre-launch baseline{pct_str} that is already flowing through your books."
-        )
-        body_text(
-            f"Across {t1_months} months, this has compounded to ${t1_total:,.0f} in cumulative "
-            f"revenue that would not have existed without the program."
-        )
-        footnote(
-            f"Based on {comparable_count} properties with reliable pre-launch baselines. "
-            f"Pre-PS baseline: ${pre_baseline:,.0f}/mo."
+        pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
+        narrative(
+            f"PetScreening has generated an incremental ${t1_mo:,.0f}/mo above your "
+            f"pre-launch baseline of ${pre_baseline:,.0f}/mo{pct_note}. Over {t1_months} months, "
+            f"this has compounded to ${t1_total:,.0f} in cumulative revenue that would not exist "
+            f"without the program."
         )
     else:
-        section_header("Value Already Created", "What PetScreening has already delivered", light_gray)
-        body_text("Revenue lift data not yet available. Ensure properties have pre-launch charge data.")
+        narrative(
+            "Revenue lift data is not yet available. Once properties have sufficient "
+            "pre-launch and post-launch charge data, this section will show the incremental "
+            "value PetScreening has created."
+        )
 
     divider()
 
-    # ── Tranche 2 ──
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 2: REVENUE OPPORTUNITY
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Revenue Opportunity", orange)
+
+    # Combine confirmed + suspected undisclosed for total opportunity
+    _total_unpaying = t2_tenants + (su_total_profiles or 0)
+    _total_uncollected_mo = t2_mo + (su_current_mo or 0)
+
+    _proj_str = f"${total_projected:,.0f}" if total_projected and total_projected > 0 else "--"
+
+    draw_card_row([
+        {
+            "value": f"${_total_uncollected_mo:,.0f}" if _total_uncollected_mo > 0 else "$0",
+            "label": "Uncollected Pet Rent",
+            "sub": f"Per month" if _total_uncollected_mo > 0 else "Fully collected",
+            "color": orange if _total_uncollected_mo > 0 else green,
+        },
+        {
+            "value": f"{_total_unpaying:,}" if _total_unpaying > 0 else "0",
+            "label": "Tenants Not Paying",
+            "sub": f"Across {t2_props} properties" if t2_tenants > 0 else "All tenants compliant",
+            "color": orange if _total_unpaying > 0 else green,
+        },
+        {
+            "value": _proj_str,
+            "label": "Projected at 100% Adoption",
+            "sub": f"Currently {t3_adoption:.1f}% adopted" if t3_adoption is not None else None,
+            "color": warm,
+        },
+    ])
+
     if t2_tenants > 0:
-        section_header("Money on the Table", "Revenue you've already earned but aren't collecting", orange)
-        body_text(
-            f"Right now, {t2_tenants:,} tenants have completed a PetScreening household profile "
-            f"- meaning they have declared a pet and gone through the screening process - "
-            f"but are not being charged pet rent."
+        narrative(
+            f"{t2_tenants:,} tenants have completed PetScreening profiles but are not being "
+            f"charged pet rent -- that is ${t2_mo:,.0f}/mo in uncollected revenue across "
+            f"{t2_props} properties. This is a billing correction, not a sales effort."
         )
-        body_text(
-            "This is not an adoption problem or a policy problem. These residents have already "
-            "raised their hand. Closing this gap is a billing correction, not a sales effort."
-        )
-        body_text(f"That's ${t2_mo:,.0f}/month sitting uncollected, across {t2_props} of your properties.")
-        if comparable_count > 0 and t1_mo > 0 and t2_mo > 0:
-            pct_str = f" - a {t1_t2_pct:.1f}% lift over your pre-PS baseline" if t1_t2_pct > 0 else ""
-            body_text(
-                f"Combined with the value already created, your hard dollar impact reaches "
-                f"${t1_t2_combined:,.0f}/month{pct_str}."
+        if su_total_profiles and su_total_profiles > 0:
+            narrative(
+                f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
+                f"(abandoned screening, unresolved requests), representing an estimated "
+                f"${su_current_mo:,.0f}/mo in potential additional revenue."
             )
+    elif su_total_profiles and su_total_profiles > 0:
+        narrative(
+            f"No confirmed tenants are missing pet rent charges. However, "
+            f"{su_total_profiles:,} tenants show signals of undisclosed pets, representing "
+            f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
+        )
     else:
-        section_header("Money on the Table", "Revenue you've already earned but aren't collecting", light_gray)
-        body_text("Enable 'Show uncollected pet rent' on the Charts tab to populate this section.")
+        narrative(
+            "All screened tenants are currently being charged pet rent. "
+            "No billing gaps identified -- this is a strong compliance result."
+        )
 
     divider()
 
-    # ── Tranche 3 ──
-    if t3_adoption is not None and t3_additional > 0:
-        section_header("The Extrapolated Potential", "What full program execution is worth", warm)
-        body_text(
-            f"Your portfolio is currently running at {t3_adoption:.1f}% {adopt_type_label.lower()} "
-            f"adoption. Closing that gap to 100% - through consistent screening enforcement at "
-            f"move-in and renewal - unlocks an additional ${t3_additional:,.0f}/month."
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 3: PORTFOLIO HEALTH
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Portfolio Health", dark_blue)
+
+    _adopt_str = f"{t3_adoption:.1f}%" if t3_adoption is not None else "--"
+    _su_str = f"{su_total_profiles:,}" if su_total_profiles and su_total_profiles > 0 else "n/a"
+
+    draw_card_row([
+        {
+            "value": _adopt_str,
+            "label": f"Avg {adopt_type_label} Adoption",
+            "sub": f"Across {n_props_with_data} properties",
+            "color": green if t3_adoption is not None and t3_adoption >= 50 else orange,
+        },
+        {
+            "value": f"{n_with_launch}",
+            "label": "Properties with Launch Date",
+            "sub": f"of {n_props_total} total",
+            "color": dark_blue,
+        },
+        {
+            "value": _su_str,
+            "label": "Suspected Undisclosed",
+            "sub": f"~${su_current_mo:,.0f}/mo" if su_total_profiles and su_total_profiles > 0 else None,
+            "color": orange if su_total_profiles and su_total_profiles > 0 else dark_blue,
+        },
+    ])
+
+    if t3_adoption is not None:
+        narrative(
+            f"Your portfolio is running at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
+            f"{n_with_launch} of {n_props_total} properties have an established PetScreening launch date, "
+            f"and {n_props_with_data} have sufficient charge data for analysis."
         )
-        body_text(
-            f"This projection is linear and assumes the remaining {adopt_type_label.lower()}s "
-            f"perform similarly to those already enrolled, so treat it as a ceiling rather than "
-            f"a guarantee."
-        )
-        if pre_baseline > 0 and t3_total_impact > 0:
-            pct_str = f" - a {t3_pct:.1f}% increase over your pre-PS baseline of ${pre_baseline:,.0f}" if t3_pct > 0 else ""
-            body_text(
-                f"If captured, total attributable PetScreening impact reaches "
-                f"${t3_total_impact:,.0f}/month{pct_str}."
-            )
     else:
-        section_header("The Extrapolated Potential", "What full program execution is worth", light_gray)
-        body_text("Enable the adoption overlay on the Charts tab to see the 100% projection.")
+        narrative(
+            f"{n_with_launch} of {n_props_total} properties have an established PetScreening "
+            f"launch date. Adoption data will populate once screening activity is available."
+        )
 
     divider()
 
-    # ── The Arc ──
-    pdf.set_fill_color(249, 244, 230)
-    pdf.set_draw_color(226, 171, 88)
-    y = pdf.get_y()
-    pdf.rect(15, y, 180, 22, 'DF')
-    pdf.set_xy(18, y + 4)
-    pdf.set_font('Helvetica', '', 10)
-    pdf.set_text_color(*body_gray)
-    pdf.multi_cell(174, 5,
-        "The arc is simple: Tranche 1 was built for you. Tranche 2 requires a billing audit. "
-        "Tranche 3 requires operational discipline. The infrastructure is already in place for all three."
-    )
-    pdf.ln(8)
+    # ═══════════════════════════════════════════════════════════
+    #  KEY METRICS TABLE
+    # ═══════════════════════════════════════════════════════════
+    # Page break check -- table needs ~80mm
+    if pdf.get_y() + 80 > pdf.h - pdf.b_margin:
+        pdf.add_page()
 
-    # ── Key Metrics Table ──
-    pdf.set_font('Helvetica', 'B', 11)
+    pdf.set_font('Helvetica', 'B', 12)
     pdf.set_text_color(*dark_blue)
     pdf.cell(0, 8, 'Key Metrics', ln=True)
     pdf.ln(2)
 
+    # Table header row
+    pdf.set_fill_color(249, 244, 230)  # dog-bone-white
+    pdf.set_draw_color(*card_border)
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_text_color(*dark_blue)
+    pdf.cell(100, 7, '  METRIC', border=1, fill=True)
+    pdf.cell(80, 7, '  VALUE', border=1, fill=True, ln=True)
+
     metrics = []
     metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo"))
     metrics.append(("Current Monthly Revenue", f"${current_monthly_rev:,.0f}/mo"))
-    if comparable_count > 0:
-        metrics.append(("Tranche 1: Monthly Lift", f"+${t1_mo:,.0f}/mo"))
-        metrics.append(("Tranche 1: Cumulative", f"${t1_total:,.0f}"))
+    if comparable_count > 0 and t1_mo != 0:
+        metrics.append(("Monthly Revenue Lift", f"+${t1_mo:,.0f}/mo"))
+        metrics.append(("Cumulative Revenue Impact", f"${t1_total:,.0f}"))
     if t2_tenants > 0:
-        metrics.append(("Tranche 2: Tenants Not Paying", f"{t2_tenants:,}"))
-        metrics.append(("Tranche 2: Uncollected", f"${t2_mo:,.0f}/mo"))
+        metrics.append(("Tenants Not Paying Pet Rent", f"{t2_tenants:,}"))
+        metrics.append(("Uncollected Revenue", f"${t2_mo:,.0f}/mo"))
+    if su_total_profiles and su_total_profiles > 0:
+        metrics.append(("Suspected Undisclosed Pets", f"{su_total_profiles:,}"))
+        metrics.append(("Suspected Undisclosed Revenue", f"~${su_current_mo:,.0f}/mo"))
     if t3_adoption is not None:
-        metrics.append((f"Tranche 3: {adopt_type_label} Adoption", f"{t3_adoption:.1f}%"))
+        metrics.append((f"{adopt_type_label} Adoption", f"{t3_adoption:.1f}%"))
     if t3_additional > 0:
-        metrics.append(("Tranche 3: Additional Opportunity", f"+${t3_additional:,.0f}/mo"))
+        metrics.append(("Additional Opportunity at 100%", f"+${t3_additional:,.0f}/mo"))
+    if total_projected and total_projected > 0:
+        metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo"))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}"))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}"))
 
     pdf.set_font('Helvetica', '', 9)
-    for label_m, value_m in metrics:
+    for i, (label_m, value_m) in enumerate(metrics):
+        # Alternate row shading
+        if i % 2 == 0:
+            pdf.set_fill_color(255, 255, 255)
+        else:
+            pdf.set_fill_color(250, 250, 248)
         pdf.set_text_color(*body_gray)
-        pdf.cell(95, 6, label_m)
+        pdf.cell(100, 6, f'  {label_m}', border='LR', fill=True)
         pdf.set_text_color(*dark_blue)
         pdf.set_font('Helvetica', 'B', 9)
-        pdf.cell(0, 6, value_m, ln=True)
+        pdf.cell(80, 6, f'  {value_m}', border='LR', fill=True, ln=True)
         pdf.set_font('Helvetica', '', 9)
+    # Close table bottom
+    pdf.cell(180, 0, '', border='T', ln=True)
 
     # ── Property Managers (optional) ──
     if include_pm and pm_rows and len(pm_rows) > 0:
@@ -3392,7 +3533,8 @@ def generate_exec_summary_html(
 
 <div class="container">
 
-  <!-- KPI Cards — Row 1: Revenue -->
+  <!-- Value Created -->
+  <h2 style="font-size:13px;font-weight:600;color:var(--catnip-green);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Value Created</h2>
   <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
     <div class="kpi-card">
       <div class="kpi-label">Current Monthly Revenue</div>
@@ -3400,28 +3542,34 @@ def generate_exec_summary_html(
       <div class="kpi-caption">Total pet fee revenue (latest month)</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Revenue Change</div>
+      <div class="kpi-label">Revenue Change Since PS</div>
       <div class="kpi-value" style="color:{color_rev}">{sign}${rev_change_mo:,.0f}<span style="font-size:16px">/mo</span></div>
-      <div class="kpi-caption">Since PetScreening launch</div>
+      <div class="kpi-caption">vs pre-launch baseline</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Projected at 100% {adopt_type_label} Adoption</div>
+      <div class="kpi-label">Projected at 100% Adoption</div>
       <div class="kpi-value" style="color:var(--retriever-rust)">{proj_str}</div>
       {f'<div class="kpi-caption">{addl_str} additional</div>' if addl_str else ''}
     </div>
   </div>
 
-  <!-- KPI Cards — Row 2: Adoption & Compliance -->
-  <div class="kpi-grid" style="grid-template-columns:repeat(2,1fr);margin-top:-8px">
+  <!-- Revenue Opportunity -->
+  <h2 style="font-size:13px;font-weight:600;color:var(--chew-toy-orange);text-transform:uppercase;letter-spacing:1px;margin:8px 0 12px 0">Revenue Opportunity</h2>
+  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="kpi-card">
+      <div class="kpi-label">Not Paying Pet Rent</div>
+      <div class="kpi-value" style="color:var(--chew-toy-orange)">{mr_str}</div>
+      {f'<div class="kpi-caption">~{mr_rev_str} uncollected{_mr_detail}</div>' if mr_rev_str else f'<div class="kpi-caption">{_mr_detail}</div>' if _mr_detail else ''}
+    </div>
     <div class="kpi-card">
       <div class="kpi-label">Avg {adopt_type_label} Adoption</div>
       <div class="kpi-value">{adopt_str}</div>
       <div class="kpi-caption">Across {n_proj_props} properties with data</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Not Paying Pet Rent</div>
-      <div class="kpi-value" style="color:var(--chew-toy-orange)">{mr_str}</div>
-      {f'<div class="kpi-caption">~{mr_rev_str} uncollected{_mr_detail}</div>' if mr_rev_str else f'<div class="kpi-caption">{_mr_detail}</div>' if _mr_detail else ''}
+      <div class="kpi-label">Suspected Undisclosed</div>
+      <div class="kpi-value" style="color:var(--chew-toy-orange)">{f'{su_total_profiles:,}' if su_total_profiles > 0 else 'n/a'}</div>
+      {f'<div class="kpi-caption">~${su_current_mo:,.0f}/mo potential revenue</div>' if su_total_profiles > 0 and su_current_mo > 0 else ''}
     </div>
   </div>
 
@@ -7029,6 +7177,9 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             n_props_with_data=n_props_with_data,
                             include_pm=_include_pm_in_report,
                             pm_rows=_pm_for_report,
+                            su_total_profiles=_su_total_profiles,
+                            su_current_mo=_su_current_mo,
+                            total_projected=_total_projected,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
