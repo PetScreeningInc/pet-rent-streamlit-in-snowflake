@@ -5158,8 +5158,17 @@ if fetch_btn:
             else:
                 st.info(f"Found **{api_count}** {_system_label}-integrated properties for **{label}**.")
 
-            st.session_state.chart_data = None  # Clear stale charts
-            st.session_state.pm_emails_cache = None  # Clear PM cache for new selection
+            # Clear ALL stale data from previous selection
+            st.session_state.chart_data = None
+            st.session_state.pm_emails_cache = None
+            st.session_state.all_charges_df = None
+            st.session_state.ar_charges_df = None
+            st.session_state.fetch_log = None
+            # Clear cached missing rent, suspected, and charge type data
+            for _stale_key in list(st.session_state.keys()):
+                if (_stale_key.startswith("missing_rent_") or _stale_key.startswith("suspected_") or
+                    _stale_key in ("export_html", "exec_html", "charge_type_overrides")):
+                    del st.session_state[_stale_key]
             st.markdown(f"Fetching {_system_label} data (full history — display window: **{lookback_months} months**)...")
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -5357,19 +5366,59 @@ if st.session_state.all_charges_df is not None:
         with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
             st.markdown(
                 "Download the raw data that the app uses so you can upload it to "
-                "Snowflake and independently recreate/validate the numbers with SQL."
+                "Snowflake and independently recreate/validate the numbers with SQL.  \n"
+                "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
             )
 
             pmc_sys = st.session_state.get("pmc_system", "yardi")
             props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
+
+            # ── Fix dates before export ──────────────────────────────
+            # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
+            # Fix all date columns so the CSV can be uploaded to Snowflake directly.
+            _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
+                          'charge_from_date', 'charge_to_date']
+
+            def _fix_dates_for_export(export_df):
+                """Fix century-shifted dates (0025 → 2025) in all date columns."""
+                fixed = export_df.copy()
+                for col in _date_cols:
+                    if col not in fixed.columns:
+                        continue
+                    def _fix_date_val(val):
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            return val
+                        s = str(val).strip()
+                        if not s or s.lower() in ('nan', 'nat', 'none', ''):
+                            return None
+                        # Try parsing and fix year if < 1000
+                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                            try:
+                                dt = datetime.strptime(s[:10], fmt)
+                                if dt.year < 1000:
+                                    dt = dt.replace(year=dt.year + 2000)
+                                return dt.strftime("%Y-%m-%d")
+                            except (ValueError, TypeError):
+                                continue
+                        # If it's already a datetime/Timestamp object
+                        try:
+                            if hasattr(val, 'year') and val.year < 1000:
+                                val = val.replace(year=val.year + 2000)
+                            return str(val)[:10]
+                        except Exception:
+                            return val
+                    fixed[col] = fixed[col].apply(_fix_date_val)
+                return fixed
+
             exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
 
             with exp_c1:
                 st.markdown("**1. All API Charges**")
-                st.caption("Every charge line from the API (all tenants, all codes). This is the full rent roll.")
+                st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
+                _export_all = _fix_dates_for_export(df)
                 st.download_button(
                     "Download all_charges.csv",
-                    data=df.to_csv(index=False),
+                    data=_export_all.to_csv(index=False),
                     file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     key="dl_all_charges",
@@ -5377,11 +5426,12 @@ if st.session_state.all_charges_df is not None:
 
             with exp_c2:
                 st.markdown("**2. Pet Charges Only**")
-                st.caption("Filtered to your selected pet charge codes only.")
+                st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
                 _pet_only = df[df['charge_code'].isin(selected_codes)]
+                _export_pet = _fix_dates_for_export(_pet_only)
                 st.download_button(
                     "Download pet_charges.csv",
-                    data=_pet_only.to_csv(index=False),
+                    data=_export_pet.to_csv(index=False),
                     file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     key="dl_pet_charges",
