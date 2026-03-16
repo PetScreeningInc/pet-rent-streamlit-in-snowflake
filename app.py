@@ -1578,12 +1578,21 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
         # (what they actually collected minus what they would have at the old rate)
         diff_total = post_total - (pre_avg * n_post)
 
+        # Baseline is "meaningful" if pre_avg is >= 2% of post_recent_avg.
+        # Properties with near-zero baselines (e.g. $8 vs $5,600 post) weren't
+        # really charging pet rent before PS — their "lift" is misleading.
+        _baseline_meaningful = (
+            post_recent_avg <= 0  # no post data — keep whatever we have
+            or pre_avg >= post_recent_avg * 0.02
+        )
+
         analysis[prop] = {
             "n_post": n_post,
             "n_pre": len(pre_baseline_months),
             "n_recent_post": n_recent_post,
             "all_pre_months": len(pre_months),
             "baseline_reliable": len(pre_months) >= 3,
+            "baseline_meaningful": _baseline_meaningful,
             "pre_avg": pre_avg,
             "post_total": post_total,
             "post_monthly_avg": post_monthly_avg,
@@ -1867,10 +1876,16 @@ def build_individual_property_charts(
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
             elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
-                # Only show lift annotation if baseline is meaningful (> $50/mo)
-                # A near-zero baseline (e.g. $8/mo) means the property wasn't really
-                # charging pet rent before PS, so the "lift" is misleading
-                if a["pre_avg"] > 50:
+                # Only show lift annotation if baseline is meaningful relative to post
+                # A near-zero baseline (e.g. $8/mo vs $5,600 post) means the property
+                # wasn't really charging pet rent before PS, so the "lift" is misleading.
+                # Threshold: pre_avg must be >= 2% of post_recent_avg to be meaningful.
+                _post_ref = a.get("post_recent_avg", a.get("post_monthly_avg", 0))
+                _baseline_meaningful = (
+                    _post_ref <= 0  # no post data — show whatever we have
+                    or a["pre_avg"] >= _post_ref * 0.02  # baseline is ≥ 2% of post
+                )
+                if _baseline_meaningful:
                     sign = "+" if a["diff_monthly"] >= 0 else ""
                     color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
                     arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
@@ -2063,8 +2078,12 @@ def build_individual_property_charts(
                 )
 
         # ── Baseline (pre-launch avg) — use row/col so axis refs are correct ──
-        # Only show baseline line if it's meaningful (> $50/mo); near-zero baselines clutter the chart
-        if a and a["pre_avg"] > 50 and a["n_pre"] > 0:
+        # Only show baseline line if it's meaningful relative to post-launch revenue
+        _post_ref_bl = a.get("post_recent_avg", a.get("post_monthly_avg", 0)) if a else 0
+        _bl_meaningful = a and a["pre_avg"] > 0 and a["n_pre"] > 0 and (
+            _post_ref_bl <= 0 or a["pre_avg"] >= _post_ref_bl * 0.02
+        )
+        if _bl_meaningful:
             fig.add_hline(
                 y=a["pre_avg"],
                 row=r, col=c,
@@ -2167,7 +2186,7 @@ def generate_html_report(
     comparable = {}
     if launch_analysis:
         comparable = {p: a for p, a in launch_analysis.items()
-                      if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
+                      if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -2184,7 +2203,7 @@ def generate_html_report(
         sorted_la = sorted(launch_analysis.items(), key=lambda x: -x[1].get("diff_monthly", 0))
         for prop, a in sorted_la:
             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-            if a["n_pre"] > 0 and a.get("baseline_reliable", True):
+            if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True):
                 s_m = "+" if a["diff_monthly"] >= 0 else ""
                 s_t = "+" if a["diff_total"] >= 0 else ""
                 color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
@@ -5696,7 +5715,7 @@ if st.session_state.all_charges_df is not None:
                 _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
                 _funnel_comparable = {
                     p: a for p, a in launch_analysis.items()
-                    if a["n_pre"] > 0 and a.get("baseline_reliable", True)
+                    if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
                 } if launch_analysis else {}
                 _render_property_funnel(
                     n_total=st.session_state.get("total_parent_props") or None,
@@ -5825,7 +5844,7 @@ if st.session_state.all_charges_df is not None:
 
                 if launch_analysis:
                     comparable = {p: a for p, a in launch_analysis.items()
-                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
+                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
                     n_no_pre = len(launch_analysis) - len(comparable)
 
                     if comparable:
@@ -6388,8 +6407,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         for prop, a in launch_analysis.items():
                             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                            # Properties need pre-launch months AND reliable baseline to compare
-                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True)
+                            # Properties need pre-launch months AND reliable+meaningful baseline to compare
+                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
 
                             if has_comparison:
                                 sign_m = "+" if a["diff_monthly"] >= 0 else ""
@@ -6700,7 +6719,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 # Comparable properties (with reliable pre & post data)
                 _comparable = {p: a for p, a in _launch_analysis.items()
-                               if a["n_pre"] > 0 and a.get("baseline_reliable", True)} if _launch_analysis else {}
+                               if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)} if _launch_analysis else {}
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 
