@@ -1867,14 +1867,20 @@ def build_individual_property_charts(
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
             elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
-                sign = "+" if a["diff_monthly"] >= 0 else ""
-                color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
-                arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
-                short += (
-                    f'  <b><span style="color:{color}">'
-                    f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
-                    f'</span></b>'
-                )
+                # Only show lift annotation if baseline is meaningful (> $50/mo)
+                # A near-zero baseline (e.g. $8/mo) means the property wasn't really
+                # charging pet rent before PS, so the "lift" is misleading
+                if a["pre_avg"] > 50:
+                    sign = "+" if a["diff_monthly"] >= 0 else ""
+                    color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
+                    arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
+                    short += (
+                        f'  <b><span style="color:{color}">'
+                        f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
+                        f'</span></b>'
+                    )
+                else:
+                    short += f'  <span style="color:#999;font-size:0.85em">no meaningful pre-PS baseline</span>'
             elif a and a["n_pre"] > 0 and not a.get("baseline_reliable", True):
                 short += f'  <span style="color:#999;font-size:0.85em">insufficient baseline</span>'
             else:
@@ -2057,7 +2063,8 @@ def build_individual_property_charts(
                 )
 
         # ── Baseline (pre-launch avg) — use row/col so axis refs are correct ──
-        if a and a["pre_avg"] > 0 and a["n_pre"] > 0:
+        # Only show baseline line if it's meaningful (> $50/mo); near-zero baselines clutter the chart
+        if a and a["pre_avg"] > 50 and a["n_pre"] > 0:
             fig.add_hline(
                 y=a["pre_avg"],
                 row=r, col=c,
