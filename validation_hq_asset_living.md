@@ -202,6 +202,10 @@ ORDER BY 1, 2;
 **Updated 2026-03-16:** Uses up to 6 months pre, up to 6 most recent completed months post.
 Monthly lift = recent post avg − pre avg. Total lift = actual observed (sum post revenue − pre avg × post months).
 
+**Full query with all fixes is in `step4_lift_analysis.sql`** — includes one-time charge handling, property_id joins, non-current tenant null date handling, and baseline_meaningful flag.
+
+The simplified version below is kept for reference but see the .sql file for the production version.
+
 ```sql
 WITH pet_codes AS (
     SELECT DISTINCT charge_code
