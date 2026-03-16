@@ -3068,10 +3068,19 @@ def generate_tranche_pdf(
             f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
         )
     else:
-        narrative(
-            "All screened tenants are currently being charged pet rent. "
-            "No billing gaps identified -- this is a strong compliance result."
+        _opportunity_note = (
+            "All screened tenants are currently being charged pet rent — no billing gaps identified."
         )
+        if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
+            _additional_at_100 = total_projected - current_monthly_rev if current_monthly_rev else 0
+            if _additional_at_100 > 0:
+                _opportunity_note += (
+                    f" However, your portfolio is currently at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
+                    f"Closing that gap to 100% — through consistent screening enforcement at move-in "
+                    f"and renewal — would unlock an estimated ${_additional_at_100:,.0f}/mo in additional "
+                    f"pet fee revenue (${total_projected:,.0f}/mo projected at full adoption)."
+                )
+        narrative(_opportunity_note)
 
     divider()
 
