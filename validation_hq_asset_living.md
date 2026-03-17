@@ -197,7 +197,14 @@ ORDER BY 1, 2;
 
 ---
 
-## Step 4: Pre/Post PetScreening Launch Analysis
+## Step 4: Pre/Post PetScreening Launch Analysis (6-and-6 Methodology)
+
+**Updated 2026-03-16:** Uses up to 6 months pre, up to 6 most recent completed months post.
+Monthly lift = recent post avg − pre avg. Total lift = actual observed (sum post revenue − pre avg × post months).
+
+**Full query with all fixes is in `step4_lift_analysis.sql`** — includes one-time charge handling, property_id joins, non-current tenant null date handling, and baseline_meaningful flag.
+
+The simplified version below is kept for reference but see the .sql file for the production version.
 
 ```sql
 WITH pet_codes AS (
@@ -271,7 +278,7 @@ classified AS (
     FROM monthly_by_prop
 ),
 
--- Pre-launch baseline (last 3 months before launch)
+-- Pre-launch baseline: up to 6 months before launch
 pre_baseline AS (
     SELECT
         property_name,
@@ -286,35 +293,56 @@ pre_baseline AS (
         FROM classified
         WHERE period = 'pre'
     )
-    WHERE rn <= 3
+    WHERE rn <= 6  -- up to 6 months pre (was 3)
     GROUP BY 1
 ),
 
--- Post-launch summary
-post_summary AS (
+-- Post-launch: all months (for total observed revenue)
+post_all AS (
     SELECT
         property_name,
         launch_date,
-        AVG(monthly_revenue)  AS post_monthly_avg,
         SUM(monthly_revenue)  AS post_total,
         COUNT(*)              AS post_months
     FROM classified
     WHERE period = 'post'
     GROUP BY 1, 2
+),
+
+-- Post-launch recent: up to 6 most recent COMPLETED months (excludes current month)
+post_recent AS (
+    SELECT
+        property_name,
+        AVG(monthly_revenue)  AS post_recent_avg,
+        COUNT(*)              AS recent_post_months
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY property_name
+                ORDER BY month_start DESC
+            ) AS rn
+        FROM classified
+        WHERE period = 'post'
+          AND month_start < DATE_TRUNC('MONTH', CURRENT_DATE())  -- exclude current partial month
+    )
+    WHERE rn <= 6  -- up to 6 most recent completed months
+    GROUP BY 1
 )
 
 SELECT
-    p.property_name,
-    p.launch_date,
-    COALESCE(b.pre_months, 0)                            AS pre_months,
-    p.post_months,
-    COALESCE(b.pre_avg, 0)                               AS pre_avg_monthly,
-    p.post_monthly_avg,
-    p.post_monthly_avg - COALESCE(b.pre_avg, 0)          AS monthly_lift,
-    (p.post_monthly_avg - COALESCE(b.pre_avg, 0)) * p.post_months AS total_lift,
+    pa.property_name,
+    pa.launch_date,
+    COALESCE(b.pre_months, 0)                                       AS pre_months,
+    COALESCE(pr.recent_post_months, 0)                               AS recent_post_months,
+    pa.post_months                                                   AS total_post_months,
+    ROUND(COALESCE(b.pre_avg, 0), 2)                                AS pre_avg_monthly,
+    ROUND(COALESCE(pr.post_recent_avg, 0), 2)                       AS current_avg_monthly,
+    ROUND(COALESCE(pr.post_recent_avg, 0) - COALESCE(b.pre_avg, 0), 2) AS monthly_lift,
+    ROUND(pa.post_total - (COALESCE(b.pre_avg, 0) * pa.post_months), 2) AS cumulative_impact,
     CASE WHEN COALESCE(b.pre_months, 0) >= 3 THEN 'reliable' ELSE 'insufficient' END AS baseline_quality
-FROM post_summary p
-LEFT JOIN pre_baseline b ON p.property_name = b.property_name
+FROM post_all pa
+LEFT JOIN pre_baseline b ON pa.property_name = b.property_name
+LEFT JOIN post_recent pr ON pa.property_name = pr.property_name
 ORDER BY monthly_lift DESC;
 ```
 

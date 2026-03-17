@@ -129,38 +129,42 @@ WHERE launch_date < '1000-01-01'
 
 ## How The Lift Calculation Works (Reference)
 
+**Updated 2026-03-16:** Changed from 3-month pre / all-post-avg to 6-and-6 windowed approach.
+
 ### Per Property:
 ```
-Pre-launch baseline = avg of last 3 months before launch (within lookback window)
-Post-launch avg = avg of ALL post-launch months
-Monthly lift = post avg − pre baseline
-Total lift = monthly lift × number of post-launch months
+Pre-launch baseline = avg of up to 6 months before launch (uses whatever is available)
+Post-launch current avg = avg of up to 6 most recent COMPLETED months (excludes current partial month)
+Monthly lift = post_recent_avg − pre_avg  (the "current lift")
+Total lift = sum(all post revenue) − (pre_avg × n_post_months)  (actual observed cumulative)
 ```
 
 ### Aggregate:
 ```
-Agg monthly change = SUM of each property's monthly lift (where pre_months > 0)
-Agg total change = SUM of each property's total lift (where pre_months > 0)
+Agg monthly change = SUM of each property's monthly lift (where pre_months > 0 and baseline reliable)
+Agg total change = SUM of each property's total lift (where pre_months > 0 and baseline reliable)
 ```
 
 ### Example:
 ```
 Property A launched June 2024:
-  Pre avg (Mar-May 2024): $1,000/mo
-  Post avg (Jun 2024–Mar 2026): $1,800/mo
-  Monthly lift: +$800/mo
-  Post months: 22
-  Total lift: $800 × 22 = +$17,600
+  Pre avg (Dec 2023–May 2024, 6mo): $1,000/mo
+  Recent post avg (Sep 2025–Feb 2026, 6 completed mo): $2,100/mo
+  Monthly lift: +$1,100/mo  ← reflects mature adoption, not dragged by ramp
+  Post months total: 22
+  Actual post revenue total: $39,600
+  Total lift: $39,600 − ($1,000 × 22) = +$17,600  ← real observed dollars
 
 Property B launched Jan 2026:
-  Pre avg (Oct-Dec 2025): $500/mo
-  Post avg (Jan-Mar 2026): $900/mo
+  Pre avg (Jul-Dec 2025, 6mo): $500/mo
+  Recent post avg (Jan-Feb 2026, 2 completed mo): $900/mo
   Monthly lift: +$400/mo
-  Post months: 3
-  Total lift: $400 × 3 = +$1,200
+  Post months total: 3
+  Actual post revenue total: $2,700
+  Total lift: $2,700 − ($500 × 3) = +$1,200
 
 Aggregate:
-  Monthly change: $800 + $400 = +$1,200/mo
+  Monthly change: $1,100 + $400 = +$1,500/mo
   Total change: $17,600 + $1,200 = +$18,800
 ```
 
@@ -203,14 +207,18 @@ Not handled currently. The lift calculation attributes all post-launch increase 
 
 ---
 
-## Open Question for the Team
+## ✅ Resolved: Lift Calculation Methodology (2026-03-16)
 
-**How should we calculate the monthly lift?**
+**Decision:** Switched to 6-and-6 windowed approach per Andy's direction.
 
-| Approach | Pre Baseline | Post Comparison | Pros | Cons |
-|----------|-------------|-----------------|------|------|
-| Current | Last 3 months pre-launch | Avg of ALL post months | Smooths out volatility | Early ramp-up drags down the number |
-| Alternative | Last 3 months pre-launch | Most recent completed month | Shows current state vs before | Single month can be noisy |
+| Component | Old Approach | New Approach |
+|-----------|-------------|--------------|
+| **Pre baseline** | Last 3 months before launch | Up to 6 months before launch |
+| **Post comparison (monthly lift)** | Avg of ALL post months | Up to 6 most recent completed months |
+| **Total/cumulative lift** | Monthly lift × post months | Actual observed: sum(all post revenue) − (pre_avg × post months) |
+| **Current month** | Included in post avg | Excluded (incomplete data) |
+
+**Why:** Old approach had early ramp-up months dragging down the post average, and only 3 pre months made the baseline sensitive to seasonality. The 6-and-6 approach smooths seasonal noise on both sides, and using recent completed months shows the "current lift" after adoption matures.
 
 ---
 

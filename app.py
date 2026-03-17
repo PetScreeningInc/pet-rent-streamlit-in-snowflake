@@ -1496,12 +1496,23 @@ def parse_date(d):
 def compute_launch_analysis(monthly_by_prop, months, launch_dates):
     """
     For each property with a launch date, compute:
-      - pre_avg        = average monthly revenue BEFORE launch
-      - post_monthly_avg = average monthly revenue AFTER launch
-      - diff_monthly   = post_avg − pre_avg  (apples-to-apples)
-      - diff_total     = diff_monthly × number of post months
+      - pre_avg             = average monthly revenue in up to 6 months BEFORE launch
+      - post_recent_avg     = average monthly revenue in up to 6 most recent COMPLETED months after launch
+      - diff_monthly        = post_recent_avg − pre_avg  (current lift — apples-to-apples)
+      - diff_total          = actual observed cumulative lift: total_post_revenue − (pre_avg × n_post_months)
+      - post_monthly_avg    = average of ALL post months (kept for backward compat / charts)
+
+    Methodology (updated 2026-03-16):
+      Pre-baseline:  up to 6 months before launch (uses whatever is available)
+      Post-current:  up to 6 most recent COMPLETED months (excludes current partial month)
+      Monthly lift:  post_recent_avg − pre_avg
+      Total lift:    sum(all post revenue) − (pre_avg × total post months)  [actual observed]
+
     Returns dict keyed by property name.
     """
+    today = datetime.now()
+    current_month = datetime(today.year, today.month, 1)
+
     analysis = {}
     for prop, prop_data in monthly_by_prop.items():
         launch = launch_dates.get(prop)
@@ -1542,26 +1553,50 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
 
         post_total = sum(prop_data.get(m, 0) for m in post_months)
 
-        # Pre-launch avg: use last 3 months before launch (if available)
-        # This gives a "business as usual" baseline, not dragged down by early ramp-up
-        pre_baseline_months = pre_months[-3:] if len(pre_months) >= 3 else pre_months
+        # Pre-launch avg: use up to 6 months before launch (whatever is available)
+        # This gives a robust "business as usual" baseline that smooths seasonal noise
+        pre_baseline_months = pre_months[-6:] if len(pre_months) >= 1 else pre_months
         pre_values = [prop_data.get(m, 0) for m in pre_baseline_months]
         pre_avg = sum(pre_values) / len(pre_values) if pre_values else 0
+
+        # Post-launch: all-time average (kept for charts and backward compat)
         post_monthly_avg = post_total / n_post if n_post > 0 else 0
 
-        # Clean diff: post avg/mo − pre avg/mo
-        diff_monthly = post_monthly_avg - pre_avg
-        # Total = that monthly lift × number of post months
-        diff_total = diff_monthly * n_post
+        # Current lift: use up to 6 most recent COMPLETED post months
+        # (excludes the current partial month so we don't undercount)
+        completed_post = [m for m in post_months if m < current_month]
+        recent_post_months = completed_post[-6:] if completed_post else []
+        n_recent_post = len(recent_post_months)
+        post_recent_avg = (
+            sum(prop_data.get(m, 0) for m in recent_post_months) / n_recent_post
+            if n_recent_post > 0 else post_monthly_avg
+        )
+
+        # Monthly lift = recent post avg − pre avg (the "current lift" number)
+        diff_monthly = post_recent_avg - pre_avg
+        # Total lift = actual observed cumulative difference
+        # (what they actually collected minus what they would have at the old rate)
+        diff_total = post_total - (pre_avg * n_post)
+
+        # Baseline is "meaningful" if pre_avg is >= 2% of post_recent_avg.
+        # Properties with near-zero baselines (e.g. $8 vs $5,600 post) weren't
+        # really charging pet rent before PS — their "lift" is misleading.
+        _baseline_meaningful = (
+            post_recent_avg <= 0  # no post data — keep whatever we have
+            or pre_avg >= post_recent_avg * 0.02
+        )
 
         analysis[prop] = {
             "n_post": n_post,
             "n_pre": len(pre_baseline_months),
+            "n_recent_post": n_recent_post,
             "all_pre_months": len(pre_months),
             "baseline_reliable": len(pre_months) >= 3,
+            "baseline_meaningful": _baseline_meaningful,
             "pre_avg": pre_avg,
             "post_total": post_total,
             "post_monthly_avg": post_monthly_avg,
+            "post_recent_avg": post_recent_avg,
             "diff_monthly": diff_monthly,
             "diff_total": diff_total,
             "launch_month": launch_month,
@@ -1841,14 +1876,26 @@ def build_individual_property_charts(
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
             elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
-                sign = "+" if a["diff_monthly"] >= 0 else ""
-                color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
-                arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
-                short += (
-                    f'  <b><span style="color:{color}">'
-                    f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
-                    f'</span></b>'
+                # Only show lift annotation if baseline is meaningful relative to post
+                # A near-zero baseline (e.g. $8/mo vs $5,600 post) means the property
+                # wasn't really charging pet rent before PS, so the "lift" is misleading.
+                # Threshold: pre_avg must be >= 2% of post_recent_avg to be meaningful.
+                _post_ref = a.get("post_recent_avg", a.get("post_monthly_avg", 0))
+                _baseline_meaningful = (
+                    _post_ref <= 0  # no post data — show whatever we have
+                    or a["pre_avg"] >= _post_ref * 0.02  # baseline is ≥ 2% of post
                 )
+                if _baseline_meaningful:
+                    sign = "+" if a["diff_monthly"] >= 0 else ""
+                    color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
+                    arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
+                    short += (
+                        f'  <b><span style="color:{color}">'
+                        f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
+                        f'</span></b>'
+                    )
+                else:
+                    short += f'  <span style="color:#999;font-size:0.85em">no meaningful pre-PS baseline</span>'
             elif a and a["n_pre"] > 0 and not a.get("baseline_reliable", True):
                 short += f'  <span style="color:#999;font-size:0.85em">insufficient baseline</span>'
             else:
@@ -2031,13 +2078,18 @@ def build_individual_property_charts(
                 )
 
         # ── Baseline (pre-launch avg) — use row/col so axis refs are correct ──
-        if a and a["pre_avg"] > 0 and a["n_pre"] > 0:
+        # Only show baseline line if it's meaningful relative to post-launch revenue
+        _post_ref_bl = a.get("post_recent_avg", a.get("post_monthly_avg", 0)) if a else 0
+        _bl_meaningful = a and a["pre_avg"] > 0 and a["n_pre"] > 0 and (
+            _post_ref_bl <= 0 or a["pre_avg"] >= _post_ref_bl * 0.02
+        )
+        if _bl_meaningful:
             fig.add_hline(
                 y=a["pre_avg"],
                 row=r, col=c,
                 line=dict(color="#E2AB58", width=1.5, dash="dot"),
             )
-            _baseline_label = f"Pre-PS avg ${a['pre_avg']:,.0f}/mo ({a['n_pre']}mo)"
+            _baseline_label = f"Pre-PS baseline ${a['pre_avg']:,.0f}/mo ({a['n_pre']}mo avg)"
             if not a.get("baseline_reliable", True):
                 _baseline_label += " -- insufficient data"
             fig.add_annotation(
@@ -2134,7 +2186,7 @@ def generate_html_report(
     comparable = {}
     if launch_analysis:
         comparable = {p: a for p, a in launch_analysis.items()
-                      if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
+                      if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -2151,7 +2203,7 @@ def generate_html_report(
         sorted_la = sorted(launch_analysis.items(), key=lambda x: -x[1].get("diff_monthly", 0))
         for prop, a in sorted_la:
             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-            if a["n_pre"] > 0 and a.get("baseline_reliable", True):
+            if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True):
                 s_m = "+" if a["diff_monthly"] >= 0 else ""
                 s_t = "+" if a["diff_total"] >= 0 else ""
                 color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
@@ -2160,10 +2212,10 @@ def generate_html_report(
                     <td>{short}</td>
                     <td>{a["launch_month"].strftime("%b %Y")}</td>
                     <td>${a["pre_avg"]:,.0f}</td>
-                    <td>${a["post_monthly_avg"]:,.0f}</td>
+                    <td>${a["post_recent_avg"]:,.0f}</td>
                     <td style="color:{color};font-weight:bold">{s_m}${a["diff_monthly"]:,.0f}/mo</td>
                     <td style="color:{color};font-weight:bold">{s_t}${a["diff_total"]:,.0f}</td>
-                    <td>{a["n_pre"]}mo before · {a["n_post"]}mo after</td>
+                    <td>{a["n_pre"]}mo pre · {a.get("n_recent_post", 0)}mo recent · {a["n_post"]}mo total</td>
                 </tr>"""
             elif a["n_pre"] > 0 and not a.get("baseline_reliable", True):
                 impact_rows_html += f"""
@@ -2171,9 +2223,9 @@ def generate_html_report(
                     <td>{short}</td>
                     <td>{a["launch_month"].strftime("%b %Y")}</td>
                     <td>${a["pre_avg"]:,.0f}</td>
-                    <td>${a["post_monthly_avg"]:,.0f}</td>
+                    <td>${a.get("post_recent_avg", a["post_monthly_avg"]):,.0f}</td>
                     <td colspan="2" style="text-align:center;color:#999">Insufficient baseline ({a["n_pre"]}mo)</td>
-                    <td>{a["n_pre"]}mo before · {a["n_post"]}mo after <span style="color:#CF5A3F;font-size:0.8em">(low data)</span></td>
+                    <td>{a["n_pre"]}mo pre · {a["n_post"]}mo total <span style="color:#CF5A3F;font-size:0.8em">(low data)</span></td>
                 </tr>"""
             else:
                 impact_rows_html += f"""
@@ -2741,10 +2793,10 @@ def generate_html_report(
     <h3>How We Calculate PetScreening Impact</h3>
     <p>For each property, we compare average monthly pet fee revenue <b>before</b> vs <b>after</b> PetScreening launch:</p>
     <ul>
-      <li><b>Before PetScreening (avg/mo)</b> — Average of the last 3 months before launch</li>
-      <li><b>After PetScreening (avg/mo)</b> — Total post-launch revenue ÷ number of post-launch months</li>
-      <li><b>Monthly Change</b> = After avg − Before avg</li>
-      <li><b>Total Change</b> = Monthly Change × number of post-launch months</li>
+      <li><b>Before PetScreening (avg/mo)</b> — Average of up to 6 months before launch (uses whatever pre-launch data is available)</li>
+      <li><b>After PetScreening (avg/mo)</b> — Average of up to 6 most recent completed months (excludes current partial month)</li>
+      <li><b>Monthly Change</b> = Recent post avg − Pre avg (the current lift)</li>
+      <li><b>Total Change</b> = Total post-launch revenue − (Pre avg × post months) — actual observed cumulative impact</li>
     </ul>
   </div>
 
@@ -2787,7 +2839,7 @@ def generate_html_report(
   {"<div class='section'><h2>Current Monthly Fee Revenue by Property</h2><div class='chart-section'>" + snapshot_html + "</div></div>" if snapshot_html else ""}
 
   <!-- Impact Breakdown Table -->
-  {"<div class='section'><h2>PetScreening Impact by Property</h2><table><thead><tr><th>Property</th><th>Launch</th><th>Pre-PS Avg ($/mo)</th><th>Post-PS Avg ($/mo)</th><th>Monthly Change</th><th>Total Change</th><th>Window</th></tr></thead><tbody>" + impact_rows_html + "</tbody></table></div>" if impact_rows_html else ""}
+  {"<div class='section'><h2>PetScreening Impact by Property</h2><table><thead><tr><th>Property</th><th>Launch</th><th>Pre-PS Avg ($/mo)</th><th>Current Avg ($/mo)</th><th>Monthly Lift</th><th>Cumulative Impact</th><th>Window</th></tr></thead><tbody>" + impact_rows_html + "</tbody></table></div>" if impact_rows_html else ""}
 
   <div class="footer">
     <img src="{_logo_dark}" alt="PetScreening" class="footer-logo"
@@ -3042,10 +3094,19 @@ def generate_tranche_pdf(
             f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
         )
     else:
-        narrative(
-            "All screened tenants are currently being charged pet rent. "
-            "No billing gaps identified -- this is a strong compliance result."
+        _opportunity_note = (
+            "All screened tenants are currently being charged pet rent — no billing gaps identified."
         )
+        if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
+            _additional_at_100 = total_projected - current_monthly_rev if current_monthly_rev else 0
+            if _additional_at_100 > 0:
+                _opportunity_note += (
+                    f" However, your portfolio is currently at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
+                    f"Closing that gap to 100% — through consistent screening enforcement at move-in "
+                    f"and renewal — would unlock an estimated ${_additional_at_100:,.0f}/mo in additional "
+                    f"pet fee revenue (${total_projected:,.0f}/mo projected at full adoption)."
+                )
+        narrative(_opportunity_note)
 
     divider()
 
@@ -5103,8 +5164,17 @@ if fetch_btn:
             else:
                 st.info(f"Found **{api_count}** {_system_label}-integrated properties for **{label}**.")
 
-            st.session_state.chart_data = None  # Clear stale charts
-            st.session_state.pm_emails_cache = None  # Clear PM cache for new selection
+            # Clear ALL stale data from previous selection
+            st.session_state.chart_data = None
+            st.session_state.pm_emails_cache = None
+            st.session_state.all_charges_df = None
+            st.session_state.ar_charges_df = None
+            st.session_state.fetch_log = None
+            # Clear cached missing rent, suspected, and charge type data
+            for _stale_key in list(st.session_state.keys()):
+                if (_stale_key.startswith("missing_rent_") or _stale_key.startswith("suspected_") or
+                    _stale_key in ("export_html", "exec_html", "charge_type_overrides")):
+                    del st.session_state[_stale_key]
             st.markdown(f"Fetching {_system_label} data (full history — display window: **{lookback_months} months**)...")
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -5305,19 +5375,59 @@ if st.session_state.all_charges_df is not None:
         with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
             st.markdown(
                 "Download the raw data that the app uses so you can upload it to "
-                "Snowflake and independently recreate/validate the numbers with SQL."
+                "Snowflake and independently recreate/validate the numbers with SQL.  \n"
+                "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
             )
 
             pmc_sys = st.session_state.get("pmc_system", "yardi")
             props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
+
+            # ── Fix dates before export ──────────────────────────────
+            # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
+            # Fix all date columns so the CSV can be uploaded to Snowflake directly.
+            _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
+                          'charge_from_date', 'charge_to_date']
+
+            def _fix_dates_for_export(export_df):
+                """Fix century-shifted dates (0025 → 2025) in all date columns."""
+                fixed = export_df.copy()
+                for col in _date_cols:
+                    if col not in fixed.columns:
+                        continue
+                    def _fix_date_val(val):
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            return val
+                        s = str(val).strip()
+                        if not s or s.lower() in ('nan', 'nat', 'none', ''):
+                            return None
+                        # Try parsing and fix year if < 1000
+                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                            try:
+                                dt = datetime.strptime(s[:10], fmt)
+                                if dt.year < 1000:
+                                    dt = dt.replace(year=dt.year + 2000)
+                                return dt.strftime("%Y-%m-%d")
+                            except (ValueError, TypeError):
+                                continue
+                        # If it's already a datetime/Timestamp object
+                        try:
+                            if hasattr(val, 'year') and val.year < 1000:
+                                val = val.replace(year=val.year + 2000)
+                            return str(val)[:10]
+                        except Exception:
+                            return val
+                    fixed[col] = fixed[col].apply(_fix_date_val)
+                return fixed
+
             exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
 
             with exp_c1:
                 st.markdown("**1. All API Charges**")
-                st.caption("Every charge line from the API (all tenants, all codes). This is the full rent roll.")
+                st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
+                _export_all = _fix_dates_for_export(df)
                 st.download_button(
                     "Download all_charges.csv",
-                    data=df.to_csv(index=False),
+                    data=_export_all.to_csv(index=False),
                     file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     key="dl_all_charges",
@@ -5325,11 +5435,12 @@ if st.session_state.all_charges_df is not None:
 
             with exp_c2:
                 st.markdown("**2. Pet Charges Only**")
-                st.caption("Filtered to your selected pet charge codes only.")
+                st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
                 _pet_only = df[df['charge_code'].isin(selected_codes)]
+                _export_pet = _fix_dates_for_export(_pet_only)
                 st.download_button(
                     "Download pet_charges.csv",
-                    data=_pet_only.to_csv(index=False),
+                    data=_export_pet.to_csv(index=False),
                     file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     key="dl_pet_charges",
@@ -5667,7 +5778,7 @@ if st.session_state.all_charges_df is not None:
                 _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
                 _funnel_comparable = {
                     p: a for p, a in launch_analysis.items()
-                    if a["n_pre"] > 0 and a.get("baseline_reliable", True)
+                    if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
                 } if launch_analysis else {}
                 _render_property_funnel(
                     n_total=st.session_state.get("total_parent_props") or None,
@@ -5796,7 +5907,7 @@ if st.session_state.all_charges_df is not None:
 
                 if launch_analysis:
                     comparable = {p: a for p, a in launch_analysis.items()
-                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True)}
+                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
                     n_no_pre = len(launch_analysis) - len(comparable)
 
                     if comparable:
@@ -5877,16 +5988,16 @@ the average monthly pet fee revenue **before** and **after** launch.
 
 | Metric | Formula | What it tells you |
 |--------|---------|-------------------|
-| **Before PetScreening (avg/mo)** | Average of the last 3 months before launch (or fewer if less data is available) | The property's recent baseline monthly pet fee collection before PetScreening was active |
-| **After PetScreening (avg/mo)** | Total post-launch revenue ÷ number of post-launch months | The property's average monthly pet fee collection after PetScreening went live |
-| **Monthly Change** | After avg − Before avg | The difference in average monthly revenue — a direct, apples-to-apples comparison |
-| **Total Change** | Monthly Change × number of post-launch months | The cumulative additional revenue attributable to the change in monthly average since launch |
+| **Before PetScreening (avg/mo)** | Average of up to 6 months before launch (uses whatever pre-launch data is available) | The property's baseline monthly pet fee collection before PetScreening was active — uses more data when available to smooth seasonal noise |
+| **After PetScreening (avg/mo)** | Average of up to 6 most recent **completed** months (excludes current partial month) | The property's current monthly pet fee collection — reflects mature adoption, not dragged down by early ramp-up months |
+| **Monthly Change** | Recent post avg − Pre avg | The current lift — what PetScreening is doing for this property right now |
+| **Total Change** | Sum(all post revenue) − (Pre avg × post months) | The actual observed cumulative revenue above the pre-launch baseline — real dollars, not projected |
 
 **Reading the charts**
 
 - <span style="color:#7D9BC1">**Blue bars**</span> = months **before** PetScreening was active
 - <span style="color:#677848">**Green bars**</span> = months **after** PetScreening went live (including the launch month)
-- <span style="color:#E2AB58">**Gold dotted line**</span> = the pre-launch monthly average (baseline from last 3 months)
+- <span style="color:#E2AB58">**Gold dotted line**</span> = the pre-launch monthly average (baseline from up to 6 months)
 - <span style="color:#CF5A3F">**Red dashed line**</span> = the PetScreening launch date
 - <span style="color:rgba(156,39,176,0.85)">**Purple line**</span> = adoption % overlay (when enabled)
 - <span style="color:#DD7B45">**Orange bars (stacked)**</span> = estimated uncollected pet rent from confirmed tenants (when "Show uncollected pet rent" is on)
@@ -5922,12 +6033,16 @@ The subtitle on each chart shows "X unpaid" and/or "X suspected" badges.
 
 The **launch month itself is counted as post-launch** (green). For example, if PetScreening launched
 on Nov 19, the November bar is green because PetScreening was active for part of that month.
-The pre-launch baseline uses the 3 months *before* the launch month (e.g., Aug, Sep, Oct).
+The pre-launch baseline uses up to 6 months *before* the launch month (e.g., May–Oct for a Nov launch).
 
 **Important notes**
 
-- The pre-launch baseline uses the **last 3 months** before the launch month (or fewer if less data is available),
-  giving a "business as usual" average that isn't skewed by early ramp-up months.
+- The pre-launch baseline uses **up to 6 months** before the launch month (whatever data is available),
+  giving a robust "business as usual" average that smooths out seasonal variation.
+- The post-launch comparison uses the **most recent 6 completed months** (excluding the current partial month),
+  reflecting the property's current performance after adoption has matured — not dragged down by ramp-up months.
+- The cumulative impact ("Total Change") uses **actual observed revenue** — total post-launch revenue minus
+  what the property would have collected at the pre-launch rate. This is real dollars, not a projection.
 - Revenue changes may reflect factors beyond PetScreening (e.g., new units, rent adjustments, seasonal variation).
   This analysis measures the **observed change** in pet fee revenue coinciding with PetScreening's launch.
 - Properties that launched before the lookback window have no pre-launch baseline available and are
@@ -6355,8 +6470,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         for prop, a in launch_analysis.items():
                             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                            # Properties need pre-launch months AND reliable baseline to compare
-                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True)
+                            # Properties need pre-launch months AND reliable+meaningful baseline to compare
+                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
 
                             if has_comparison:
                                 sign_m = "+" if a["diff_monthly"] >= 0 else ""
@@ -6366,10 +6481,10 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     "Property": short,
                                     "Launch": a["launch_month"].strftime("%b %Y"),
                                     "Pre-PS Avg ($/mo)": f"${a['pre_avg']:,.0f}",
-                                    "Post-PS Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
-                                    "Monthly Change": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
-                                    "Total Change": f"{sign_t}${a['diff_total']:,.0f}",
-                                    "Window": f"{a['n_pre']}mo before · {a['n_post']}mo after",
+                                    "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
+                                    "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
+                                    "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
+                                    "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo recent post · {a['n_post']}mo total",
                                     "_sort": a["diff_monthly"],
                                     "_comparable": True,
                                 })
@@ -6378,9 +6493,9 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     "Property": short,
                                     "Launch": a["launch_month"].strftime("%b %Y"),
                                     "Pre-PS Avg ($/mo)": "Live before window",
-                                    "Post-PS Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
-                                    "Monthly Change": "—",
-                                    "Total Change": "—",
+                                    "Current Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
+                                    "Monthly Lift": "—",
+                                    "Cumulative Impact": "—",
                                     "Window": f"{a['n_post']}mo after (no pre data)",
                                     "_sort": -999999,
                                     "_comparable": False,
@@ -6672,7 +6787,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 # Comparable properties (with reliable pre & post data)
                 _comparable = {p: a for p, a in _launch_analysis.items()
-                               if a["n_pre"] > 0 and a.get("baseline_reliable", True)} if _launch_analysis else {}
+                               if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)} if _launch_analysis else {}
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 
@@ -7787,7 +7902,9 @@ average as fallback if no payers at that property).
 - **Source:** `PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS.PROPERTY_LAUNCH_DATE`
 - **Launch month is counted as post-launch** (green bar). The red line sits at the boundary
   between the last pre-launch month and the launch month.
-- **Pre-launch baseline** = average of the last 3 months before the launch month
+- **Pre-launch baseline** = average of up to 6 months before the launch month (uses whatever data is available)
+- **Post-launch current lift** = average of up to 6 most recent completed months (excludes current partial month)
+- **Cumulative impact** = total actual post-launch revenue − (pre_avg × number of post months)
 - **Baseline reliability** (Entrata): if fewer than 3 pre-launch months of charge data
   are available, the baseline is flagged as unreliable. Charts show "-- insufficient data"
   and the impact table adds a "(low data)" badge. A warning banner appears if most
@@ -7973,7 +8090,7 @@ incomplete or missing entirely.
 **What the app does:**
 
 - `compute_launch_analysis` now tracks `baseline_reliable` for each property:
-  reliable = at least **3 months** of pre-launch charge data available
+  reliable = at least **3 months** of pre-launch charge data available (baseline uses up to 6 months when available)
 - Properties with unreliable baselines are flagged in the charts with
   "-- insufficient data" annotations
 - The impact summary table shows a **(low data)** badge next to unreliable properties
@@ -8048,12 +8165,14 @@ Each number represents a progressively smaller slice — here's what each one me
                 st.markdown("""
 For each property with a PetScreening launch date:
 
-1. **Pre-launch baseline** = average monthly pet fee revenue in the **3 months before** the launch month
-2. **Post-launch average** = total post-launch revenue ÷ number of post-launch months
-3. **Monthly Change** = Post-launch avg − Pre-launch baseline
-4. **Total Change** = Monthly Change × number of post-launch months
+1. **Pre-launch baseline** = average monthly pet fee revenue in **up to 6 months before** the launch month (uses whatever pre-launch data is available — more months = less seasonal noise)
+2. **Post-launch current avg** = average of up to 6 most recent **completed** months after launch (excludes the current partial month to avoid undercounting)
+3. **Monthly Change** = Recent post avg − Pre-launch baseline (the "current lift" — what PS is doing now)
+4. **Total Change** = Sum(all post revenue) − (Pre avg × post months) — actual observed cumulative impact in real dollars
 
 The aggregate KPIs sum these values across all **comparable** properties (those with both pre & post data).
+
+**Why up to 6 months on each side?** Using more months smooths out seasonal variation and one-time charges. The post window uses only recent completed months so the number isn't dragged down by early ramp-up months when units were still onboarding.
 
 **The launch month itself is counted as post-launch** (green bar on charts). The red line sits at the boundary between the last pre-launch month and the launch month.
 
@@ -8174,7 +8293,7 @@ The **Summary** tab is designed for **VP-level skimming** — high-level numbers
 
 **KPIs shown (Row 1 — Revenue):**
 - **Current Monthly Pet Fee Revenue** — sum of all properties' latest-month revenue for selected charge codes
-- **Revenue Change Since PetScreening** — aggregate monthly lift across comparable properties (same calc as Charts tab)
+- **Revenue Change Since PetScreening** — aggregate monthly lift based on recent completed months vs pre-launch baseline (same calc as Charts tab)
 - **Projected at 100% Adoption** — what total revenue could be if every property reached 100% adoption
 
 **KPIs shown (Row 2 — Compliance):**
@@ -8215,7 +8334,7 @@ This means:
 - A shorter window (e.g., 6 months) gives a more recent view but may exclude pre-launch data
 - A longer window (e.g., 60 months) shows more history but may include noise from old charge codes
 
-**Tip:** For the "Revenue Change Since PetScreening" calculation, the 3-month pre-launch baseline is computed within the lookback window. If your window is too short, some properties may not have enough pre-launch data for comparison.
+**Tip:** For the "Revenue Change Since PetScreening" calculation, the pre-launch baseline (up to 6 months) is computed within the lookback window. If your window is too short, some properties may not have enough pre-launch data for comparison.
                 """)
 
             with st.expander("**How are charge codes selected and why does it matter?**"):
@@ -8537,7 +8656,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
 - **Adoption = linear proxy for revenue:** The "projected at 100%" calculation assumes revenue scales linearly with adoption. The last units to comply may have fewer pets, so actual revenue at 100% may be lower.
 - **Uncollected pet rent estimate:** Uses the **average (mean) charge amount** from tenants who ARE paying at each specific property. Falls back to portfolio-wide average if no payers at a property.
 - **PetScreening tenants vs PMC charges:** Pet data (who has a pet) comes from PetScreening's internal tables. Charge data (who's paying) comes from the PMC API. These update independently — brief sync delays are possible.
-- **Launch date = month boundary:** The launch month is counted as post-launch. Pre-launch baseline uses the 3 months immediately before the launch month.
+- **Launch date = month boundary:** The launch month is counted as post-launch. Pre-launch baseline uses up to 6 months before the launch month. Post-launch "current lift" uses up to 6 most recent completed months (excludes current partial month). Cumulative impact uses actual observed total post-launch revenue minus the projected baseline.
 - **PM emails:** Filtered to active PMs with specific permission types, using `parent_company_ancestry_id` from `user_enriched`.
 - **Suspected undisclosed exclusions:** Assistance profiles with `recommended` or `expired` status are excluded. Pet profiles with a non-empty `archive_reason` are excluded.
 - **Missing pet rent tenant criteria:** Only `compliant` + `household` + `active` tenants are considered. This is consistent across ALL tabs (Charts, Summary, Report).
