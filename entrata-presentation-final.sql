@@ -236,18 +236,23 @@ entrata_properties as (
       and p.property_status = 'active'
 ),
 
--- Count units via d_units → user_enriched (same join pattern as app.py)
--- Only counts units that have at least one user in PetScreening
+-- Count physical units: dedup by (property_id, address_1, address_2)
+-- d_units can have multiple unit_key/unit_id for the same physical unit
 unit_counts as (
     select
         ep.integration_type,
-        count(distinct du.unit_id) as total_units
-    from entrata_properties ep
-    inner join prod.common.d_units du
-        on ep.property_id = du.property_id
-        and du.unit_source = 'entrata'
-    inner join prod.petscreening.petscreening__user_enriched ue
-        on ue.unit_id = du.unit_id
+        count(*) as total_units
+    from (
+        select distinct
+            ep.integration_type,
+            du.property_id,
+            du.unit_address_1,
+            du.unit_address_2
+        from entrata_properties ep
+        inner join prod.common.d_units du
+            on ep.property_id = du.property_id
+            and du.unit_source = 'entrata'
+    ) sub
     group by 1
 )
 
@@ -519,17 +524,22 @@ lease_charges as (
       and t.application_completed_on_date is not null
 ),
 
--- Count units via d_units → user_enriched (same join pattern as app.py)
+-- Count physical units: dedup by (property_id, address_1, address_2)
 unit_totals as (
     select
         ep.integration_type,
-        count(distinct du.unit_id) as total_units
-    from entrata_properties ep
-    inner join prod.common.d_units du
-        on ep.property_id = du.property_id
-        and du.unit_source = 'entrata'
-    inner join prod.petscreening.petscreening__user_enriched ue
-        on ue.unit_id = du.unit_id
+        count(*) as total_units
+    from (
+        select distinct
+            ep.integration_type,
+            du.property_id,
+            du.unit_address_1,
+            du.unit_address_2
+        from entrata_properties ep
+        inner join prod.common.d_units du
+            on ep.property_id = du.property_id
+            and du.unit_source = 'entrata'
+    ) sub
     group by 1
 )
 
