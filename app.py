@@ -4182,6 +4182,16 @@ def fetch_missing_pet_rent_by_property(
             else:
                 code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
 
+    # Apply user overrides (from the charge type classification UI)
+    try:
+        _user_overrides = st.session_state.get("charge_type_overrides", {})
+        if _user_overrides:
+            for (pname, code) in list(code_class.keys()):
+                if code in _user_overrides:
+                    code_class[(pname, code)] = _user_overrides[code]
+    except Exception:
+        pass
+
     # Avg fee per property, split by recurring vs one-time
     avg_recurring_by_prop = {}   # avg monthly recurring fee per tenant
     avg_onetime_by_prop = {}     # avg one-time deposit per tenant
@@ -4458,6 +4468,16 @@ def fetch_suspected_undisclosed_by_property(
                 code_class[(pname, code)] = "recurring"
             else:
                 code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+
+    # Apply user overrides (from the charge type classification UI)
+    try:
+        _user_overrides = st.session_state.get("charge_type_overrides", {})
+        if _user_overrides:
+            for (pname, code) in list(code_class.keys()):
+                if code in _user_overrides:
+                    code_class[(pname, code)] = _user_overrides[code]
+    except Exception:
+        pass
 
     avg_recurring_by_prop = {}
     avg_onetime_by_prop = {}
@@ -5187,6 +5207,98 @@ if st.session_state.all_charges_df is not None:
     if not selected_codes:
         st.info("Select at least one charge code above to continue.")
     else:
+        # ─── Charge Type Classification (Recurring vs One-Time) ──────
+        with st.expander("⚙️ Charge type classification — recurring vs one-time", expanded=False):
+            st.markdown(
+                "Each charge code is auto-classified as **recurring** (monthly pet rent) or "
+                "**one-time** (pet deposit/fee). One-time charges only count in their start month "
+                "on the revenue charts — they don't spread across months.\n\n"
+                "**Override** any classification below if the auto-detection is wrong."
+            )
+
+            # Auto-detect classification for selected codes
+            _has_freq = 'frequency' in df.columns
+            _auto_class = {}  # {charge_code: "recurring" | "onetime"}
+            _class_reason = {}  # {charge_code: explanation}
+
+            _pet_df = df[df['charge_code'].isin(selected_codes)].copy()
+            _pet_df['_amt'] = pd.to_numeric(_pet_df['charge_amount'], errors='coerce').fillna(0)
+
+            for code in selected_codes:
+                code_rows = _pet_df[_pet_df['charge_code'] == code]
+                if _has_freq:
+                    freqs = code_rows['frequency'].dropna().str.strip().str.lower()
+                    ot = (freqs == 'one-time').sum()
+                    mo = freqs.isin(['monthly', 'recurring']).sum()
+                    if ot > mo:
+                        _auto_class[code] = "onetime"
+                        _class_reason[code] = f"Entrata frequency field: {ot} one-time vs {mo} recurring"
+                    else:
+                        _auto_class[code] = "recurring"
+                        _class_reason[code] = f"Entrata frequency field: {mo} recurring vs {ot} one-time"
+                else:
+                    spans = []
+                    for _, row in code_rows.iterrows():
+                        fd = parse_date(row.get('charge_from_date'))
+                        td = parse_date(row.get('charge_to_date'))
+                        if fd and td:
+                            try:
+                                spans.append((td - fd).days)
+                            except (TypeError, AttributeError):
+                                pass
+                    med = float(np.median(spans)) if spans else None
+                    if med is None:
+                        _auto_class[code] = "recurring"
+                        _class_reason[code] = "No date spans available — defaulting to recurring"
+                    elif med > 60:
+                        _auto_class[code] = "recurring"
+                        _class_reason[code] = f"Median date span: {med:.0f} days (>60 = recurring)"
+                    else:
+                        _auto_class[code] = "onetime"
+                        _class_reason[code] = f"Median date span: {med:.0f} days (≤60 = one-time)"
+
+            # Build UI: one row per charge code with override dropdown
+            _override_key = "charge_type_overrides"
+            if _override_key not in st.session_state:
+                st.session_state[_override_key] = {}
+
+            _class_options = ["Auto-detect", "Recurring", "One-Time"]
+            _override_cols = st.columns([3, 2, 2, 3])
+            _override_cols[0].markdown("**Charge Code**")
+            _override_cols[1].markdown("**Auto-Detected**")
+            _override_cols[2].markdown("**Override**")
+            _override_cols[3].markdown("**Reason**")
+
+            for code in selected_codes:
+                auto = _auto_class.get(code, "recurring")
+                auto_label = "Recurring" if auto == "recurring" else "One-Time"
+                reason = _class_reason.get(code, "")
+                avg_amt = _pet_df[_pet_df['charge_code'] == code]['_amt'].mean()
+
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+                c1.markdown(f"`{code}` (avg ${avg_amt:,.0f})")
+                c2.markdown(f"{'🔄 Recurring' if auto == 'recurring' else '1️⃣ One-Time'}")
+                override = c3.selectbox(
+                    "Override",
+                    options=_class_options,
+                    index=0,
+                    key=f"ct_override_{code}",
+                    label_visibility="collapsed",
+                )
+                c4.caption(reason)
+
+                if override == "Recurring":
+                    st.session_state[_override_key][code] = "recurring"
+                elif override == "One-Time":
+                    st.session_state[_override_key][code] = "onetime"
+                elif code in st.session_state[_override_key]:
+                    del st.session_state[_override_key][code]
+
+            if st.session_state.get(_override_key):
+                _n_overrides = len(st.session_state[_override_key])
+                st.info(f"📌 {_n_overrides} manual override{'s' if _n_overrides > 1 else ''} active. "
+                        f"These override the auto-detection for revenue charts and lift calculations.")
+
         st.divider()
 
         # ─── Raw Data Exports (for Snowflake validation) ─────────────
@@ -5500,6 +5612,13 @@ if st.session_state.all_charges_df is not None:
                             _code_class[(pname, code)] = "recurring"
                         else:
                             _code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+
+                # Apply user overrides (from the charge type classification UI)
+                _user_overrides = st.session_state.get("charge_type_overrides", {})
+                if _user_overrides:
+                    for (pname, code) in list(_code_class.keys()):
+                        if code in _user_overrides:
+                            _code_class[(pname, code)] = _user_overrides[code]
 
                 # Aggregate charges into monthly buckets
                 monthly_portfolio = defaultdict(float)
@@ -6389,7 +6508,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     "# Tenants": len(set(r.get("tenant_code", "") for r in active_in_month)),
                                     "By Code": breakdown_str,
                                 })
-                            st.caption(f"**{explorer_prop}** — monthly revenue for display window ({lb} months)")
+                            st.caption(f"**{explorer_prop}** — monthly revenue for display window ({len(months)} months)")
                             _render_table(pd.DataFrame(prop_table), height=400)
 
                             # ── Full charge rows with tenant info ──
