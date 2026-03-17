@@ -3,17 +3,10 @@
 -- 2026-03-17
 --
 -- Supports these claims:
---   1. "Across X integrated units..."           → count units from d_units
+--   1. "Across X integrated units..."           → count active units from d_units
 --   2. "Enhanced generates XX% more revenue"     → enhanced vs basic pet rent comparison
 --   3. "Pet leak = $X uncollected pet rent"      → active HHP not paying pet rent
 --   4. "At 5% cap rate = $X asset value"         → derived from (2) and (3)
---
--- Data sources:
---   - d_units                              → unit counts (count distinct unit_id per property)
---   - stg_pmc_integrations_entrata__getleases → scheduled charges (chargeCode is literal: "Pet Rent", "Pet Fee")
---   - petscreening__user_enriched          → active household profiles
---   - d_properties + stg_petscreening__integrations → property mapping + enhanced flag
---   - petscreening__property_key_facts     → launch dates
 -- ═══════════════════════════════════════════════════════════════════
 
 
@@ -226,7 +219,6 @@ entrata_properties as (
     select
         p.property_id,
         p.property_name,
-        p.parent_company_name,
         parse_json(p.property_source_id):"property_id"::string as entrata_pid,
         case
             when e.entrata_property_id is not null then 'Enhanced'
@@ -252,16 +244,17 @@ unit_counts as (
     inner join prod.common.d_units du
         on ep.property_id = du.property_id
         and du.unit_source = 'entrata'
+        and du.unit_state = 'active'
     group by 1
 )
 
 select
     uc.integration_type,
     count(distinct ep.property_id) as properties,
-    uc.total_units
+    max(uc.total_units) as total_units
 from entrata_properties ep
 inner join unit_counts uc on ep.integration_type = uc.integration_type
-group by 1, 3
+group by 1
 
 union all
 
@@ -276,6 +269,9 @@ order by 1;
 -- ═══════════════════════════════════════════════════════════════════
 -- Q2: ENHANCED vs BASIC — pet rent per user comparison
 -- "Clients on enhanced integration generate XX% more pet revenue"
+--
+-- Users from user_enriched joined directly on property_id (no d_units hop).
+-- Unit counts from d_units (active only) pre-aggregated to avoid fan-out.
 -- ═══════════════════════════════════════════════════════════════════
 
 with enhanced_property_ids as (
@@ -500,8 +496,6 @@ entrata_properties as (
       and p.property_status = 'active'
 ),
 
--- Flatten pet charges from getLeases
--- Entrata chargeCode = literal string ("Pet Rent", "Pet Fee", etc.)
 lease_charges as (
     select
         t.property_id,
@@ -522,7 +516,6 @@ lease_charges as (
       and t.application_completed_on_date is not null
 ),
 
--- Pre-aggregate unit counts to avoid fan-out
 unit_totals as (
     select
         ep.integration_type,
@@ -531,6 +524,7 @@ unit_totals as (
     inner join prod.common.d_units du
         on ep.property_id = du.property_id
         and du.unit_source = 'entrata'
+        and du.unit_state = 'active'
     group by 1
 )
 
@@ -569,6 +563,7 @@ select
 
 from entrata_properties ep
 left join unit_totals ut on ep.integration_type = ut.integration_type
+-- PS users joined directly on property_id (same as query_a_enhanced_vs_basic.sql)
 left join prod.petscreening.petscreening__user_enriched u
     on u.property_id = ep.property_id
     and u.property_source_name = 'entrata'
@@ -588,9 +583,11 @@ order by 1;
 -- Q3: PET LEAK — active HHP not paying pet rent
 -- "Hard number: folks with active HHP that are not paying pet rent"
 --
--- Roommate dedup: if ANY customer on a lease OR unit pays pet charges,
--- ALL customers on that lease/unit are marked as paying.
--- (matches app.py _build_paying_sets logic)
+-- Roommate dedup (matches app.py _build_paying_sets):
+--   - Lease expansion: any customer on a paying lease → all are paying
+--   - Unit expansion: any tenant on a paying unit → all are paying
+-- Freshness filter: only count profiles whose email exists in getLeases
+-- PS profiles joined directly on property_id (same join path as Q2)
 -- ═══════════════════════════════════════════════════════════════════
 
 with enhanced_property_ids as (
@@ -815,7 +812,7 @@ entrata_properties as (
       and p.property_status = 'active'
 ),
 
--- Leases that have at least one pet charge
+-- Leases with at least one pet charge
 paying_leases as (
     select distinct
         t.property_id,
@@ -830,7 +827,7 @@ paying_leases as (
       and charges.value:amount::number(10,2) > 0
 ),
 
--- Units that have at least one pet charge (roommate expansion)
+-- Units with at least one pet charge (roommate expansion)
 paying_units as (
     select distinct
         t.property_id,
@@ -847,9 +844,7 @@ paying_units as (
 ),
 
 -- All emails on paying leases OR paying units = "paying"
--- This handles roommates: charge on one person covers the whole unit/lease
 paying_emails as (
-    -- Co-tenants on same lease
     select distinct
         t.property_id,
         lower(trim(t.email)) as email
@@ -861,7 +856,6 @@ paying_emails as (
 
     union
 
-    -- Co-tenants on same unit (roommate expansion)
     select distinct
         t.property_id,
         lower(trim(t.email)) as email
@@ -872,7 +866,7 @@ paying_emails as (
     where t.email is not null and trim(t.email) <> ''
 ),
 
--- Freshness: emails that exist in current getLeases data (filter stale profiles)
+-- Freshness: emails in current getLeases data
 api_emails as (
     select distinct
         t.property_id,
@@ -883,7 +877,7 @@ api_emails as (
       and t.lease_customer_status not in ('Cancelled', 'Applicant')
 ),
 
--- Active household profiles in PetScreening
+-- PS profiles joined directly on property_id (same path as Q2)
 ps_profiles as (
     select distinct
         ep.property_id,
@@ -893,11 +887,10 @@ ps_profiles as (
         u.user_email,
         u.user_first_name,
         u.user_last_name
-    from prod.common.d_units du
-    join entrata_properties ep on du.property_id = ep.property_id
-    join prod.petscreening.petscreening__user_enriched u
-        on du.unit_id = u.unit_id
-    where du.unit_source = 'entrata'
+    from entrata_properties ep
+    inner join prod.petscreening.petscreening__user_enriched u
+        on u.property_id = ep.property_id
+    where u.property_source_name = 'entrata'
       and u.compliance_status = 'compliant'
       and u.user_pet_type = 'household'
       and u.user_pet_status = 'active'
@@ -917,7 +910,6 @@ pet_leak as (
         p.user_last_name,
         case when pe.email is not null then 1 else 0 end as is_paying
     from ps_profiles p
-    -- Freshness: only profiles whose email appears in current getLeases data
     inner join api_emails ae
         on p.property_id = ae.property_id
         and lower(trim(p.user_email)) = ae.email
