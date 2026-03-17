@@ -4175,8 +4175,12 @@ def fetch_missing_pet_rent_by_property(
                 f, t = row['_from'], row['_to']
                 if f and t and not pd.isna(f) and not pd.isna(t):
                     spans.append((t - f).days)
-            median_span = float(np.median(spans)) if spans else 0
-            code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+            # No valid date spans → assume recurring (missing dates ≠ one-time)
+            median_span = float(np.median(spans)) if spans else None
+            if median_span is None:
+                code_class[(pname, code)] = "recurring"
+            else:
+                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
 
     # Avg fee per property, split by recurring vs one-time
     avg_recurring_by_prop = {}   # avg monthly recurring fee per tenant
@@ -4448,8 +4452,12 @@ def fetch_suspected_undisclosed_by_property(
                 f, t = row['_from'], row['_to']
                 if f and t and not pd.isna(f) and not pd.isna(t):
                     spans.append((t - f).days)
-            median_span = float(np.median(spans)) if spans else 0
-            code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+            # No valid date spans → assume recurring (missing dates ≠ one-time)
+            median_span = float(np.median(spans)) if spans else None
+            if median_span is None:
+                code_class[(pname, code)] = "recurring"
+            else:
+                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
 
     avg_recurring_by_prop = {}
     avg_onetime_by_prop = {}
@@ -5486,8 +5494,12 @@ if st.session_state.all_charges_df is not None:
                                     spans.append((t - f).days)
                                 except (TypeError, AttributeError):
                                     pass
-                        median_span = float(np.median(spans)) if spans else 0
-                        _code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+                        # No valid date spans → assume recurring (missing dates ≠ one-time)
+                        median_span = float(np.median(spans)) if spans else None
+                        if median_span is None:
+                            _code_class[(pname, code)] = "recurring"
+                        else:
+                            _code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
 
                 # Aggregate charges into monthly buckets
                 monthly_portfolio = defaultdict(float)
@@ -6506,7 +6518,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     spans.append((t - f).days)
                                 except (TypeError, AttributeError):
                                     pass
-                        _cc2[(pn, cc)] = "recurring" if (float(np.median(spans)) if spans else 0) > 60 else "onetime"
+                        # No valid date spans → assume recurring (missing dates ≠ one-time)
+                        _median = float(np.median(spans)) if spans else None
+                        if _median is None:
+                            _cc2[(pn, cc)] = "recurring"
+                        else:
+                            _cc2[(pn, cc)] = "recurring" if _median > 60 else "onetime"
 
                 _monthly_portfolio = defaultdict(float)
                 _monthly_by_prop = defaultdict(lambda: defaultdict(float))
