@@ -236,16 +236,18 @@ entrata_properties as (
       and p.property_status = 'active'
 ),
 
--- Count units from getLeases (actual leased units from PM data)
+-- Count units via d_units → user_enriched (same join pattern as app.py)
+-- Only counts units that have at least one user in PetScreening
 unit_counts as (
     select
         ep.integration_type,
-        count(distinct t.unit_id) as total_units
+        count(distinct du.unit_id) as total_units
     from entrata_properties ep
-    inner join prod.staging.stg_pmc_integrations_entrata__getleases t
-        on ep.property_id = t.property_id
-    where t.lease_customer_status not in ('Cancelled', 'Applicant')
-      and t.application_completed_on_date is not null
+    inner join prod.common.d_units du
+        on ep.property_id = du.property_id
+        and du.unit_source = 'entrata'
+    inner join prod.petscreening.petscreening__user_enriched ue
+        on ue.unit_id = du.unit_id
     group by 1
 )
 
@@ -517,16 +519,17 @@ lease_charges as (
       and t.application_completed_on_date is not null
 ),
 
--- Count units from getLeases (actual leased units from PM data)
+-- Count units via d_units → user_enriched (same join pattern as app.py)
 unit_totals as (
     select
         ep.integration_type,
-        count(distinct t.unit_id) as total_units
+        count(distinct du.unit_id) as total_units
     from entrata_properties ep
-    inner join prod.staging.stg_pmc_integrations_entrata__getleases t
-        on ep.property_id = t.property_id
-    where t.lease_customer_status not in ('Cancelled', 'Applicant')
-      and t.application_completed_on_date is not null
+    inner join prod.common.d_units du
+        on ep.property_id = du.property_id
+        and du.unit_source = 'entrata'
+    inner join prod.petscreening.petscreening__user_enriched ue
+        on ue.unit_id = du.unit_id
     group by 1
 )
 
