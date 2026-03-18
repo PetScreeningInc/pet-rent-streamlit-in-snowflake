@@ -964,18 +964,22 @@ Testing `includeArTransactions=1` on **Hillpointe - Pointe Grand Augusta**:
 }
 ```
 
-### Critical Finding: Pagination Truncation
+### Critical Finding: Pagination Truncation — ✅ FIXED (March 2026)
 
-**37 out of 43 properties returned exactly 100 leases** (the per-page cap). This almost certainly means the API has more leases that we are not fetching. The pagination logic in both this script and `app.py` breaks after page 1 because the Entrata API does not return `meta.currentPage`/`meta.lastPage` in the response.
+> **Update (2026-03-18):** This issue has been fixed in `app.py`. Pagination now uses `per_page = 500` with a proper loop (`while page_no <= max_pages`, breaks when `len(leases) < per_page`). The findings below were based on the OLD 100-per-page limit.
 
-**Impact:** We are working with an incomplete dataset. Properties with more than 100 leases (likely most of them) are missing data. This affects:
+**37 out of 43 properties returned exactly 100 leases** (the per-page cap at the time of this investigation). The pagination logic in both this script and `app.py` broke after page 1 because the Entrata API did not return `meta.currentPage`/`meta.lastPage` in the response.
+
+**Impact (historical — now resolved):** We were working with an incomplete dataset. Properties with more than 100 leases were missing data. This affected:
 - Revenue calculations (undercounting charges)
-- Missing pet rent detection (may miss tenants who ARE paying on leases 101+)
-- Before/after comparisons (skewed by which 100 leases the API returns first)
+- Missing pet rent detection (may have missed tenants who ARE paying on leases 101+)
+- Before/after comparisons (skewed by which 100 leases the API returned first)
 
-### Critical Finding: Empty Interval Status
+### Critical Finding: Empty Interval Status — ✅ HANDLED (March 2026)
 
-**100% of scheduled charges** from this PMC have an empty `leaseIntervalId` status. The app's `interval_is_valid` filter expects 'current', 'past', or 'notice'. Since all statuses are empty, this filter would exclude ALL Entrata charges for this PMC. The investigation fell back to using all charges, but `app.py` may be silently discarding valid charge data.
+> **Update (2026-03-18):** `app.py` now has a fallback: when no valid interval IDs are found and the top-level lease status is not in `INVALID_INTERVAL_STATUSES`, the app uses ALL charges for that lease. Empty interval status no longer causes silent data loss.
+
+**100% of scheduled charges** from this PMC have an empty `leaseIntervalId` status. The app's `interval_is_valid` filter expects 'current', 'past', or 'notice'. Since all statuses are empty, this filter would have excluded ALL Entrata charges for this PMC. The investigation fell back to using all charges, and `app.py` now does the same via its fallback logic.
 
 ### Critical Finding: Tenant Code Matching is Broken
 
@@ -998,17 +1002,19 @@ The `includeArTransactions=1` parameter **does return actual posted transactions
 - Consider only showing post-launch trends, or marking the before/after comparison as 'insufficient data'
 - Investigate whether Entrata has a separate historical charges endpoint
 
-#### 2. Missing Pet Rent Accuracy
+#### 2. Missing Pet Rent Accuracy — ✅ FRESHNESS FILTER IMPLEMENTED (March 2026)
 
-**Status: Potential overcounting (1269 flagged as missing).**
+**Status: Stale profile issue mitigated.**
 
 Key issues found:
-- **1226 stale profiles**: Tenants with active PetScreening profiles who are no longer in the API (possibly moved out).
+- **1226 stale profiles**: Tenants with active PetScreening profiles who were no longer in the API (possibly moved out).
 
-**Recommendations:**
-- Strengthen tenant matching: add email-based matching as primary (not just fallback) for Entrata
+> **Update (2026-03-18):** `app.py` now implements `_in_api` freshness checks in 3 places. Profiles not found in the current API data are excluded from the missing pet rent count. This directly addresses the stale profile overcounting identified here.
+
+**Recommendations (remaining):**
+- ~~Consider adding a freshness check: exclude profiles where the tenant doesn't appear in current API data~~ ✅ DONE
+- Strengthen tenant matching: email is now the primary match method for Entrata (tenant_code remains broken — see #5)
 - Add lease_id-level dedup: if ANY customer on a lease has a pet charge, ALL customers on that lease should be excluded
-- Consider adding a freshness check: exclude profiles where the tenant doesn't appear in current API data
 
 #### 3. Scheduled vs Actual Charges
 
@@ -1024,16 +1030,16 @@ Key issues found:
 - Consider capping charge dates to today to exclude future-scheduled charges from current revenue
 - **Explore using AR transactions** (`includeArTransactions=1`) for actual revenue data instead of / in addition to scheduled charges
 
-#### 4. Pagination (CRITICAL)
+#### 4. Pagination — ✅ FIXED (March 2026)
 
-**Status: Most properties are truncated at 100 leases.**
+**Status: Resolved.** `app.py` now uses `per_page = 500` with a proper pagination loop (`while page_no <= max_pages`, breaks when `len(leases) < per_page`).
 
-37/43 properties hit the 100-lease cap. The API likely has more data that we are not fetching.
+> **Note:** The Hillpointe findings in this document (37/43 properties truncated) were based on the OLD 100-per-page limit. With 500 per page and proper pagination, these properties are no longer truncated.
 
-**Recommendations:**
-- Fix pagination: inspect the raw API response to determine the correct pagination fields
-- If Entrata doesn't support pagination on `getLeases`, consider using a different endpoint or requesting larger page sizes
-- At minimum, flag properties where `lease_count == per_page` as potentially truncated in the UI
+**Recommendations (resolved):**
+- ~~Fix pagination~~ ✅ DONE — uses 500 per page with full loop
+- ~~Request larger page sizes~~ ✅ DONE
+- ~~Flag truncated properties~~ No longer needed — pagination handles all pages
 
 #### 5. Tenant Code Matching (CRITICAL)
 
@@ -1041,19 +1047,20 @@ Key issues found:
 
 All 191 paying matches came through email only. The `f_leases.lease_source_external_id:tenant_code` path returns NULL for all Entrata tenants.
 
-**Recommendations:**
+> **Note (2026-03-18):** The app uses email as the primary match method for Entrata, which is the correct workaround. The 87% "missing" rate (1269/1460) was also inflated by the 100-lease pagination cap (now fixed — see #4) and stale profiles (now filtered — see #2). Actual missing counts should be significantly lower with these fixes in place.
+
+**Recommendations (remaining):**
 - Audit how `lease_source_external_id` is populated for Entrata in the data pipeline
-- Make email the primary matching method for Entrata (not just a fallback)
+- ~~Make email the primary matching method~~ Already the case in practice
 - Consider matching by unit number as an additional signal
-- The 87% "missing" rate (1269/1460) is almost certainly an overcount driven by the 100-lease pagination cap combined with broken TC matching
 
-#### 6. Interval Status Filter (CRITICAL)
+#### 6. Interval Status Filter — ✅ HANDLED (March 2026)
 
-**Status: All Entrata charges have empty interval status, causing the `interval_is_valid` filter to reject everything.**
+**Status: Resolved.** `app.py` now falls back to using all charges when interval statuses are empty, provided the top-level lease status is valid (not in `INVALID_INTERVAL_STATUSES`).
 
-**Recommendations:**
-- For Entrata, skip the interval status filter or treat empty status as valid
-- Alternatively, use the lease-level status (which may be populated) instead of the interval-level status
+**Recommendations (resolved):**
+- ~~For Entrata, skip the interval status filter or treat empty status as valid~~ ✅ DONE — fallback logic implemented
+- ~~Use the lease-level status instead~~ ✅ DONE — top-level status is checked when interval statuses are empty
 
 ---
 

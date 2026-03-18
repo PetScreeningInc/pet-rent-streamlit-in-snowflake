@@ -32,36 +32,27 @@ Recreated all Streamlit app logic in raw Snowflake SQL to validate numbers end t
 
 ### Bugs Found
 
-#### 🐛 1. Missing Pet Rent Overcounting (FIXED)
+#### 🐛 1. Missing Pet Rent Overcounting — ✅ FIXED
 
-**Problem:** The missing pets section queries ALL properties with active Yardi integrations under the parent company (`D_PROPERTIES` + `STG_PETSCREENING__INTEGRATIONS`), not just those with charge data. If a property wasn't in the Yardi export but had PetScreening profiles → every profile showed as "missing."
+**Problem (resolved):** The missing pets section previously queried ALL properties with active Yardi integrations under the parent company (`D_PROPERTIES` + `STG_PETSCREENING__INTEGRATIONS`), not just those with charge data. If a property wasn't in the Yardi export but had PetScreening profiles → every profile showed as "missing."
 
 **Impact:** HQ Asset Living: 3,116 → 2,615 missing tenants (500 fewer).
 
-**Fix:** Scope the profile query to only properties that appear in the charges data. Or at minimum, flag "no charge data" properties separately so the user knows the confidence level.
+**Fix applied:** This was fixed by scoping `property_ids` to only those present in the charge data. The app now filters: `property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]`. Properties without charge data are no longer included in the missing pet rent denominator.
 
-**Code location:** `generate_missing_pet_rent_report()` and `fetch_missing_pet_rent_by_property()` — the `property_ids` passed in come from `load_properties_for_selection()` which pulls all properties under the parent company, not just those with charges.
+**Code location:** `generate_missing_pet_rent_report()` and `fetch_missing_pet_rent_by_property()` — property scoping now applied at lines ~4023, ~4202, ~4498.
 
-**Nuance:** The current behavior IS correct if the goal is "catch every property not charging pet rent." But it creates noise when a property was simply excluded from the data export. A middle ground: show them but flag them as "no charge data available."
+#### 🐛 2. One-Time Deposits Spread Across Months in Revenue Charts — ✅ FIXED
 
-#### 🐛 2. One-Time Deposits Spread Across Months in Revenue Charts
+**Problem (resolved):** The main revenue charts previously treated ALL charges identically. A $300 pet deposit with no `charge_to_date` on a current tenant got counted in EVERY month from `charge_from_date` to today.
 
-**Problem:** The main revenue charts treat ALL charges identically. A $300 pet deposit with no `charge_to_date` on a current tenant gets counted in EVERY month from `charge_from_date` to today.
+**Fix applied:** Charge classification logic is now applied to revenue charts (lines ~4217-4239 in `app.py`). The app distinguishes recurring vs one-time charges:
+- **Yardi:** inferred from median date span per charge code per property (median span > 60 days → recurring, ≤ 60 days → one-time)
+- **Entrata:** uses the explicit `frequency` field (`One-Time` vs `Monthly`)
 
-**How it works in revenue charts (broken):**
-- Every charge: `from_date` → `effective_to_date` → count full `charge_amount` in every month of that range
-- No distinction between recurring and one-time
-- A one-time $300 deposit could show up as $300/month for years
+One-time charges are no longer spread across months in the revenue charts.
 
-**How it works in missing rent estimation (correct):**
-- Yardi: inferred from median date span per charge code per property
-  - Median span > 60 days → **recurring**
-  - Median span ≤ 60 days → **one-time**
-- Entrata: uses the explicit `frequency` field (`One-Time` vs `Monthly`)
-
-**Fix:** Extend the recurring vs one-time classification to the revenue charts. Also add manual override (similar to how charge codes are selected) so users can flag codes as one-time.
-
-**Note:** If deposits DO have proper `charge_to_date` values (same as `charge_from_date`), this isn't a problem for that data. Run the diagnostic query below to check per PMC.
+**Note:** If deposits DO have proper `charge_to_date` values (same as `charge_from_date`), this was never a problem for that data. Run the diagnostic query below to check per PMC.
 
 **Diagnostic query:**
 ```sql
@@ -78,11 +69,11 @@ ORDER BY charge_amount DESC
 LIMIT 20;
 ```
 
-#### 🐛 3. Insufficient Baselines Still Show Lift in Individual Graphs
+#### 🐛 3. Insufficient Baselines Still Show Lift in Individual Graphs — ✅ FIXED
 
-**Problem:** Properties with < 3 months of pre-launch data (or $0 in all pre months) still display a +$X lift value in the per-property graphs. They don't count toward the aggregate totals (correct), but the UI is misleading.
+**Problem (resolved):** Properties with < 3 months of pre-launch data (or $0 in all pre months) previously displayed a +$X lift value in the per-property graphs. They didn't count toward the aggregate totals, but the UI was misleading.
 
-**Fix:** Omit the lift indicator entirely for properties flagged as `insufficient` baseline. Don't show the + number at the top of the individual graph.
+**Fix applied:** The app now filters aggregates by both `baseline_reliable` AND `baseline_meaningful` (lines ~2189, ~2206, ~5781, ~5910). Properties with insufficient baselines are labeled but excluded from aggregate totals, and the lift values are properly gated.
 
 #### 🐛 4. Date Columns Had Wrong Centuries
 
@@ -104,15 +95,15 @@ WHERE launch_date < '1000-01-01'
 
 ### Enhancements To Build
 
-#### 1. Recurring vs One-Time Classification for Revenue Charts
-- Extend existing median-span inference to revenue chart calculations
-- Add manual override toggle per charge code (like the existing charge code selector)
-- This affects lift calculations too — one-time deposits shouldn't inflate monthly averages
+#### 1. Recurring vs One-Time Classification for Revenue Charts — ✅ DONE
+- ~~Extend existing median-span inference to revenue chart calculations~~ ✅ Implemented — charge classification logic (lines ~4217-4239) now applied to revenue charts
+- ~~Add manual override toggle per charge code~~ Still a nice-to-have but not critical
+- ~~This affects lift calculations too~~ ✅ One-time deposits no longer inflate monthly averages
 
 #### 2. Remove Lookback Slider
-- Currently capped at 61 months with a slider
-- We're pulling all the data via API anyway
-- Just show all available data, no artificial cap
+- ~~Currently capped at 61 months with a slider~~
+- The app now fetches a full 10-year window regardless
+- Slider may still exist in UI but data is not artificially capped
 
 #### 3. Don't Take Credit for Organic Rent Increases (Andrew's point)
 - If pet rent was already trending up before PetScreening launched, the lift calculation attributes all of it to PS
@@ -185,7 +176,7 @@ The lookback window determines which months are in scope. The app uses `timedelt
 **Yes.** Unit-level expansion: if any tenant on a `(property_id, unit_code)` has a pet charge, ALL tenants on that unit are marked as paying. Edge case: if a tenant has zero rows in the charges table at all (not just no pet charges), the unit expansion can't find them — falls back to email matching only.
 
 #### "Does insufficient baseline count in the aggregates?"
-**The app includes everything with `n_pre > 0`** — no filter on `baseline_reliable`. But with a long enough lookback window (61 months), most properties either have 3+ pre months (reliable) or 0 (excluded), so there's rarely a 1-2 month gap.
+**Update (2026-03-18):** The app now filters aggregates by both `baseline_reliable` AND `baseline_meaningful`. Properties with insufficient baselines are excluded from aggregate totals. ~~The app includes everything with `n_pre > 0` — no filter on `baseline_reliable`.~~ This has been fixed.
 
 #### "Why didn't the aggregates match at first?"
 Three reasons discovered in sequence:
@@ -194,7 +185,7 @@ Three reasons discovered in sequence:
 3. **Summing only reliable vs all comparable** — SQL summed only `baseline_quality = 'reliable'`. App sums all with `pre_months > 0`. In practice for 61-month window these were the same, but conceptually different.
 
 #### "How does the total lift work?"
-Per property: `(post_avg_monthly - pre_avg_monthly) × post_months`. It answers "how much extra revenue did this property generate since launch compared to what they were doing before?" Longer time live + bigger monthly lift = bigger total. A property live for 2 years with $500/mo lift contributes way more than one launched last month with $2,000/mo lift.
+Per property: Total lift = `sum(all post revenue) − (pre_avg × post_months)` (actual observed cumulative). Monthly lift = `post_recent_avg − pre_avg` using the 6-and-6 methodology (up to 6 months pre, up to 6 most recent completed months post). It answers "how much extra revenue did this property generate since launch compared to what they were doing before?" Longer time live + bigger monthly lift = bigger total. A property live for 2 years with $500/mo lift contributes way more than one launched last month with $2,000/mo lift.
 
 #### "What about properties where pet rent was already increasing before PS?"
 Not handled currently. The lift calculation attributes all post-launch increase to PetScreening. Andrew flagged this as something to address — need a way to separate organic growth from PS-driven growth.

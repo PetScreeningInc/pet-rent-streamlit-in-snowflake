@@ -1,6 +1,6 @@
 # Pet Rent App — Audit & Enhancement Plan
 
-**Last Updated:** 2026-03-14  
+**Last Updated:** 2026-03-18  
 **Sources:** holistic-audit, code-review, cross-tab-audit, potential-enhancements
 
 ---
@@ -307,11 +307,19 @@ report_df = exec_df[exec_df['_lookup_key'].isin(missing_lookup)]
 
 ## Open Questions (Need Team Input)
 
-### A. How Should We Calculate Monthly Lift?
-| Approach | Post Comparison | Pros | Cons |
-|----------|----------------|------|------|
-| Current | Avg of ALL post months | Smooths volatility | Early ramp-up drags down the number |
-| Alternative | Most recent completed month | Shows current state | Single month can be noisy |
+### A. How Should We Calculate Monthly Lift? — ✅ RESOLVED
+
+**Decision (2026-03-16):** Adopted the **6-and-6 windowed approach**:
+- **Pre baseline:** Up to 6 months before launch
+- **Post comparison (monthly lift):** Up to 6 most recent COMPLETED months (excludes current partial month)
+- **Total/cumulative lift:** Actual observed: `sum(all post revenue) − (pre_avg × post months)`
+
+This smooths seasonal noise on both sides and uses recent completed months to show the "current lift" after adoption matures, rather than being dragged down by early ramp-up months.
+
+~~| Approach | Post Comparison | Pros | Cons |~~
+~~|----------|----------------|------|------|~~
+~~| Current | Avg of ALL post months | Smooths volatility | Early ramp-up drags down the number |~~
+~~| Alternative | Most recent completed month | Shows current state | Single month can be noisy |~~
 
 ### B. How to Handle Organic Rent Increases?
 If pet rent was already trending up before PetScreening launched, the current method attributes all growth to PS. Options:
@@ -388,7 +396,7 @@ If pet rent was already trending up before PetScreening launched, the current me
 | 11 | Lambda apply → vectorized join (lines 3606, 3847, 4180, 4414) | code-review | 🟡 Performance |
 | 12 | Properties denominator inconsistency | cross-tab-audit | 🔴 Trust |
 | 13 | Report ↔ Charts count mismatch | cross-tab-audit | 🔴 Trust |
-| 14 | Lift aggregation duplicated in What's Next | cross-tab-audit | 🟡 Consistency |
+| 14 | Lift aggregation duplicated in What's Next (note: one-time charge classification IS now applied to both tabs) | cross-tab-audit | 🟡 Consistency |
 | 15 | Property denominator confusion (no funnel) | holistic-audit | 🔴 Trust |
 | 16 | Report tab count gap (exec summary dep) | holistic-audit | 🔴 Trust |
 | 17 | No data freshness indicator | holistic-audit | 🔴 Trust |
@@ -405,5 +413,5 @@ If pet rent was already trending up before PetScreening launched, the current me
 | 28 | QBR data freshness not surfaced | holistic-audit | 🟢 Enhancement |
 | 29 | No tests | holistic-audit | 🟡 Technical debt |
 | 30 | 8,100-line single file | code-review | 🟡 Technical debt |
-| 31 | Lift methodology (avg all post vs latest month) | yardi-validation | ❓ Open question |
+| 31 | Lift methodology (avg all post vs latest month) — ✅ Resolved: adopted 6-and-6 | yardi-validation | ✅ Resolved |
 | 32 | Organic growth not separated from PS lift | yardi-validation | ❓ Open question |
