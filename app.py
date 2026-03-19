@@ -1497,15 +1497,15 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
     """
     For each property with a launch date, compute:
       - pre_avg             = average monthly revenue in up to 6 months BEFORE launch
-      - post_recent_avg     = average monthly revenue in up to 6 most recent COMPLETED months after launch
-      - diff_monthly        = post_recent_avg − pre_avg  (current lift — apples-to-apples)
+      - post_recent_avg     = average monthly revenue across all completed post-launch months
+      - diff_monthly        = cumulative impact ÷ completed post months  (average monthly uplift since launch)
       - diff_total          = actual observed cumulative lift: total_post_revenue − (pre_avg × n_post_months)
       - post_monthly_avg    = average of ALL post months (kept for backward compat / charts)
 
-    Methodology (updated 2026-03-16):
+    Methodology (updated 2026-07-14):
       Pre-baseline:  up to 6 months before launch (uses whatever is available)
-      Post-current:  up to 6 most recent COMPLETED months (excludes current partial month)
-      Monthly lift:  post_recent_avg − pre_avg
+      Post-current:  all completed post-launch months (excludes current partial month)
+      Monthly lift:  cumulative impact ÷ completed post months
       Total lift:    sum(all post revenue) − (pre_avg × total post months)  [actual observed]
 
     Returns dict keyed by property name.
@@ -1562,21 +1562,24 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
         # Post-launch: all-time average (kept for charts and backward compat)
         post_monthly_avg = post_total / n_post if n_post > 0 else 0
 
-        # Current lift: use up to 6 most recent COMPLETED post months
-        # (excludes the current partial month so we don't undercount)
+        # Completed post months (excludes current partial month so we don't undercount)
         completed_post = [m for m in post_months if m < current_month]
-        recent_post_months = completed_post[-6:] if completed_post else []
-        n_recent_post = len(recent_post_months)
+        n_completed_post = len(completed_post)
+        completed_post_total = sum(prop_data.get(m, 0) for m in completed_post)
+
+        # Post-launch avg across all completed months (used for display & baseline check)
         post_recent_avg = (
-            sum(prop_data.get(m, 0) for m in recent_post_months) / n_recent_post
-            if n_recent_post > 0 else post_monthly_avg
+            completed_post_total / n_completed_post
+            if n_completed_post > 0 else post_monthly_avg
         )
 
-        # Monthly lift = recent post avg − pre avg (the "current lift" number)
-        diff_monthly = post_recent_avg - pre_avg
         # Total lift = actual observed cumulative difference
         # (what they actually collected minus what they would have at the old rate)
         diff_total = post_total - (pre_avg * n_post)
+
+        # Monthly lift = cumulative impact ÷ completed post months
+        # (average monthly uplift since launch — mathematically consistent: monthly × months ≈ cumulative)
+        diff_monthly = (completed_post_total - (pre_avg * n_completed_post)) / n_completed_post if n_completed_post > 0 else 0
 
         # Baseline is "meaningful" if pre_avg is >= 2% of post_recent_avg.
         # Properties with near-zero baselines (e.g. $8 vs $5,600 post) weren't
@@ -1589,7 +1592,7 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
         analysis[prop] = {
             "n_post": n_post,
             "n_pre": len(pre_baseline_months),
-            "n_recent_post": n_recent_post,
+            "n_recent_post": n_completed_post,
             "all_pre_months": len(pre_months),
             "baseline_reliable": len(pre_months) >= 3,
             "baseline_meaningful": _baseline_meaningful,
@@ -2215,7 +2218,7 @@ def generate_html_report(
                     <td>${a["post_recent_avg"]:,.0f}</td>
                     <td style="color:{color};font-weight:bold">{s_m}${a["diff_monthly"]:,.0f}/mo</td>
                     <td style="color:{color};font-weight:bold">{s_t}${a["diff_total"]:,.0f}</td>
-                    <td>{a["n_pre"]}mo pre · {a.get("n_recent_post", 0)}mo recent · {a["n_post"]}mo total</td>
+                    <td>{a["n_pre"]}mo pre · {a.get("n_recent_post", 0)}mo completed post · {a["n_post"]}mo total</td>
                 </tr>"""
             elif a["n_pre"] > 0 and not a.get("baseline_reliable", True):
                 impact_rows_html += f"""
@@ -2778,7 +2781,7 @@ def generate_html_report(
       <div class="kpi-card">
         <div class="kpi-label">Monthly Revenue Change</div>
         <div class="kpi-value">{sign_mo}${agg_diff_mo:,.0f}/mo</div>
-        <div class="kpi-caption">Average monthly lift across {n_comparable} properties</div>
+        <div class="kpi-caption">Average monthly uplift since launch across {n_comparable} properties</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Properties with Launch Date</div>
@@ -2794,8 +2797,8 @@ def generate_html_report(
     <p>For each property, we compare average monthly pet fee revenue <b>before</b> vs <b>after</b> PetScreening launch:</p>
     <ul>
       <li><b>Before PetScreening (avg/mo)</b> — Average of up to 6 months before launch (uses whatever pre-launch data is available)</li>
-      <li><b>After PetScreening (avg/mo)</b> — Average of up to 6 most recent completed months (excludes current partial month)</li>
-      <li><b>Monthly Change</b> = Recent post avg − Pre avg (the current lift)</li>
+      <li><b>After PetScreening (avg/mo)</b> — Average of all completed post-launch months (excludes current partial month)</li>
+      <li><b>Monthly Change</b> = Cumulative impact ÷ completed post months (average monthly uplift since launch)</li>
       <li><b>Total Change</b> = Total post-launch revenue − (Pre avg × post months) — actual observed cumulative impact</li>
     </ul>
   </div>
@@ -5989,8 +5992,8 @@ the average monthly pet fee revenue **before** and **after** launch.
 | Metric | Formula | What it tells you |
 |--------|---------|-------------------|
 | **Before PetScreening (avg/mo)** | Average of up to 6 months before launch (uses whatever pre-launch data is available) | The property's baseline monthly pet fee collection before PetScreening was active — uses more data when available to smooth seasonal noise |
-| **After PetScreening (avg/mo)** | Average of up to 6 most recent **completed** months (excludes current partial month) | The property's current monthly pet fee collection — reflects mature adoption, not dragged down by early ramp-up months |
-| **Monthly Change** | Recent post avg − Pre avg | The current lift — what PetScreening is doing for this property right now |
+| **After PetScreening (avg/mo)** | Average of all completed post-launch months (excludes current partial month) | The property's average monthly pet fee collection since PetScreening launched |
+| **Monthly Change** | Cumulative impact ÷ completed post months | Average monthly uplift since launch — mathematically consistent with cumulative total |
 | **Total Change** | Sum(all post revenue) − (Pre avg × post months) | The actual observed cumulative revenue above the pre-launch baseline — real dollars, not projected |
 
 **Reading the charts**
@@ -6039,8 +6042,8 @@ The pre-launch baseline uses up to 6 months *before* the launch month (e.g., May
 
 - The pre-launch baseline uses **up to 6 months** before the launch month (whatever data is available),
   giving a robust "business as usual" average that smooths out seasonal variation.
-- The post-launch comparison uses the **most recent 6 completed months** (excluding the current partial month),
-  reflecting the property's current performance after adoption has matured — not dragged down by ramp-up months.
+- The post-launch comparison uses **all completed post-launch months** (excluding the current partial month),
+  reflecting the property's average performance since PetScreening launched.
 - The cumulative impact ("Total Change") uses **actual observed revenue** — total post-launch revenue minus
   what the property would have collected at the pre-launch rate. This is real dollars, not a projection.
 - Revenue changes may reflect factors beyond PetScreening (e.g., new units, rent adjustments, seasonal variation).
@@ -6484,7 +6487,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                     "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
                                     "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
                                     "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
-                                    "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo recent post · {a['n_post']}mo total",
+                                    "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo completed post · {a['n_post']}mo total",
                                     "_sort": a["diff_monthly"],
                                     "_comparable": True,
                                 })
@@ -7903,7 +7906,7 @@ average as fallback if no payers at that property).
 - **Launch month is counted as post-launch** (green bar). The red line sits at the boundary
   between the last pre-launch month and the launch month.
 - **Pre-launch baseline** = average of up to 6 months before the launch month (uses whatever data is available)
-- **Post-launch current lift** = average of up to 6 most recent completed months (excludes current partial month)
+- **Post-launch current lift** = average of all completed post-launch months (excludes current partial month)
 - **Cumulative impact** = total actual post-launch revenue − (pre_avg × number of post months)
 - **Baseline reliability** (Entrata): if fewer than 3 pre-launch months of charge data
   are available, the baseline is flagged as unreliable. Charts show "-- insufficient data"
@@ -8166,13 +8169,13 @@ Each number represents a progressively smaller slice — here's what each one me
 For each property with a PetScreening launch date:
 
 1. **Pre-launch baseline** = average monthly pet fee revenue in **up to 6 months before** the launch month (uses whatever pre-launch data is available — more months = less seasonal noise)
-2. **Post-launch current avg** = average of up to 6 most recent **completed** months after launch (excludes the current partial month to avoid undercounting)
-3. **Monthly Change** = Recent post avg − Pre-launch baseline (the "current lift" — what PS is doing now)
+2. **Post-launch avg** = average of all completed post-launch months (excludes the current partial month to avoid undercounting)
+3. **Monthly Change** = Cumulative impact ÷ completed post months (average monthly uplift since launch)
 4. **Total Change** = Sum(all post revenue) − (Pre avg × post months) — actual observed cumulative impact in real dollars
 
 The aggregate KPIs sum these values across all **comparable** properties (those with both pre & post data).
 
-**Why up to 6 months on each side?** Using more months smooths out seasonal variation and one-time charges. The post window uses only recent completed months so the number isn't dragged down by early ramp-up months when units were still onboarding.
+**Why up to 6 months for pre?** Using more months smooths out seasonal variation and one-time charges. The monthly lift uses all completed post months so it's mathematically consistent with the cumulative total (monthly × months ≈ cumulative).
 
 **The launch month itself is counted as post-launch** (green bar on charts). The red line sits at the boundary between the last pre-launch month and the launch month.
 
@@ -8293,7 +8296,7 @@ The **Summary** tab is designed for **VP-level skimming** — high-level numbers
 
 **KPIs shown (Row 1 — Revenue):**
 - **Current Monthly Pet Fee Revenue** — sum of all properties' latest-month revenue for selected charge codes
-- **Revenue Change Since PetScreening** — aggregate monthly lift based on recent completed months vs pre-launch baseline (same calc as Charts tab)
+- **Revenue Change Since PetScreening** — aggregate monthly lift based on all completed post-launch months vs pre-launch baseline (same calc as Charts tab)
 - **Projected at 100% Adoption** — what total revenue could be if every property reached 100% adoption
 
 **KPIs shown (Row 2 — Compliance):**
@@ -8656,7 +8659,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
 - **Adoption = linear proxy for revenue:** The "projected at 100%" calculation assumes revenue scales linearly with adoption. The last units to comply may have fewer pets, so actual revenue at 100% may be lower.
 - **Uncollected pet rent estimate:** Uses the **average (mean) charge amount** from tenants who ARE paying at each specific property. Falls back to portfolio-wide average if no payers at a property.
 - **PetScreening tenants vs PMC charges:** Pet data (who has a pet) comes from PetScreening's internal tables. Charge data (who's paying) comes from the PMC API. These update independently — brief sync delays are possible.
-- **Launch date = month boundary:** The launch month is counted as post-launch. Pre-launch baseline uses up to 6 months before the launch month. Post-launch "current lift" uses up to 6 most recent completed months (excludes current partial month). Cumulative impact uses actual observed total post-launch revenue minus the projected baseline.
+- **Launch date = month boundary:** The launch month is counted as post-launch. Pre-launch baseline uses up to 6 months before the launch month. Post-launch monthly lift = cumulative impact ÷ completed post months (excludes current partial month). Cumulative impact uses actual observed total post-launch revenue minus the projected baseline.
 - **PM emails:** Filtered to active PMs with specific permission types, using `parent_company_ancestry_id` from `user_enriched`.
 - **Suspected undisclosed exclusions:** Assistance profiles with `recommended` or `expired` status are excluded. Pet profiles with a non-empty `archive_reason` are excluded.
 - **Missing pet rent tenant criteria:** Only `compliant` + `household` + `active` tenants are considered. This is consistent across ALL tabs (Charts, Summary, Report).
