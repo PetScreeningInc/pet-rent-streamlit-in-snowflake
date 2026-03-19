@@ -51,29 +51,36 @@ For each missing tenant, we estimate how much pet rent is going uncollected by u
 | | Yardi | Entrata |
 |---|---|---|
 | **API** | SOAP-based GetRentroll API | REST-based getLeases API |
-| **What it returns** | Scheduled charges per tenant | Leases with customers, intervals, and scheduled charges |
-| **Tenant identifier** | `tenant_code` (straightforward) | `customerId` (extracted from lease JSON) |
-| **Email availability** | Not always available | Usually available per customer |
-| **Date range** | Pulls 10 years of history (wide window) | Pulls all lease statuses (current, past, notice) |
+| **What it returns** | Lease charges from the rent roll (what tenants are being charged, not payment receipts) | Leases with customers, intervals, and scheduled charges (what the lease says should be billed) |
+| **Tenant identifier** | `tenant_code` (straightforward) | `customerId` (extracted from lease JSON, stored as `tenant_code` in the app for consistency) |
+| **Email availability** | Rarely available — matching relies almost entirely on `tenant_code` | Usually available per customer — used as primary match alongside customerId |
+| **Tenant scope** | Returns ALL tenants including `TenantStatus = "Past"` — we see moved-out tenants | Pulls all lease statuses (current, past, notice) with interval filtering |
+| **Date range** | Pulls 10 years of history (wide window) | Pulls all lease statuses via `leaseStatusTypeIds: 1,2,3,4,5,6` |
+
+**Important distinction:** Neither Yardi nor Entrata returns actual payment receipts (what was collected). They return what the property *intends* to charge. For Entrata, the app also fetches AR (accounts receivable) transactions, but those are used ONLY for the separate "Scheduled vs Actual Revenue" comparison view — they do not feed into the missing pet rent calculation.
 
 ### How Charges Are Structured
 
 **Yardi:** Simple — each row is one charge for one tenant. One tenant code, one charge code, one amount.
 
-**Entrata:** Complex — charges belong to a **lease**, not a person. A lease can have multiple customers (roommates, guarantors). Each customer on the lease sees the same charges. We handle this by:
-- Emitting one row per customer × charge combination
-- Using a deduplication key so we don't double-count revenue
+**Entrata:** Complex — charges belong to a **lease**, not a person. A lease can have multiple customers (roommates, guarantors). **Every customer on the same lease gets identical charges.** So if a lease has 2 roommates and a $25/mo Pet Rent charge, both customers show that same $25 charge — it's NOT split $12.50 each.
+
+We handle this by:
+- Emitting one row per customer × charge combination (so we can match individual profiles)
+- Using a deduplication key (`_entrata_charge_dedup_key`) so we don't double-count revenue when summing totals
 - If any customer on a lease has a pet charge, all customers on that lease are marked as "paying"
+
+**This dedup is critical.** Without it, revenue numbers would be inflated by 2x or more on every shared lease. The same applies to the Snowflake staging table — `stg_pmc_integrations_entrata__getleases` has one row per customer per lease, with identical `scheduled_charges_array` across all customers on the same lease.
 
 ### How We Identify Tenants
 
-**Yardi:** Match on `tenant_code` — a unique identifier Yardi assigns to each tenant. Straightforward and reliable.
+**Yardi:** Match on `tenant_code` — a unique identifier Yardi assigns to each tenant. Email is attempted but rarely available from the Yardi API, so `tenant_code` is the primary (and usually only) matching method.
 
-**Entrata:** Match on `customerId` first, then fall back to email. The customer ID comes from a JSON field in the lease data (`lease_source_external_id`), and we try three possible key names:
+**Entrata:** The raw charge data has `lease_id`, `tenant_code` (which is actually the Entrata `customerId` — renamed for consistency with Yardi), and `email`. On the Snowflake side, matching tries three possible JSON key names in `lease_source_external_id`:
 ```
 tenant_code → customerId → customer_id
 ```
-If none of these exist, we fall back to matching by email address.
+If none of these exist (comes back NULL), matching falls back to email address (case-insensitive). **This fallback is important** — if `lease_source_external_id` doesn't store these keys for Entrata, tenant_code matching is effectively disabled and email becomes the only link between PetScreening profiles and charge data.
 
 ### Entrata-Only: The Freshness Filter
 
@@ -85,7 +92,9 @@ Entrata has an extra safety check that Yardi does not need.
 
 **The tradeoff:** This filter is conservative. It can also exclude legitimate current tenants whose email in PetScreening doesn't match their email in Entrata (typos, different email used, etc.). When this happens, a message shows how many profiles were excluded.
 
-**Yardi doesn't need this** because the Yardi API returns a rent roll (current occupants), which is inherently fresh. Entrata's getLeases API can return historical leases, so we need the extra check.
+**Yardi doesn't have this filter** because there's no equivalent email-based check available (email is rarely populated from Yardi). However, the Yardi API does return tenants with `TenantStatus = "Past"` — meaning moved-out tenants CAN appear in the data. The app does not currently filter these out from the missing pet rent count. Their dollar impact is limited by using `move_out` dates when available, but they can still be counted as "missing" if their PetScreening profile is still active. This is a known gap — Yardi's past tenants are not freshness-filtered the way Entrata's are.
+
+Entrata's getLeases API returns historical leases across all statuses (`leaseStatusTypeIds: 1,2,3,4,5,6`), so the freshness check is necessary to avoid flagging moved-out tenants.
 
 ---
 
@@ -95,7 +104,7 @@ We only flag a tenant as "missing pet rent" if ALL of these are true:
 
 | Filter | What it means | Why |
 |---|---|---|
-| `compliance_status = 'compliant'` | The tenant completed their screening fully | Incomplete screenings might not have confirmed pets yet |
+| `compliance_status = 'compliant'` | The tenant completed their screening fully | Incomplete screenings might not have confirmed pets yet. Note: a newer `n/a\|entrata` status also exists which filters out users who no longer live at the property — these are correctly excluded since they're not `compliant`. |
 | `user_pet_type = 'household'` | The pet is classified as a household pet (not an assistance/ESA animal) | Assistance animals cannot be charged pet rent — it's a legal requirement (Fair Housing Act) |
 | `user_pet_status = 'active'` | The pet profile is currently active | Archived or removed pet profiles shouldn't generate charges |
 | Email is not null/blank/junk | The tenant has a real email address | We need a valid identifier to match against charge data |
@@ -131,9 +140,9 @@ The "missing pet rent" number represents the **minimum confirmed gap** — the r
 
 ### Cancelled / Applicant Leases (Entrata)
 
-**Problem:** Entrata returns all lease intervals, including cancelled applications and denied applicants. Charges on cancelled leases shouldn't count as real revenue.
+**Problem:** Entrata returns all lease intervals across all statuses (the API is called with `leaseStatusTypeIds: 1,2,3,4,5,6` to get everything). This includes cancelled applications and denied applicants. Charges on cancelled leases shouldn't count as real revenue.
 
-**Solution:** We filter lease intervals by status. Only `Current`, `Past`, and `Notice` intervals are included. `Cancelled`, `Applicant`, `Denied`, and `Future` intervals are dropped.
+**Solution:** We filter lease intervals by status. Only `Current`, `Past`, and `Notice` intervals are included. `Cancelled`, `Applicant`, `Denied`, and `Future` intervals are dropped. The app also handles cases where `intervalStatusId` is empty (some Entrata responses don't populate this field) — in those cases, the code falls back to checking the lease-level status.
 
 ### One-Time vs. Recurring Charges
 
@@ -141,8 +150,10 @@ The "missing pet rent" number represents the **minimum confirmed gap** — the r
 
 **Solution:**
 - **Entrata:** Uses the explicit `frequency` field on each charge (one-time vs. monthly)
-- **Yardi:** Infers from the date range — if the charge spans more than 60 days, it's recurring; otherwise it's one-time
+- **Yardi:** Classifies per-property using the median date span of each charge code. If the median span is more than 60 days, it's treated as recurring. If under 60 days, it's one-time. **If there are no valid date spans at all (common with Yardi since dates are often missing), the charge defaults to recurring.** In practice, most Yardi charges end up classified as recurring because the date span data is frequently absent.
 - Missing revenue estimation uses the property-specific average. If a property has no payers to average from, we fall back to the portfolio-wide average.
+
+**Important nuance:** The classification is done per-property for each charge code, not globally. The same charge code (e.g., "Pet Fee") might be classified as one-time at one property and recurring at another depending on how it's used. This is correct — the same code name can have different billing patterns across properties.
 
 ### Properties Without Charge Data
 
@@ -155,6 +166,14 @@ The "missing pet rent" number represents the **minimum confirmed gap** — the r
 **Problem:** A tenant might exist in PetScreening's Snowflake data but not appear in the current Entrata API pull — possibly because they moved out, or the API didn't return their lease.
 
 **Solution:** The Entrata freshness filter checks if the tenant's email exists in the API data. If not, they're excluded (with a count shown to the user). Tenants already marked as paying are kept regardless.
+
+### Past / Moved-Out Tenants (Yardi)
+
+**Problem:** The Yardi GetRentroll API returns all tenants including those with `TenantStatus = "Past"`. If a tenant moved out but their PetScreening profile is still active, they could be flagged as "missing pet rent" even though they no longer live there.
+
+**How the app handles it:** The dollar impact for past tenants is bounded by their `move_out` or `lease_to` date — so they won't inflate the cumulative revenue estimate indefinitely. However, they CAN still appear in the "missing" headcount. Unlike Entrata (which has the freshness filter to catch this), Yardi has no equivalent safety net since email is rarely available for matching.
+
+**Mitigating factor:** The `compliance_status = 'compliant'` and `user_pet_status = 'active'` filters on the PetScreening side help — if a tenant's profile was deactivated when they moved out, they'd be excluded. But if the profile was never deactivated (a data hygiene issue), they would still be counted.
 
 ### Properties with No Pet Charges At All
 
@@ -200,6 +219,7 @@ It does NOT capture:
 - Tenants whose email/ID doesn't match between systems (they get silently excluded)
 - Properties not connected via API
 - Tenants filtered out by the Entrata freshness check
+- Tenants with the newer `n/a|entrata` compliance status (these are users flagged as no longer living at the property — correctly excluded, but this recently reduced the denominator for Entrata clients)
 
 Think of the confirmed number as the **floor**, not the ceiling. The actual gap is likely larger.
 
