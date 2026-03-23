@@ -1245,7 +1245,12 @@ def _extract_ar_charges_from_entrata_lease(lease_obj, property_row):
     Only pet-related charge codes are kept (matched case-insensitively against
     common pet charge code names).
     """
-    PET_KEYWORDS = {'pet rent', 'pet fee', 'pet deposit', 'animal rent', 'animal fee', 'animal deposit'}
+    PET_KEYWORDS = {
+        'pet rent', 'pet fee', 'pet deposit', 'pet damage',
+        'animal rent', 'animal fee', 'animal deposit',
+        'pet', 'pet charge', 'monthly pet', 'pet premium',
+        'companion animal', 'esa fee', 'esa rent',
+    }
     rows = []
     ar_data = lease_obj.get("arTransactions", {})
     if not ar_data:
@@ -1257,9 +1262,14 @@ def _extract_ar_charges_from_entrata_lease(lease_obj, property_row):
     lease_id = str(lease_obj.get("id", ""))
     unit_number = lease_obj.get("unitNumberSpace", "")
 
+    PARTIAL_KEYWORDS = {'pet', 'animal', 'companion'}
     for txn in transactions:
         code_name = str(txn.get("chargeCodeName", "")).strip()
-        if not code_name or code_name.lower() not in PET_KEYWORDS:
+        if not code_name:
+            continue
+        code_lower = code_name.lower()
+        # Match exact keywords OR any partial substring match
+        if code_lower not in PET_KEYWORDS and not any(kw in code_lower for kw in PARTIAL_KEYWORDS):
             continue
         rows.append({
             "property_id": property_row["PROPERTY_ID"],
