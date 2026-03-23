@@ -6549,107 +6549,62 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             f"Total AR rows (all time): **{len(ar_df):,}**"
                         )
 
-                        # ── Lease-Level: Scheduled vs AR Detail ──────────
+                        # ── Raw AR Transactions (individual posted charges) ──
                         st.markdown("---")
-                        st.subheader("Lease-Level: Scheduled vs AR Detail")
+                        st.subheader("AR Transactions (Individual Posted Charges)")
                         st.caption(
-                            "Shows each pet charge at the lease level with whether a matching AR "
-                            "transaction was found. Use this to identify leases where scheduled "
-                            "charges aren't being posted (or vice versa)."
+                            "Each row = one actual charge posted to the ledger. "
+                            "This is what the property management system actually billed, "
+                            "not what the lease says *should* be billed."
                         )
 
-                        # Build scheduled charges by lease
-                        _sched_pet = df[df['charge_code'].isin(selected_codes)].copy() if 'charge_code' in df.columns else pd.DataFrame()
-                        if not _sched_pet.empty and 'lease_id' in _sched_pet.columns:
-                            # Deduplicate scheduled charges (one per lease+charge_code)
-                            _sched_grouped = _sched_pet.groupby(
-                                ['property_name', 'lease_id', 'unit_code', 'charge_code']
-                            ).agg(
-                                charge_amount=('charge_amount', 'first'),
-                                charge_from=('charge_from_date', 'first'),
-                                charge_to=('charge_to_date', 'first'),
-                                tenant=('first_name', lambda x: f"{x.iloc[0]} {_sched_pet.loc[x.index[0], 'last_name']}" if len(x) > 0 else ""),
-                            ).reset_index()
+                        # Build a clean display table from ar_df
+                        _ar_display = ar_df.copy()
+                        _ar_display['_amt'] = pd.to_numeric(_ar_display['amount'], errors='coerce').fillna(0)
+                        _ar_display['_paid'] = pd.to_numeric(_ar_display['amount_paid'], errors='coerce').fillna(0)
+                        _ar_display['_bal'] = pd.to_numeric(_ar_display['balance_due'], errors='coerce').fillna(0)
 
-                            # Build AR lookup: (lease_id, charge_code_lower) → total AR amount
-                            _ar_by_lease = {}
-                            for _, _ar_r in ar_df.iterrows():
-                                _key = (
-                                    str(_ar_r.get('lease_id', '')).strip(),
-                                    str(_ar_r.get('charge_code_name', '')).strip().lower(),
+                        _ar_table_rows = []
+                        for _, _r in _ar_display.iterrows():
+                            _ar_table_rows.append({
+                                "Unit": _r.get('unit', ''),
+                                "Lease ID": _r.get('lease_id', ''),
+                                "Charge": _r.get('charge_code_name', ''),
+                                "Post Date": str(_r.get('post_date', ''))[:10],
+                                "Post Month": str(_r.get('post_month', ''))[:7],
+                                "Amount": f"${_r['_amt']:,.2f}",
+                                "Paid": f"${_r['_paid']:,.2f}",
+                                "Balance": f"${_r['_bal']:,.2f}",
+                                "Description": str(_r.get('description', ''))[:50],
+                            })
+
+                        if _ar_table_rows:
+                            _ar_table_df = pd.DataFrame(_ar_table_rows)
+
+                            # Month filter
+                            _ar_months = sorted(set(r["Post Month"] for r in _ar_table_rows if r["Post Month"]))
+                            if _ar_months:
+                                _sel_ar_month = st.selectbox(
+                                    "Filter by post month:",
+                                    ["All"] + _ar_months,
+                                    index=0,
+                                    key="ar_month_filter",
                                 )
-                                _ar_by_lease[_key] = _ar_by_lease.get(_key, 0) + float(_ar_r.get('amount', 0) or 0)
+                                if _sel_ar_month != "All":
+                                    _ar_table_df = _ar_table_df[_ar_table_df["Post Month"] == _sel_ar_month]
 
-                            # Match
-                            _detail_rows = []
-                            for _, _sr in _sched_grouped.iterrows():
-                                _lk = (
-                                    str(_sr['lease_id']).strip(),
-                                    str(_sr['charge_code']).strip().lower(),
-                                )
-                                _ar_amt = _ar_by_lease.pop(_lk, None)
-                                _sched_amt = float(_sr['charge_amount']) if _sr['charge_amount'] else 0
-                                _detail_rows.append({
-                                    "Property": (_sr['property_name'].split(" - ", 1)[-1]
-                                                 if " - " in str(_sr['property_name']) else _sr['property_name']),
-                                    "Unit": _sr['unit_code'],
-                                    "Lease ID": _sr['lease_id'],
-                                    "Tenant": _sr.get('tenant', ''),
-                                    "Charge Code": _sr['charge_code'],
-                                    "Scheduled ($)": f"{_sched_amt:,.2f}",
-                                    "AR Posted ($)": f"{_ar_amt:,.2f}" if _ar_amt is not None else "—",
-                                    "Status": ("✅ Match" if _ar_amt is not None and _ar_amt > 0
-                                               else "⚠️ No AR"),
-                                })
+                            st.markdown(f"**{len(_ar_table_df)}** transactions shown")
+                            _render_table(_ar_table_df, height=400)
 
-                            # Add AR-only rows (posted but not scheduled)
-                            for (_lid, _ccode), _ar_val in _ar_by_lease.items():
-                                if _ar_val == 0:
-                                    continue
-                                # Find property name from ar_df
-                                _ar_prop = ar_df[ar_df['lease_id'] == _lid]
-                                _pname = _ar_prop['property_name'].iloc[0] if not _ar_prop.empty else "Unknown"
-                                _unit = _ar_prop['unit'].iloc[0] if not _ar_prop.empty else ""
-                                _pname_short = _pname.split(" - ", 1)[-1] if " - " in _pname else _pname
-                                _detail_rows.append({
-                                    "Property": _pname_short,
-                                    "Unit": _unit,
-                                    "Lease ID": _lid,
-                                    "Tenant": "",
-                                    "Charge Code": _ccode,
-                                    "Scheduled ($)": "—",
-                                    "AR Posted ($)": f"{_ar_val:,.2f}",
-                                    "Status": "⚠️ AR only (no scheduled)",
-                                })
-
-                            if _detail_rows:
-                                _detail_df = pd.DataFrame(_detail_rows)
-                                # Summary counts
-                                _n_match = sum(1 for r in _detail_rows if "Match" in r["Status"])
-                                _n_no_ar = sum(1 for r in _detail_rows if "No AR" in r["Status"])
-                                _n_ar_only = sum(1 for r in _detail_rows if "AR only" in r["Status"])
-                                st.markdown(
-                                    f"**{_n_match}** matched · **{_n_no_ar}** scheduled with no AR · "
-                                    f"**{_n_ar_only}** AR-only (not scheduled)"
-                                )
-
-                                # Filter options
-                                _status_filter = st.radio(
-                                    "Filter by status:",
-                                    ["All", "⚠️ No AR", "⚠️ AR only", "✅ Match"],
-                                    horizontal=True,
-                                    key="ar_detail_filter",
-                                )
-                                if _status_filter != "All":
-                                    _detail_df = _detail_df[_detail_df["Status"].str.contains(_status_filter.split(" ", 1)[-1])]
-
-                                _render_table(_detail_df, height=400)
-                            else:
-                                st.info("No pet charges found to compare.")
-                        elif _sched_pet.empty:
-                            st.info("No scheduled pet charges found in the current data.")
+                            st.download_button(
+                                "Download AR transactions",
+                                data=_ar_display.to_csv(index=False),
+                                file_name=f"ar_transactions_{datetime.now().strftime('%Y%m%d')}.csv",
+                                mime="text/csv",
+                                key="dl_ar_inline",
+                            )
                         else:
-                            st.info("Lease-level matching requires `lease_id` column (Entrata only).")
+                            st.info("No AR transactions found for this property.")
 
                 # ── 6. Collapsible Tables Section ───────────────────────
                 st.divider()
