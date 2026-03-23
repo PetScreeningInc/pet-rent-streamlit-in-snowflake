@@ -1375,6 +1375,7 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
     """
     all_charges = []
     all_ar_charges = []
+    all_raw_lease_arrays = []
     results_log = []
 
     for i, prop in enumerate(properties):
@@ -1400,6 +1401,39 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
             charges.extend(_extract_charges_from_entrata_lease(lease, prop))
             ar_charges_prop.extend(_extract_ar_charges_from_entrata_lease(lease, prop))
 
+            # Capture raw arrays for export
+            lease_id = str(lease.get("id", ""))
+            unit = lease.get("unitNumberSpace", "")
+            # Get primary customer name
+            _custs = lease.get("customers", {}).get("customer", [])
+            if isinstance(_custs, dict):
+                _custs = [_custs]
+            _primary = _custs[0] if _custs else {}
+            _tenant_name = f"{_primary.get('firstName', '')} {_primary.get('lastName', '')}".strip()
+            _tenant_status = _primary.get("leaseCustomerStatus", "")
+
+            # Raw scheduled charges array
+            _sched_raw = lease.get("scheduledCharges", {}).get("scheduledCharge", [])
+            if isinstance(_sched_raw, dict):
+                _sched_raw = [_sched_raw]
+            # Raw AR transactions array
+            _ar_raw = lease.get("arTransactions", {}).get("arTransaction", [])
+            if isinstance(_ar_raw, dict):
+                _ar_raw = [_ar_raw]
+
+            all_raw_lease_arrays.append({
+                "property_name": prop_name,
+                "property_code": prop_code,
+                "lease_id": lease_id,
+                "unit": unit,
+                "tenant": _tenant_name,
+                "tenant_status": _tenant_status,
+                "n_scheduled_charges": len(_sched_raw),
+                "n_ar_transactions": len(_ar_raw),
+                "scheduled_charges_json": json.dumps(_sched_raw, default=str),
+                "ar_transactions_json": json.dumps(_ar_raw, default=str),
+            })
+
         if charges:
             all_charges.extend(charges)
             all_ar_charges.extend(ar_charges_prop)
@@ -1419,7 +1453,7 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
 
     progress_bar.progress(1.0)
     status_text.text("Done!")
-    return all_charges, results_log, all_ar_charges
+    return all_charges, results_log, all_ar_charges, all_raw_lease_arrays
 
 
 # ─── Yardi API fetch ─────────────────────────────────────────────────
@@ -5021,6 +5055,7 @@ with st.sidebar:
         st.session_state.pmc_system = _pmc_system
         st.session_state.all_charges_df = None
         st.session_state.ar_charges_df = None
+        st.session_state.raw_lease_arrays_df = None
         st.session_state.fetch_log = None
         st.session_state.chart_data = None
         st.session_state.selection_label = ""
@@ -5100,6 +5135,8 @@ if "all_charges_df" not in st.session_state:
     st.session_state.all_charges_df = None
 if "ar_charges_df" not in st.session_state:
     st.session_state.ar_charges_df = None
+if "raw_lease_arrays_df" not in st.session_state:
+    st.session_state.raw_lease_arrays_df = None
 if "fetch_log" not in st.session_state:
     st.session_state.fetch_log = None
 if "selection_label" not in st.session_state:
@@ -5182,6 +5219,7 @@ if fetch_btn:
             st.session_state.pm_emails_cache = None
             st.session_state.all_charges_df = None
             st.session_state.ar_charges_df = None
+            st.session_state.raw_lease_arrays_df = None
             st.session_state.fetch_log = None
             # Clear cached missing rent, suspected, and charge type data
             for _stale_key in list(st.session_state.keys()):
@@ -5194,10 +5232,11 @@ if fetch_btn:
 
             # Route to correct API fetch
             if _is_entrata:
-                all_charges, fetch_log, ar_charges = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
+                all_charges, fetch_log, ar_charges, raw_lease_arrays = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
             else:
                 all_charges, fetch_log = fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months)
                 ar_charges = []
+                raw_lease_arrays = []
 
             success_count = sum(1 for l in fetch_log if l['status'].startswith('Success'))
             error_count = sum(1 for l in fetch_log if l['status'].startswith('Error'))
@@ -5210,6 +5249,10 @@ if fetch_btn:
                     st.session_state.ar_charges_df = pd.DataFrame(ar_charges)
                 else:
                     st.session_state.ar_charges_df = None
+                if raw_lease_arrays:
+                    st.session_state.raw_lease_arrays_df = pd.DataFrame(raw_lease_arrays)
+                else:
+                    st.session_state.raw_lease_arrays_df = None
 
                 # Build summary message
                 summary_parts = [f"Fetched **{len(all_charges):,}** charges across **{success_count}** properties"]
@@ -5221,6 +5264,7 @@ if fetch_btn:
             else:
                 st.session_state.all_charges_df = None
                 st.session_state.ar_charges_df = None
+                st.session_state.raw_lease_arrays_df = None
                 st.session_state.fetch_log = pd.DataFrame(fetch_log)
                 st.warning("No charge data returned from any property.")
 
@@ -5582,6 +5626,32 @@ if st.session_state.all_charges_df is not None:
                         mime="text/csv",
                         key="dl_pet_ar_flag",
                     )
+
+            # ── 7. Raw Lease Arrays Export (Entrata only) ────────────
+            _raw_arrays_df = st.session_state.get("raw_lease_arrays_df")
+            if pmc_sys == "entrata" and _raw_arrays_df is not None and not _raw_arrays_df.empty:
+                st.markdown("---")
+                _rac1, _rac2, _ = st.columns([1, 1, 2])
+                with _rac1:
+                    st.markdown("**7. Raw Lease Arrays (Entrata)**")
+                    st.caption(
+                        "One row per lease with the raw `scheduledCharges` and `arTransactions` "
+                        "JSON arrays exactly as returned by the Entrata API. "
+                        "Open the CSV and expand the JSON columns to see every individual "
+                        "charge and transaction."
+                    )
+                    st.download_button(
+                        "Download raw_lease_arrays.csv",
+                        data=_raw_arrays_df.to_csv(index=False),
+                        file_name=f"raw_lease_arrays_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        key="dl_raw_lease_arrays",
+                    )
+                with _rac2:
+                    _n_with_sched = (_raw_arrays_df['n_scheduled_charges'] > 0).sum()
+                    _n_with_ar = (_raw_arrays_df['n_ar_transactions'] > 0).sum()
+                    st.metric("Leases with scheduled charges", f"{_n_with_sched:,}")
+                    st.metric("Leases with AR transactions", f"{_n_with_ar:,}")
 
             st.divider()
             st.markdown("##### Snowflake Upload Instructions")
