@@ -5673,6 +5673,18 @@ if st.session_state.all_charges_df is not None:
                 # revenue aggregation we keep only one copy per unique charge.
                 if "_entrata_charge_dedup_key" in filtered.columns:
                     _pre = len(filtered)
+
+                    # Sort so active customers (current/past/notice) come first.
+                    # After dedup (keep="first"), the surviving row will represent
+                    # an active customer if one exists on the lease.  If ALL
+                    # customers are cancelled/applicant, the surviving row will
+                    # have that status → we filter it out below.
+                    _ACTIVE_STATUSES = {"current", "past", "notice"}
+                    filtered["_status_sort"] = filtered["tenant_status"].apply(
+                        lambda s: 0 if str(s).strip().lower() in _ACTIVE_STATUSES else 1
+                    )
+                    filtered = filtered.sort_values("_status_sort", kind="stable")
+
                     # Drop rows where the dedup key is non-empty and duplicated
                     mask_has_key = filtered["_entrata_charge_dedup_key"].astype(str).str.strip().ne("")
                     dedup_rows = filtered[mask_has_key].drop_duplicates(
@@ -5680,12 +5692,31 @@ if st.session_state.all_charges_df is not None:
                     )
                     non_dedup_rows = filtered[~mask_has_key]
                     filtered = pd.concat([dedup_rows, non_dedup_rows], ignore_index=True)
+                    filtered = filtered.drop(columns=["_status_sort"], errors="ignore")
                     _deduped = _pre - len(filtered)
-                    if _deduped > 0:
-                        st.caption(
-                            f"Deduplicated {_deduped:,} shared-lease charge rows "
-                            f"(charges belong to the lease, not individual customers)."
+
+                    # Exclude charges where ALL customers on the lease are
+                    # cancelled/applicant — these aren't real revenue.
+                    _INACTIVE_STATUSES = {"cancelled", "applicant", "denied", "future"}
+                    _pre_inactive = len(filtered)
+                    filtered = filtered[
+                        ~filtered["tenant_status"].apply(
+                            lambda s: str(s).strip().lower() in _INACTIVE_STATUSES
                         )
+                    ]
+                    _dropped_inactive = _pre_inactive - len(filtered)
+
+                    _info_parts = []
+                    if _deduped > 0:
+                        _info_parts.append(
+                            f"Deduplicated {_deduped:,} shared-lease charge rows"
+                        )
+                    if _dropped_inactive > 0:
+                        _info_parts.append(
+                            f"Excluded {_dropped_inactive:,} charges from fully cancelled/applicant leases"
+                        )
+                    if _info_parts:
+                        st.caption(" · ".join(_info_parts) + ".")
 
                 # Extract launch dates per property (once)
                 launch_dates = {}
