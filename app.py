@@ -4191,6 +4191,7 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
       AND m.pet_profile_type = 'household'
       AND m.pet_profile_status = 'active'
       AND m.property_source_name = '{pmc_system}'
+      AND LOWER(m.resident_type) = 'current'
     """
     cur.execute(sql_exec)
     exec_df = pd.DataFrame(cur.fetchall())
