@@ -4088,6 +4088,19 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
     paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
 
+    # ── DEBUG: Log matching diagnostics ──
+    _sample_pids = list(_charge_pids)[:3]
+    _sample_tc = list(paying_tc_set)[:3] if paying_tc_set else []
+    _sample_em = list(paying_email_set)[:3] if paying_email_set else []
+    st.info(
+        f"🔍 **Debug — Missing Pet Rent Report**\n\n"
+        f"- Properties in scope: **{len(property_ids)}** (sample PIDs: {_sample_pids})\n"
+        f"- Paying tenant codes: **{len(paying_tc_set):,}** (sample: {_sample_tc})\n"
+        f"- Paying emails: **{len(paying_email_set):,}** (sample: {_sample_em})\n"
+        f"- property_id dtype in DataFrame: `{all_charges_df['property_id'].dtype}`\n"
+        f"- Sample property_id values: {all_charges_df['property_id'].head(3).tolist()}"
+    )
+
     # ── Step 2: Query Snowflake for PetScreening household profiles ──
     # ** MUST match fetch_missing_pet_rent_by_property exactly: compliant + household + active **
     sql_profiles = f"""
@@ -4155,6 +4168,23 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
         if _n_excluded > 0:
             st.info(f"Entrata freshness filter: excluded {_n_excluded:,} profiles not found in current API data")
         profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
+
+    # ── DEBUG: Profile matching results ──
+    _n_total_profiles = len(profiles_df)
+    _n_paying = (profiles_df['pet_rent_paid'] == 1).sum()
+    _n_not_paying = (profiles_df['pet_rent_paid'] == 0).sum()
+    # Check if API email PIDs match Snowflake PIDs
+    _api_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    _sf_pids = set(profiles_df['PROPERTY_ID'].astype(str).str.strip().unique()) if not profiles_df.empty else set()
+    _overlap = _api_pids & _sf_pids
+    st.info(
+        f"🔍 **Debug — Profile Matching**\n\n"
+        f"- Total profiles from Snowflake: **{_n_total_profiles}**\n"
+        f"- Marked as paying: **{_n_paying}** | Not paying: **{_n_not_paying}**\n"
+        f"- API property_ids (sample): {list(_api_pids)[:3]}\n"
+        f"- Snowflake property_ids (sample): {list(_sf_pids)[:3]}\n"
+        f"- Overlapping property_ids: **{len(_overlap)}** of {len(_sf_pids)}"
+    )
 
     # Tenants with household pets who are NOT paying any selected charge
     missing_profiles = profiles_df[profiles_df['pet_rent_paid'] == 0].copy()
