@@ -4233,13 +4233,25 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
       AND m.pet_profile_type = 'household'
       AND m.pet_profile_status = 'active'
       AND m.property_source_name = '{pmc_system}'
-      AND LOWER(m.resident_type) = 'current'
     """
     cur.execute(sql_exec)
     exec_df = pd.DataFrame(cur.fetchall())
 
     if exec_df.empty:
         return pd.DataFrame()
+
+    # Filter out past residents in Python (flexible matching).
+    # The RESIDENT_TYPE values vary across PMC systems ('Current', 'Current Resident', etc.)
+    if 'RESIDENT_TYPE' in exec_df.columns:
+        _rt_values = exec_df['RESIDENT_TYPE'].dropna().unique().tolist()
+        _rt_lower = exec_df['RESIDENT_TYPE'].astype(str).str.strip().str.lower()
+        _is_current = _rt_lower.str.contains('current', na=False)
+        _n_current = _is_current.sum()
+        _n_past = (~_is_current).sum()
+        st.info(f"🔍 Resident types found: {_rt_values[:10]} — current: {_n_current:,}, other: {_n_past:,}")
+        if _n_current > 0:
+            exec_df = exec_df[_is_current]
+        # If no 'current' matches at all, keep everything (don't silently drop all data)
 
     # ── Step 5: Keep only exec summary records whose (email, property) is missing ──
     report_df = exec_df[
