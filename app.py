@@ -574,9 +574,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Styled HTML table helper (replaces st.dataframe for visibility) ─
-def _render_table(df, height=None, hide_index=True):
-    """Render a DataFrame as a styled HTML table with guaranteed white bg + dark text."""
-    html = df.to_html(
+def _render_table(df, height=None, hide_index=True, max_rows=1000):
+    """Render a DataFrame as a styled HTML table with guaranteed white bg + dark text.
+
+    Large DataFrames are automatically truncated to *max_rows* for display.
+    The full dataset is untouched — only the browser rendering is capped.
+    """
+    truncated = False
+    display_df = df
+    if max_rows and len(df) > max_rows:
+        display_df = df.head(max_rows)
+        truncated = True
+
+    html = display_df.to_html(
         index=not hide_index,
         classes="ps-table",
         border=0,
@@ -590,6 +600,8 @@ def _render_table(df, height=None, hide_index=True):
         f'<div class="ps-table-wrap"{wrapper_style}>{html}</div>',
         unsafe_allow_html=True,
     )
+    if truncated:
+        st.caption(f"Showing first {max_rows:,} of {len(df):,} rows. Download CSV/Excel for full data.")
 
 
 # ─── Property Funnel — consistent cascade across all tabs ────────────
