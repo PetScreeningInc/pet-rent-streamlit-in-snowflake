@@ -5129,7 +5129,43 @@ with st.sidebar:
     lookback_months = 120  # 10 years — effectively "all data"
 
     st.divider()
-    fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
+    _fetch_col, _load_col = st.columns([1, 1])
+    with _fetch_col:
+        fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
+    with _load_col:
+        # ── Load from saved export ──
+        _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+        _saved_files = []
+        if os.path.isdir(_auto_dir):
+            _saved_files = sorted(
+                [f for f in os.listdir(_auto_dir) if f.startswith("charges_") and f.endswith(".csv")],
+                reverse=True,
+            )
+        if _saved_files:
+            _selected_export = st.selectbox(
+                "Or load saved export",
+                options=[""] + _saved_files,
+                format_func=lambda x: "— Select a saved file —" if x == "" else x,
+                key="load_export_select",
+            )
+            if _selected_export and st.button("📂 Load", key="load_export_btn", use_container_width=True):
+                _load_path = os.path.join(_auto_dir, _selected_export)
+                _loaded_df = pd.read_csv(_load_path, low_memory=False)
+                st.session_state.all_charges_df = _loaded_df
+                st.session_state.fetch_log = None
+                # Try to load matching AR file
+                _ar_name = _selected_export.replace("charges_", "ar_charges_", 1)
+                _ar_path = os.path.join(_auto_dir, _ar_name)
+                if os.path.isfile(_ar_path):
+                    st.session_state.ar_charges_df = pd.read_csv(_ar_path, low_memory=False)
+                else:
+                    st.session_state.ar_charges_df = None
+                st.session_state.raw_lease_arrays_df = None
+                # Recover property_ids from the loaded data
+                if 'property_id' in _loaded_df.columns:
+                    st.session_state.property_ids = _loaded_df['property_id'].dropna().unique().tolist()
+                st.success(f"Loaded **{len(_loaded_df):,}** charges from `{_selected_export}`")
+                st.rerun()
 
 # ─── Session state ───────────────────────────────────────────────────
 if "all_charges_df" not in st.session_state:
