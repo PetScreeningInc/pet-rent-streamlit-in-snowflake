@@ -5163,13 +5163,36 @@ with st.sidebar:
             if st.button("Load selected file", key="load_export_btn", use_container_width=True):
                 _load_path = os.path.join(_auto_dir, _selected_export)
                 _loaded_df = pd.read_csv(_load_path, low_memory=False)
+
+                # ── Fix CSV type coercion ──
+                # Pandas reads integer columns with NaN as float (e.g. 12345 → 12345.0).
+                # Downstream matching compares string IDs ("12345" vs "12345.0") and fails.
+                # Normalize ID-like columns back to clean strings.
+                for _id_col in ['property_id', 'tenant_code', 'lease_id', 'unit_code']:
+                    if _id_col in _loaded_df.columns:
+                        _loaded_df[_id_col] = (
+                            _loaded_df[_id_col]
+                            .astype(str)
+                            .str.replace(r'\.0$', '', regex=True)
+                            .replace({'nan': '', 'None': '', 'none': ''})
+                        )
+
                 st.session_state.all_charges_df = _loaded_df
                 st.session_state.fetch_log = None
                 # Try to load matching AR file
                 _ar_name = _selected_export.replace("charges_", "ar_charges_", 1)
                 _ar_path = os.path.join(_auto_dir, _ar_name)
                 if os.path.isfile(_ar_path):
-                    st.session_state.ar_charges_df = pd.read_csv(_ar_path, low_memory=False)
+                    _ar_df = pd.read_csv(_ar_path, low_memory=False)
+                    for _id_col in ['property_id', 'tenant_code', 'lease_id', 'unit_code']:
+                        if _id_col in _ar_df.columns:
+                            _ar_df[_id_col] = (
+                                _ar_df[_id_col]
+                                .astype(str)
+                                .str.replace(r'\.0$', '', regex=True)
+                                .replace({'nan': '', 'None': '', 'none': ''})
+                            )
+                    st.session_state.ar_charges_df = _ar_df
                 else:
                     st.session_state.ar_charges_df = None
                 st.session_state.raw_lease_arrays_df = None
