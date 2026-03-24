@@ -5129,26 +5129,26 @@ with st.sidebar:
     lookback_months = 120  # 10 years — effectively "all data"
 
     st.divider()
-    _fetch_col, _load_col = st.columns([1, 1])
-    with _fetch_col:
-        fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
-    with _load_col:
-        # ── Load from saved export ──
-        _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
-        _saved_files = []
-        if os.path.isdir(_auto_dir):
-            _saved_files = sorted(
-                [f for f in os.listdir(_auto_dir) if f.startswith("charges_") and f.endswith(".csv")],
-                reverse=True,
-            )
-        if _saved_files:
+
+    # ── Check for saved exports ──
+    _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+    _saved_files = []
+    if os.path.isdir(_auto_dir):
+        _saved_files = sorted(
+            [f for f in os.listdir(_auto_dir) if f.startswith("charges_") and f.endswith(".csv")],
+            reverse=True,
+        )
+
+    fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
+
+    if _saved_files:
+        with st.expander("📂 Or load from saved export"):
             _selected_export = st.selectbox(
-                "Or load saved export",
-                options=[""] + _saved_files,
-                format_func=lambda x: "— Select a saved file —" if x == "" else x,
+                "Saved files",
+                options=_saved_files,
                 key="load_export_select",
             )
-            if _selected_export and st.button("📂 Load", key="load_export_btn", use_container_width=True):
+            if st.button("Load selected file", key="load_export_btn", use_container_width=True):
                 _load_path = os.path.join(_auto_dir, _selected_export)
                 _loaded_df = pd.read_csv(_load_path, low_memory=False)
                 st.session_state.all_charges_df = _loaded_df
