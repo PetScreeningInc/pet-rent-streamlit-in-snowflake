@@ -4088,19 +4088,6 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
     paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
 
-    # ── DEBUG: Log matching diagnostics ──
-    _sample_pids = list(_charge_pids)[:3]
-    _sample_tc = list(paying_tc_set)[:3] if paying_tc_set else []
-    _sample_em = list(paying_email_set)[:3] if paying_email_set else []
-    st.info(
-        f"🔍 **Debug — Missing Pet Rent Report**\n\n"
-        f"- Properties in scope: **{len(property_ids)}** (sample PIDs: {_sample_pids})\n"
-        f"- Paying tenant codes: **{len(paying_tc_set):,}** (sample: {_sample_tc})\n"
-        f"- Paying emails: **{len(paying_email_set):,}** (sample: {_sample_em})\n"
-        f"- property_id dtype in DataFrame: `{all_charges_df['property_id'].dtype}`\n"
-        f"- Sample property_id values: {all_charges_df['property_id'].head(3).tolist()}"
-    )
-
     # ── Step 2: Query Snowflake for PetScreening household profiles ──
     # ** MUST match fetch_missing_pet_rent_by_property exactly: compliant + household + active **
     sql_profiles = f"""
@@ -4169,23 +4156,6 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
             st.info(f"Entrata freshness filter: excluded {_n_excluded:,} profiles not found in current API data")
         profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
 
-    # ── DEBUG: Profile matching results ──
-    _n_total_profiles = len(profiles_df)
-    _n_paying = (profiles_df['pet_rent_paid'] == 1).sum()
-    _n_not_paying = (profiles_df['pet_rent_paid'] == 0).sum()
-    # Check if API email PIDs match Snowflake PIDs
-    _api_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
-    _sf_pids = set(profiles_df['PROPERTY_ID'].astype(str).str.strip().unique()) if not profiles_df.empty else set()
-    _overlap = _api_pids & _sf_pids
-    st.info(
-        f"🔍 **Debug — Profile Matching**\n\n"
-        f"- Total profiles from Snowflake: **{_n_total_profiles}**\n"
-        f"- Marked as paying: **{_n_paying}** | Not paying: **{_n_not_paying}**\n"
-        f"- API property_ids (sample): {list(_api_pids)[:3]}\n"
-        f"- Snowflake property_ids (sample): {list(_sf_pids)[:3]}\n"
-        f"- Overlapping property_ids: **{len(_overlap)}** of {len(_sf_pids)}"
-    )
-
     # Tenants with household pets who are NOT paying any selected charge
     missing_profiles = profiles_df[profiles_df['pet_rent_paid'] == 0].copy()
 
@@ -4240,18 +4210,19 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     if exec_df.empty:
         return pd.DataFrame()
 
-    # Filter out past residents in Python (flexible matching).
-    # The RESIDENT_TYPE values vary across PMC systems ('Current', 'Current Resident', etc.)
+    # Deduplicate: a tenant can have multiple exec summary rows (current + past lease).
+    # Keep 'current' rows preferentially; if a tenant only has non-current rows, keep them
+    # (profile matching in Step 2-3 already validated they're active).
     if 'RESIDENT_TYPE' in exec_df.columns:
-        _rt_values = exec_df['RESIDENT_TYPE'].dropna().unique().tolist()
         _rt_lower = exec_df['RESIDENT_TYPE'].astype(str).str.strip().str.lower()
-        _is_current = _rt_lower.str.contains('current', na=False)
-        _n_current = _is_current.sum()
-        _n_past = (~_is_current).sum()
-        st.info(f"🔍 Resident types found: {_rt_values[:10]} — current: {_n_current:,}, other: {_n_past:,}")
-        if _n_current > 0:
-            exec_df = exec_df[_is_current]
-        # If no 'current' matches at all, keep everything (don't silently drop all data)
+        exec_df['_is_current'] = _rt_lower.str.contains('current', na=False)
+        # Sort so current rows come first, then drop duplicates per tenant+property+pet
+        exec_df = exec_df.sort_values('_is_current', ascending=False)
+        _dedup_cols = ['USER_EMAIL', 'PROPERTY_ID', 'PET_ID']
+        _dedup_cols = [c for c in _dedup_cols if c in exec_df.columns]
+        if _dedup_cols:
+            exec_df = exec_df.drop_duplicates(subset=_dedup_cols, keep='first')
+        exec_df = exec_df.drop(columns=['_is_current'], errors='ignore')
 
     # ── Step 5: Keep only exec summary records whose (email, property) is missing ──
     report_df = exec_df[
