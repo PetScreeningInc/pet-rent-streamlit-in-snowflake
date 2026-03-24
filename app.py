@@ -5255,6 +5255,20 @@ if fetch_btn:
                 else:
                     st.session_state.raw_lease_arrays_df = None
 
+                # ── Auto-export to disk (survives crashes / memory kills) ──
+                _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+                os.makedirs(_auto_dir, exist_ok=True)
+                _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                _label_safe = st.session_state.get("selection_label", "export").replace(" ", "_")[:60]
+                _auto_path = os.path.join(_auto_dir, f"charges_{_label_safe}_{_ts}.csv")
+                st.session_state.all_charges_df.to_csv(_auto_path, index=False)
+                _auto_msg = f"Auto-saved {len(all_charges):,} charges → `{os.path.basename(_auto_path)}`"
+                if ar_charges and st.session_state.ar_charges_df is not None:
+                    _ar_path = os.path.join(_auto_dir, f"ar_charges_{_label_safe}_{_ts}.csv")
+                    st.session_state.ar_charges_df.to_csv(_ar_path, index=False)
+                    _auto_msg += f" + AR transactions"
+                st.info(f"💾 {_auto_msg} (in `auto_exports/` folder)")
+
                 # Build summary message
                 summary_parts = [f"Fetched **{len(all_charges):,}** charges across **{success_count}** properties"]
                 if error_count:
