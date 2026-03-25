@@ -2937,6 +2937,7 @@ def generate_tranche_pdf(
     n_props_total, n_with_launch, n_props_with_data,
     include_pm=False, pm_rows=None,
     su_total_profiles=0, su_current_mo=0, total_projected=0,
+    missing_rent_data=None,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3111,15 +3112,27 @@ def generate_tranche_pdf(
     _total_unpaying = t2_tenants + (su_total_profiles or 0)
     _total_uncollected_mo = t2_mo + (su_current_mo or 0)
 
-    _proj_str = f"${total_projected:,.0f}" if total_projected and total_projected > 0 else "--"
+    # Split recurring vs one-time from missing_rent_data
+    _opp_recurring_mo = 0
+    _opp_onetime_total = 0
+    if missing_rent_data:
+        for _v in missing_rent_data.values():
+            _cnt = _v.get("missing_count", 0)
+            if _cnt == 0:
+                continue
+            _opp_recurring_mo += _cnt * _v.get("avg_recurring", 0)
+            _opp_onetime_total += _cnt * _v.get("avg_onetime", 0)
+    else:
+        # Fallback: use t2_mo as recurring (best we have without per-property data)
+        _opp_recurring_mo = t2_mo
 
+    _opp_annual_recurring = _opp_recurring_mo * 12
+    _opp_annual_impact = _opp_annual_recurring + _opp_onetime_total
+    _opp_cap_rate = 0.05
+    _opp_value_impact = _opp_annual_impact / _opp_cap_rate if _opp_annual_impact > 0 else 0
+
+    # ── Row 1: The Gap ──
     draw_card_row([
-        {
-            "value": f"${_total_uncollected_mo:,.0f}" if _total_uncollected_mo > 0 else "$0",
-            "label": "Uncollected Pet Rent",
-            "sub": f"Per month" if _total_uncollected_mo > 0 else "Fully collected",
-            "color": orange if _total_uncollected_mo > 0 else green,
-        },
         {
             "value": f"{_total_unpaying:,}" if _total_unpaying > 0 else "0",
             "label": "Tenants Not Paying",
@@ -3127,19 +3140,57 @@ def generate_tranche_pdf(
             "color": orange if _total_unpaying > 0 else green,
         },
         {
-            "value": _proj_str,
-            "label": "Projected at 100% Adoption",
-            "sub": f"Currently {t3_adoption:.1f}% adopted" if t3_adoption is not None else None,
-            "color": warm,
+            "value": f"${_opp_recurring_mo:,.0f}" if _opp_recurring_mo > 0 else "$0",
+            "label": "Missing Pet Rent",
+            "sub": "Per month, based on each property's avg fee" if _opp_recurring_mo > 0 else "Fully collected",
+            "color": orange if _opp_recurring_mo > 0 else green,
+        },
+        {
+            "value": f"${_opp_onetime_total:,.0f}" if _opp_onetime_total > 0 else "--",
+            "label": "One-Time Fees Not Collected",
+            "sub": "Pet deposits and one-time pet fees" if _opp_onetime_total > 0 else None,
+            "color": orange if _opp_onetime_total > 0 else dark_blue,
         },
     ])
+
+    # ── Row 2: The Impact ──
+    if _opp_annual_impact > 0 or (total_projected and total_projected > 0):
+        _proj_str = f"${total_projected:,.0f}" if total_projected and total_projected > 0 else "--"
+        draw_card_row([
+            {
+                "value": f"${_opp_annual_impact:,.0f}",
+                "label": "Annual Revenue Impact",
+                "sub": f"Pet rent (${_opp_annual_recurring:,.0f}/yr) + one-time fees (${_opp_onetime_total:,.0f})" if _opp_onetime_total > 0 else f"${_opp_recurring_mo:,.0f}/mo x 12",
+                "color": orange,
+            },
+            {
+                "value": f"${_opp_value_impact:,.0f}",
+                "label": "Unrealized Property Value",
+                "sub": "Annual impact / 5% cap rate",
+                "color": orange,
+            },
+            {
+                "value": _proj_str,
+                "label": "Projected at 100% Adoption",
+                "sub": f"Currently {t3_adoption:.1f}% adopted" if t3_adoption is not None else None,
+                "color": warm,
+            },
+        ])
 
     if t2_tenants > 0:
         narrative(
             f"{t2_tenants:,} tenants have completed PetScreening profiles but are not being "
-            f"charged pet rent -- that is ${t2_mo:,.0f}/mo in uncollected revenue across "
-            f"{t2_props} properties. This is a billing correction, not a sales effort."
+            f"charged pet rent. That is ${_opp_recurring_mo:,.0f}/mo in recurring pet rent"
+            + (f" plus ${_opp_onetime_total:,.0f} in uncollected one-time fees" if _opp_onetime_total > 0 else "")
+            + f" across {t2_props} properties. "
+            f"This is a billing correction, not a sales effort."
         )
+        if _opp_annual_impact > 0:
+            narrative(
+                f"On an annual basis, that is ${_opp_annual_impact:,.0f} in revenue not being captured. "
+                f"At a 5% cap rate, collecting these fees would add ${_opp_value_impact:,.0f} "
+                f"in property value."
+            )
         if su_total_profiles and su_total_profiles > 0:
             narrative(
                 f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
@@ -3154,15 +3205,15 @@ def generate_tranche_pdf(
         )
     else:
         _opportunity_note = (
-            "All screened tenants are currently being charged pet rent — no billing gaps identified."
+            "All screened tenants are currently being charged pet rent -- no billing gaps identified."
         )
         if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
             _additional_at_100 = total_projected - current_monthly_rev if current_monthly_rev else 0
             if _additional_at_100 > 0:
                 _opportunity_note += (
                     f" However, your portfolio is currently at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
-                    f"Closing that gap to 100% — through consistent screening enforcement at move-in "
-                    f"and renewal — would unlock an estimated ${_additional_at_100:,.0f}/mo in additional "
+                    f"Closing that gap to 100% -- through consistent screening enforcement at move-in "
+                    f"and renewal -- would unlock an estimated ${_additional_at_100:,.0f}/mo in additional "
                     f"pet fee revenue (${total_projected:,.0f}/mo projected at full adoption)."
                 )
         narrative(_opportunity_note)
@@ -7870,6 +7921,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             su_total_profiles=_su_total_profiles,
                             su_current_mo=_su_current_mo,
                             total_projected=_total_projected,
+                            missing_rent_data=_mr_data,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
