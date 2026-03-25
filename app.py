@@ -6551,6 +6551,78 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         "or declared no-pet after starting an assistance profile — signals they likely have an undisclosed pet."
                     )
 
+                    # ── "Show the Math" transparency section ──
+                    if _has_confirmed and c_total > 0 and c_mo > 0:
+                        _avg_fee_overall = c_mo / c_total if c_total > 0 else 0
+
+                        # Gather per-property fee details
+                        _fee_ranges = []
+                        for _p, _v in _missing_rent_data.items():
+                            _rec = _v.get("avg_recurring", 0)
+                            if _rec > 0 and _v.get("missing_count", 0) > 0:
+                                _fee_ranges.append(_rec)
+                        _fee_min = min(_fee_ranges) if _fee_ranges else 0
+                        _fee_max = max(_fee_ranges) if _fee_ranges else 0
+
+                        with st.expander("📐 How we calculate uncollected revenue", expanded=False):
+                            st.markdown(f"""
+**Current month ({latest_month.strftime('%b %Y')}):**
+
+| | |
+|---|---|
+| Tenants with pets, not paying selected charges | **{c_total:,}** |
+| × Avg pet rent at their property | **${_avg_fee_overall:,.0f}/mo** |
+| **= Estimated uncollected revenue** | **${c_mo:,.0f}/mo** |
+
+> The avg fee varies by property (${_fee_min:,.0f} – ${_fee_max:,.0f}/mo). We use each property's **actual average** from paying tenants, not a flat number across the portfolio.
+
+**Total uncollected ({len(months)}mo window):**
+
+Same logic, but we account for each tenant's **actual lease dates** — only counting months they were active and on/after the property's PetScreening launch date. One-time deposits are counted once per tenant.
+""")
+                            # Show a few example properties
+                            _example_rows = []
+                            for _p in sorted(
+                                _missing_rent_data.keys(),
+                                key=lambda p: _missing_rent_data[p].get("missing_count", 0),
+                                reverse=True,
+                            )[:5]:
+                                _v = _missing_rent_data[_p]
+                                if _v.get("missing_count", 0) == 0:
+                                    continue
+                                _short = _p.split(" - ", 1)[-1] if " - " in _p else _p
+                                _rec = _v.get("avg_recurring", 0)
+                                _cnt = _v["missing_count"]
+                                _mo_val = _v["monthly_missing"].get(latest_month, 0)
+                                _example_rows.append({
+                                    "Property": _short,
+                                    "Missing Tenants": _cnt,
+                                    "Avg Fee at Property": f"${_rec:,.0f}/mo",
+                                    "= Uncollected": f"${_mo_val:,.0f}/mo",
+                                })
+                            if _example_rows:
+                                st.markdown("**Example properties:**")
+                                _render_table(pd.DataFrame(_example_rows))
+
+                        # ── Cap Rate / Property Value Impact ──
+                        _annual_uncollected = c_mo * 12
+                        _cap_rate = 0.05  # 5% cap rate
+                        _value_impact = _annual_uncollected / _cap_rate
+
+                        with st.expander("🏢 Impact on property value", expanded=False):
+                            st.markdown(f"""
+Uncollected pet rent directly impacts property valuation through the income approach:
+
+| | |
+|---|---|
+| Monthly uncollected revenue | **${c_mo:,.0f}** |
+| × 12 months | **${_annual_uncollected:,.0f}/yr** |
+| ÷ 5% cap rate | |
+| **= Unrealized property value** | **${_value_impact:,.0f}** |
+
+> At a 5% cap rate, every **$1/mo** in recovered pet rent adds **$240** in property value. Collecting from all {c_total:,} tenants could increase portfolio valuation by **${_value_impact:,.0f}**.
+""")
+
                     # Per-property breakdown table
                     with st.expander(f"Uncollected pet rent by property ({combined_props} properties)", expanded=False):
                         mr_rows = []
