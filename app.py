@@ -6489,71 +6489,92 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     c_total = sum(v["missing_count"] for v in _missing_rent_data.values()) if _has_confirmed else 0
                     c_props = sum(1 for v in _missing_rent_data.values() if v["missing_count"] > 0) if _has_confirmed else 0
                     c_mo = sum(v["monthly_missing"].get(latest_month, 0) for v in _missing_rent_data.values()) if _has_confirmed else 0
-                    c_window = sum(v.get("total_missing_in_window", 0) for v in _missing_rent_data.values()) if _has_confirmed else 0
+
+                    # Split recurring vs one-time for confirmed
+                    c_recurring_mo = 0
+                    c_onetime_total = 0
+                    if _has_confirmed:
+                        for _v in _missing_rent_data.values():
+                            _cnt = _v.get("missing_count", 0)
+                            if _cnt == 0:
+                                continue
+                            _rec = _v.get("avg_recurring", 0)
+                            _ot = _v.get("avg_onetime", 0)
+                            c_recurring_mo += _cnt * _rec
+                            c_onetime_total += _cnt * _ot
 
                     # ── Suspected stats ──
                     s_total = sum(v["missing_count"] for v in _suspected_data.values()) if _has_suspected else 0
                     s_props = sum(1 for v in _suspected_data.values() if v["missing_count"] > 0) if _has_suspected else 0
                     s_mo = sum(v["monthly_missing"].get(latest_month, 0) for v in _suspected_data.values()) if _has_suspected else 0
-                    s_window = sum(v.get("total_missing_in_window", 0) for v in _suspected_data.values()) if _has_suspected else 0
 
                     # ── Combined ──
                     combined_total = c_total + s_total
                     combined_mo = c_mo + s_mo
-                    combined_window = c_window + s_window
                     combined_props = len(set(
                         [p for p, v in _missing_rent_data.items() if v["missing_count"] > 0] if _has_confirmed else []
                     ) | set(
                         [p for p, v in _suspected_data.items() if v["missing_count"] > 0] if _has_suspected else []
                     ))
 
+                    # ── Forward-looking impact ──
+                    _annual_recurring = c_recurring_mo * 12
+                    _annual_impact = _annual_recurring + c_onetime_total
+                    _cap_rate = 0.05
+                    _value_impact = _annual_impact / _cap_rate if _annual_impact > 0 else 0
+
                     st.subheader("Uncollected Pet Rent Summary")
 
-                    # ── KPI row — combined totals ──
+                    # ── KPI row — forward-looking ──
                     mcol1, mcol2, mcol3, mcol4 = st.columns(4)
                     mcol1.metric(
                         "Total Unpaid/Suspected",
                         f"{combined_total:,}",
-                        help=f"Confirmed (active tenants not paying): {c_total:,}  ·  "
+                        help=f"Confirmed (active tenants not paying): {c_total:,}  |  "
                              f"Suspected undisclosed: {s_total:,}",
                     )
                     mcol2.metric(
                         f"Uncollected ({latest_month.strftime('%b %Y')})",
                         f"${combined_mo:,.0f}",
-                        help=f"Confirmed: ${c_mo:,.0f}  ·  Suspected: ${s_mo:,.0f}",
+                        help=f"Recurring pet rent not being collected this month. "
+                             f"Confirmed: ${c_mo:,.0f}  |  Suspected: ${s_mo:,.0f}",
                     )
                     mcol3.metric(
-                        f"Total Uncollected ({len(months)}mo)",
-                        f"${combined_window:,.0f}",
-                        help=f"Confirmed: ${c_window:,.0f}  ·  Suspected: ${s_window:,.0f}",
+                        "Annual Revenue Impact",
+                        f"${_annual_impact:,.0f}",
+                        help=f"Pet rent: ${c_recurring_mo:,.0f}/mo x 12 = ${_annual_recurring:,.0f}/yr  |  "
+                             f"One-time fees: ${c_onetime_total:,.0f}  |  "
+                             f"Total: ${_annual_impact:,.0f}/yr",
                     )
                     mcol4.metric(
-                        "Properties Affected",
-                        f"{combined_props} of {_total_fetched}",
-                        help="Properties with at least one confirmed or suspected unpaid tenant.",
+                        "Unrealized Property Value",
+                        f"${_value_impact:,.0f}",
+                        help=f"Annual revenue impact (${_annual_impact:,.0f}) / 5% cap rate = ${_value_impact:,.0f}. "
+                             f"Across {combined_props} of {_total_fetched} properties.",
                     )
 
                     # ── Breakdown caption ──
                     _breakdown_parts = []
                     if _has_confirmed:
                         _breakdown_parts.append(
-                            f"**Confirmed** (orange bars): {c_total:,} tenants  ·  ~${c_mo:,.0f}/mo uncollected"
+                            f"**Confirmed** (orange bars): {c_total:,} tenants  --  ~${c_recurring_mo:,.0f}/mo in pet rent"
+                            + (f" + ${c_onetime_total:,.0f} in one-time fees" if c_onetime_total > 0 else "")
                         )
                     if _has_suspected:
                         _breakdown_parts.append(
-                            f"**Suspected** (red bars): {s_total:,} tenants  ·  ~${s_mo:,.0f}/mo uncollected"
+                            f"**Suspected** (red bars): {s_total:,} tenants  --  ~${s_mo:,.0f}/mo"
                         )
                     st.caption(" &nbsp;|&nbsp; ".join(_breakdown_parts))
 
                     st.caption(
                         "**Confirmed** = tenants with an active PetScreening household pet screening who aren't paying pet rent. "
                         "**Suspected** = tenants who started screening but abandoned it, had an unresolved assistance request, "
-                        "or declared no-pet after starting an assistance profile — signals they likely have an undisclosed pet."
+                        "or declared no-pet after starting an assistance profile -- signals they likely have an undisclosed pet."
                     )
 
                     # ── "Show the Math" transparency section ──
-                    if _has_confirmed and c_total > 0 and c_mo > 0:
-                        _avg_fee_overall = c_mo / c_total if c_total > 0 else 0
+                    if _has_confirmed and c_total > 0 and c_recurring_mo > 0:
+                        _avg_fee_overall = c_recurring_mo / c_total if c_total > 0 else 0
 
                         # Gather per-property fee details
                         _fee_ranges = []
@@ -6564,21 +6585,44 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _fee_min = min(_fee_ranges) if _fee_ranges else 0
                         _fee_max = max(_fee_ranges) if _fee_ranges else 0
 
-                        with st.expander("📐 How we calculate uncollected revenue", expanded=False):
+                        with st.expander("How we calculate these numbers", expanded=False):
                             st.markdown(f"""
-**Current month ({latest_month.strftime('%b %Y')}):**
+**Monthly uncollected pet rent:**
 
 | | |
 |---|---|
 | Tenants with pets, not paying selected charges | **{c_total:,}** |
-| × Avg pet rent at their property | **${_avg_fee_overall:,.0f}/mo** |
-| **= Estimated uncollected revenue** | **${c_mo:,.0f}/mo** |
+| x Avg pet rent at their property | **${_avg_fee_overall:,.0f}/mo** |
+| **= Missing pet rent** | **${c_recurring_mo:,.0f}/mo** |
+""")
+                            if c_onetime_total > 0:
+                                _avg_ot_overall = c_onetime_total / c_total if c_total > 0 else 0
+                                st.markdown(f"""
+**One-time fees not collected:**
 
-> The avg fee varies by property (${_fee_min:,.0f} – ${_fee_max:,.0f}/mo). We use each property's **actual average** from paying tenants, not a flat number across the portfolio.
+| | |
+|---|---|
+| Same {c_total:,} tenants | x ${_avg_ot_overall:,.0f} avg one-time fee |
+| **= One-time fees** | **${c_onetime_total:,.0f}** |
+""")
+                            st.markdown(f"""
+**Annual revenue impact:**
 
-**Total uncollected ({len(months)}mo window):**
+| | |
+|---|---|
+| Monthly pet rent | ${c_recurring_mo:,.0f} x 12 = **${_annual_recurring:,.0f}/yr** |
+| One-time fees | **${c_onetime_total:,.0f}** |
+| **Total annual impact** | **${_annual_impact:,.0f}** |
 
-Same logic, but we account for each tenant's **actual lease dates** — only counting months they were active and on/after the property's PetScreening launch date. One-time deposits are counted once per tenant.
+**Unrealized property value** (at 5% cap rate):
+
+| | |
+|---|---|
+| Annual impact | ${_annual_impact:,.0f} |
+| / 5% cap rate | |
+| **= Unrealized value** | **${_value_impact:,.0f}** |
+
+> The avg fee varies by property (${_fee_min:,.0f} -- ${_fee_max:,.0f}/mo). We use each property's actual average from paying tenants, not a flat number.
 """)
                             # Show a few example properties
                             _example_rows = []
@@ -6592,36 +6636,23 @@ Same logic, but we account for each tenant's **actual lease dates** — only cou
                                     continue
                                 _short = _p.split(" - ", 1)[-1] if " - " in _p else _p
                                 _rec = _v.get("avg_recurring", 0)
+                                _ot = _v.get("avg_onetime", 0)
                                 _cnt = _v["missing_count"]
-                                _mo_val = _v["monthly_missing"].get(latest_month, 0)
-                                _example_rows.append({
+                                _mo_val = _cnt * _rec
+                                _ot_val = _cnt * _ot
+                                _row = {
                                     "Property": _short,
                                     "Missing Tenants": _cnt,
-                                    "Avg Fee at Property": f"${_rec:,.0f}/mo",
-                                    "= Uncollected": f"${_mo_val:,.0f}/mo",
-                                })
+                                    "Avg Pet Rent": f"${_rec:,.0f}/mo",
+                                    "= Monthly": f"${_mo_val:,.0f}/mo",
+                                }
+                                if c_onetime_total > 0:
+                                    _row["Avg One-Time"] = f"${_ot:,.0f}"
+                                    _row["= One-Time"] = f"${_ot_val:,.0f}"
+                                _example_rows.append(_row)
                             if _example_rows:
                                 st.markdown("**Example properties:**")
                                 _render_table(pd.DataFrame(_example_rows))
-
-                        # ── Cap Rate / Property Value Impact ──
-                        _annual_uncollected = c_mo * 12
-                        _cap_rate = 0.05  # 5% cap rate
-                        _value_impact = _annual_uncollected / _cap_rate
-
-                        with st.expander("🏢 Impact on property value", expanded=False):
-                            st.markdown(f"""
-Uncollected pet rent directly impacts property valuation through the income approach:
-
-| | |
-|---|---|
-| Monthly uncollected revenue | **${c_mo:,.0f}** |
-| × 12 months | **${_annual_uncollected:,.0f}/yr** |
-| ÷ 5% cap rate | |
-| **= Unrealized property value** | **${_value_impact:,.0f}** |
-
-> At a 5% cap rate, every **$1/mo** in recovered pet rent adds **$240** in property value. Collecting from all {c_total:,} tenants could increase portfolio valuation by **${_value_impact:,.0f}**.
-""")
 
                     # Per-property breakdown table
                     with st.expander(f"Uncollected pet rent by property ({combined_props} properties)", expanded=False):
@@ -6631,8 +6662,16 @@ Uncollected pet rent directly impacts property valuation through the income appr
                             list(_suspected_data.keys() if _has_suspected else [])
                         )
                         for pname in sorted(all_pnames, key=lambda p: -(
-                            (_missing_rent_data.get(p, {}).get("total_missing_in_window", 0) if _has_confirmed else 0) +
-                            (_suspected_data.get(p, {}).get("total_missing_in_window", 0) if _has_suspected else 0)
+                            # Sort by annual impact (recurring*12 + one-time)
+                            (lambda ci, si: (
+                                ci.get("missing_count", 0) * ci.get("avg_recurring", 0) * 12
+                                + ci.get("missing_count", 0) * ci.get("avg_onetime", 0)
+                                + si.get("missing_count", 0) * si.get("avg_recurring", 0) * 12
+                                + si.get("missing_count", 0) * si.get("avg_onetime", 0)
+                            ))(
+                                _missing_rent_data.get(p, {}) if _has_confirmed else {},
+                                _suspected_data.get(p, {}) if _has_suspected else {},
+                            )
                         )):
                             c_info = _missing_rent_data.get(pname, {}) if _has_confirmed else {}
                             s_info = _suspected_data.get(pname, {}) if _has_suspected else {}
@@ -6646,13 +6685,20 @@ Uncollected pet rent directly impacts property valuation through the income appr
                                 _row["Confirmed"] = c_cnt
                             if _has_suspected:
                                 _row["Suspected"] = s_cnt
-                            _row["Total"] = c_cnt + s_cnt
-                            c_mo_p = c_info.get("monthly_missing", {}).get(latest_month, 0)
-                            s_mo_p = s_info.get("monthly_missing", {}).get(latest_month, 0)
-                            _row[f"Current Mo ({latest_month.strftime('%b %Y')})"] = f"${c_mo_p + s_mo_p:,.0f}"
-                            c_win_p = c_info.get("total_missing_in_window", 0)
-                            s_win_p = s_info.get("total_missing_in_window", 0)
-                            _row[f"Total ({len(months)}mo)"] = f"${c_win_p + s_win_p:,.0f}"
+                            _row["Total Tenants"] = c_cnt + s_cnt
+                            # Pet rent per month
+                            _p_rec_mo = c_cnt * c_info.get("avg_recurring", 0) + s_cnt * s_info.get("avg_recurring", 0)
+                            _row["Pet Rent/Mo"] = f"${_p_rec_mo:,.0f}"
+                            # One-time fees
+                            _p_ot = c_cnt * c_info.get("avg_onetime", 0) + s_cnt * s_info.get("avg_onetime", 0)
+                            if c_onetime_total > 0:
+                                _row["One-Time Fees"] = f"${_p_ot:,.0f}"
+                            # Annual impact
+                            _p_annual = _p_rec_mo * 12 + _p_ot
+                            _row["Annual Impact"] = f"${_p_annual:,.0f}"
+                            # Property value at 5% cap
+                            _p_value = _p_annual / 0.05 if _p_annual > 0 else 0
+                            _row["Value Impact"] = f"${_p_value:,.0f}"
                             mr_rows.append(_row)
                         if mr_rows:
                             _render_table(pd.DataFrame(mr_rows))
