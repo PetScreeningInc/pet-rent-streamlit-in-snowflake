@@ -7509,43 +7509,39 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     for k in st.session_state.keys()
                 )
 
+                # ── Split recurring vs one-time from missing_rent_data ──
+                _s2_recurring_mo = 0
+                _s2_onetime_total = 0
+                if _mr_data:
+                    for _v in _mr_data.values():
+                        _cnt = _v.get("missing_count", 0)
+                        if _cnt == 0:
+                            continue
+                        _s2_recurring_mo += _cnt * _v.get("avg_recurring", 0)
+                        _s2_onetime_total += _cnt * _v.get("avg_onetime", 0)
+                else:
+                    _s2_recurring_mo = _t2_mo  # fallback
+
+                _s2_annual_recurring = _s2_recurring_mo * 12
+                _s2_annual_impact = _s2_annual_recurring + _s2_onetime_total
+                _s2_cap_rate = 0.05
+                _s2_value_impact = _s2_annual_impact / _s2_cap_rate if _s2_annual_impact > 0 else 0
+
                 st.markdown(
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
                     'color:#1F2257;margin:0 0 12px 0">Revenue Opportunity</p>',
                     unsafe_allow_html=True,
                 )
 
+                # ── Row 1: The Gap ──
                 _ro1, _ro2, _ro3 = st.columns(3)
                 with _ro1:
-                    if _has_missing_rent_data:
-                        if _t2_mo > 0:
-                            st.markdown(_summary_card(
-                                f"${_t2_mo:,.0f}/mo",
-                                "Uncollected Pet Rent",
-                                f"{_t2_props} properties affected",
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "None",
-                                "Uncollected Pet Rent",
-                                "No gaps identified",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "Uncollected Pet Rent",
-                            "Enable on Charts tab to calculate",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-                with _ro2:
                     if _has_missing_rent_data:
                         if _t2_tenants > 0:
                             st.markdown(_summary_card(
                                 f"{_t2_tenants:,}",
                                 "Tenants Not Paying",
-                                "With active household profiles",
+                                f"Across {_t2_props} properties",
                                 color="#DD7B45",
                             ), unsafe_allow_html=True)
                         else:
@@ -7562,43 +7558,223 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             "Enable on Charts tab to calculate",
                             color="#636569",
                         ), unsafe_allow_html=True)
-                with _ro3:
-                    if _t3_adoption is not None and _total_projected > 0:
-                        st.markdown(_summary_card(
-                            f"${_total_projected:,.0f}/mo",
-                            "Projected at 100% Adoption",
-                            f"Additional ${_t3_additional:,.0f}/mo opportunity",
-                            color="#B17455",
-                        ), unsafe_allow_html=True)
+                with _ro2:
+                    if _has_missing_rent_data:
+                        if _s2_recurring_mo > 0:
+                            st.markdown(_summary_card(
+                                f"${_s2_recurring_mo:,.0f}/mo",
+                                "Missing Pet Rent",
+                                "Recurring monthly pet rent not collected",
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "$0",
+                                "Missing Pet Rent",
+                                "Fully collected",
+                                color="#677848",
+                            ), unsafe_allow_html=True)
                     else:
                         st.markdown(_summary_card(
                             "--",
-                            "Projected at 100% Adoption",
-                            "Enable adoption overlay on Charts tab",
+                            "Missing Pet Rent",
+                            "Enable on Charts tab to calculate",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
+                with _ro3:
+                    if _has_missing_rent_data:
+                        if _s2_onetime_total > 0:
+                            st.markdown(_summary_card(
+                                f"${_s2_onetime_total:,.0f}",
+                                "One-Time Fees Not Collected",
+                                "Pet deposits and one-time pet fees",
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "--",
+                                "One-Time Fees",
+                                "None identified or no one-time codes selected",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "One-Time Fees",
+                            "Enable on Charts tab to calculate",
                             color="#636569",
                         ), unsafe_allow_html=True)
 
-                if _has_missing_rent_data and _t2_tenants == 0:
-                    st.markdown(
-                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#677848;'
-                        'text-align:center;margin:8px 0 28px 0">'
-                        'All tenants with active household profiles are paying pet rent. No gaps identified.</p>',
-                        unsafe_allow_html=True,
-                    )
-                elif _has_missing_rent_data and _t2_tenants > 0:
+                # ── Row 2: The Impact ──
+                if _has_missing_rent_data and (_s2_annual_impact > 0 or (_t3_adoption is not None and _total_projected > 0)):
+                    _ri1, _ri2, _ri3 = st.columns(3)
+                    with _ri1:
+                        if _s2_annual_impact > 0:
+                            _sub = f"Pet rent (${_s2_annual_recurring:,.0f}/yr) + one-time fees (${_s2_onetime_total:,.0f})" if _s2_onetime_total > 0 else f"${_s2_recurring_mo:,.0f}/mo × 12"
+                            st.markdown(_summary_card(
+                                f"${_s2_annual_impact:,.0f}",
+                                "Annual Revenue Impact",
+                                _sub,
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "$0",
+                                "Annual Revenue Impact",
+                                "No revenue gap identified",
+                                color="#677848",
+                            ), unsafe_allow_html=True)
+                    with _ri2:
+                        if _s2_value_impact > 0:
+                            st.markdown(_summary_card(
+                                f"${_s2_value_impact:,.0f}",
+                                "Unrealized Property Value",
+                                "Annual impact / 5% cap rate",
+                                color="#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "--",
+                                "Unrealized Property Value",
+                                "",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
+                    with _ri3:
+                        if _t3_adoption is not None and _total_projected > 0:
+                            st.markdown(_summary_card(
+                                f"${_total_projected:,.0f}/mo",
+                                "Projected at 100% Adoption",
+                                f"Currently {_t3_adoption:.1f}% adopted",
+                                color="#B17455",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "--",
+                                "Projected at 100% Adoption",
+                                "Enable adoption overlay on Charts tab",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
+
+                # ── Narrative ──
+                if _has_missing_rent_data and _t2_tenants > 0:
+                    _narrative_parts = [
+                        f'{_t2_tenants:,} tenants have completed PetScreening profiles but are not being charged pet rent — '
+                        f'that is <strong>${_s2_recurring_mo:,.0f}/mo</strong> in recurring pet rent'
+                    ]
+                    if _s2_onetime_total > 0:
+                        _narrative_parts.append(f' plus <strong>${_s2_onetime_total:,.0f}</strong> in uncollected one-time fees')
+                    _narrative_parts.append(f' across {_t2_props} properties.')
+                    if _s2_annual_impact > 0:
+                        _narrative_parts.append(
+                            f' On an annual basis, that is <strong>${_s2_annual_impact:,.0f}</strong> in revenue not being captured.'
+                        )
+                        _narrative_parts.append(
+                            f' At a 5% cap rate, collecting these fees would add <strong>${_s2_value_impact:,.0f}</strong> in property value.'
+                        )
+                    _narrative_parts.append(' This is a billing correction, not a sales effort.')
                     st.markdown(
                         f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        f'text-align:center;margin:8px 0 28px 0">'
-                        f'{_t2_tenants:,} tenants have completed PetScreening profiles but are not being charged pet rent.</p>',
+                        f'text-align:center;margin:8px 0 4px 0">'
+                        f'{"".join(_narrative_parts)}</p>',
+                        unsafe_allow_html=True,
+                    )
+                elif _has_missing_rent_data and _t2_tenants == 0:
+                    st.markdown(
+                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#677848;'
+                        'text-align:center;margin:8px 0 4px 0">'
+                        'All tenants with active household profiles are paying pet rent. No gaps identified.</p>',
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown(
                         '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        'text-align:center;margin:8px 0 28px 0">'
+                        'text-align:center;margin:8px 0 4px 0">'
                         'Enable "Show uncollected pet rent" on the Charts tab to populate this section.</p>',
                         unsafe_allow_html=True,
                     )
+
+                # ── "Show the Math" expander ──
+                if _has_missing_rent_data and _t2_tenants > 0 and _s2_recurring_mo > 0:
+                    _avg_fee_s2 = _s2_recurring_mo / _t2_tenants if _t2_tenants > 0 else 0
+
+                    # Per-property fee ranges
+                    _fee_ranges_s2 = []
+                    for _v in _mr_data.values():
+                        if _v.get("missing_count", 0) > 0 and _v.get("avg_recurring", 0) > 0:
+                            _fee_ranges_s2.append(_v["avg_recurring"])
+                    _fee_min_s2 = min(_fee_ranges_s2) if _fee_ranges_s2 else 0
+                    _fee_max_s2 = max(_fee_ranges_s2) if _fee_ranges_s2 else 0
+
+                    with st.expander("How we calculate these numbers", expanded=False):
+                        _math_md = f"""**Monthly uncollected pet rent:**
+
+| | |
+|---|---|
+| Tenants with pets, not paying selected charges | **{_t2_tenants:,}** |
+| × Avg pet rent at their property | **${_avg_fee_s2:,.0f}/mo** |
+| **= Missing pet rent** | **${_s2_recurring_mo:,.0f}/mo** |
+"""
+                        if _s2_onetime_total > 0:
+                            _avg_ot_s2 = _s2_onetime_total / _t2_tenants if _t2_tenants > 0 else 0
+                            _math_md += f"""
+**One-time fees not collected:**
+
+| | |
+|---|---|
+| Same {_t2_tenants:,} tenants | × ${_avg_ot_s2:,.0f} avg one-time fee |
+| **= One-time fees** | **${_s2_onetime_total:,.0f}** |
+"""
+                        _math_md += f"""
+**Annual revenue impact:**
+
+| | |
+|---|---|
+| Monthly pet rent | ${_s2_recurring_mo:,.0f} × 12 = **${_s2_annual_recurring:,.0f}/yr** |
+| One-time fees | **${_s2_onetime_total:,.0f}** |
+| **Total annual impact** | **${_s2_annual_impact:,.0f}** |
+
+**Unrealized property value** (at 5% cap rate):
+
+| | |
+|---|---|
+| Annual impact | ${_s2_annual_impact:,.0f} |
+| ÷ 5% cap rate | |
+| **= Unrealized value** | **${_s2_value_impact:,.0f}** |
+
+> The avg fee varies by property (${_fee_min_s2:,.0f} – ${_fee_max_s2:,.0f}/mo). We use each property's actual average from paying tenants, not a flat number.
+"""
+                        st.markdown(_math_md)
+
+                        # Per-property example table
+                        _example_rows_s2 = []
+                        for _p, _v in sorted(_mr_data.items(), key=lambda x: -(x[1].get("missing_count", 0) * x[1].get("avg_recurring", 0))):
+                            if _v.get("missing_count", 0) == 0:
+                                continue
+                            _short = _p.split(" - ", 1)[-1] if " - " in _p else _p
+                            _rec = _v.get("avg_recurring", 0)
+                            _ot = _v.get("avg_onetime", 0)
+                            _cnt = _v["missing_count"]
+                            _mo_val = _cnt * _rec
+                            _ot_val = _cnt * _ot
+                            _ann = (_mo_val * 12) + _ot_val
+                            _val = _ann / _s2_cap_rate if _ann > 0 else 0
+                            _example_rows_s2.append({
+                                "Property": _short,
+                                "Tenants": _cnt,
+                                "Pet Rent/Mo": f"${_mo_val:,.0f}",
+                                "One-Time Fees": f"${_ot_val:,.0f}" if _ot_val > 0 else "--",
+                                "Annual Impact": f"${_ann:,.0f}",
+                                "Value Impact": f"${_val:,.0f}",
+                            })
+                        if _example_rows_s2:
+                            st.markdown("**Per-property breakdown:**")
+                            st.dataframe(
+                                pd.DataFrame(_example_rows_s2),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
 
                 # ═══════════════════════════════════════════════════════════════
                 #  SECTION 3: PORTFOLIO HEALTH
