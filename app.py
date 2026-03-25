@@ -6600,52 +6600,85 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                     st.subheader("Uncollected Pet Rent Summary")
 
-                    # ── KPI row — forward-looking ──
-                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                    mcol1.metric(
-                        "Total Unpaid/Suspected",
-                        f"{combined_total:,}",
-                        help=f"Confirmed (active tenants not paying): {c_total:,}  |  "
-                             f"Suspected undisclosed: {s_total:,}",
-                    )
-                    mcol2.metric(
-                        f"Uncollected ({latest_month.strftime('%b %Y')})",
-                        f"${combined_mo:,.0f}",
-                        help=f"Recurring pet rent not being collected this month. "
-                             f"Confirmed: ${c_mo:,.0f}  |  Suspected: ${s_mo:,.0f}",
-                    )
-                    mcol3.metric(
-                        "Annual Revenue Impact",
-                        f"${_annual_impact:,.0f}",
-                        help=f"Pet rent: ${c_recurring_mo:,.0f}/mo x 12 = ${_annual_recurring:,.0f}/yr  |  "
-                             f"One-time fees: ${c_onetime_total:,.0f}  |  "
-                             f"Total: ${_annual_impact:,.0f}/yr",
-                    )
-                    mcol4.metric(
-                        "Unrealized Property Value",
-                        f"${_value_impact:,.0f}",
-                        help=f"Annual revenue impact (${_annual_impact:,.0f}) / 5% cap rate = ${_value_impact:,.0f}. "
-                             f"Across {combined_props} of {_total_fetched} properties.",
-                    )
-
-                    # ── Breakdown caption ──
-                    _breakdown_parts = []
-                    if _has_confirmed:
-                        _breakdown_parts.append(
-                            f"**Confirmed** (orange bars): {c_total:,} tenants  --  ~${c_recurring_mo:,.0f}/mo in pet rent"
-                            + (f" + ${c_onetime_total:,.0f} in one-time fees" if c_onetime_total > 0 else "")
+                    # ── Confirmed: the billing correction ──
+                    if _has_confirmed and c_total > 0:
+                        st.markdown("**Confirmed** — tenants with active PetScreening profiles who aren't paying pet rent")
+                        cc1, cc2, cc3 = st.columns(3)
+                        cc1.metric(
+                            "Tenants Not Paying",
+                            f"{c_total:,}",
+                            help=f"Active tenants with household profiles not being charged pet rent, across {c_props} properties.",
                         )
-                    if _has_suspected:
-                        _breakdown_parts.append(
-                            f"**Suspected** (red bars): {s_total:,} tenants  --  ~${s_mo:,.0f}/mo"
+                        cc2.metric(
+                            "Missing Pet Rent",
+                            f"${c_recurring_mo:,.0f}/mo",
+                            help=f"Recurring monthly pet rent not collected. Based on each property's avg fee from paying tenants.",
                         )
-                    st.caption(" &nbsp;|&nbsp; ".join(_breakdown_parts))
+                        cc3.metric(
+                            "Annual Revenue Impact",
+                            f"${_annual_impact:,.0f}/yr",
+                            help=f"Pet rent: ${c_recurring_mo:,.0f}/mo x 12 = ${_annual_recurring:,.0f}/yr"
+                                 + (f"  |  One-time fees: ${c_onetime_total:,.0f}" if c_onetime_total > 0 else "")
+                                 + f"  |  Total: ${_annual_impact:,.0f}/yr",
+                        )
+                        if _value_impact > 0:
+                            st.caption(
+                                f"At a 5% cap rate, this ${_annual_impact:,.0f}/yr represents "
+                                f"**${_value_impact:,.0f} in unrealized property value**. "
+                                f"This is a billing correction, not a sales effort."
+                            )
+                    elif _has_confirmed:
+                        st.markdown("**Confirmed** — all profiled tenants are paying pet rent ✓")
 
-                    st.caption(
-                        "**Confirmed** = tenants with an active PetScreening household pet screening who aren't paying pet rent. "
-                        "**Suspected** = tenants who started screening but abandoned it, had an unresolved assistance request, "
-                        "or declared no-pet after starting an assistance profile -- signals they likely have an undisclosed pet."
-                    )
+                    # ── Suspected: the undisclosed opportunity ──
+                    if _has_suspected and s_total > 0:
+                        st.markdown("---")
+                        st.markdown("**Suspected Undisclosed** — tenants who started screening but abandoned, had unresolved assistance requests, or declared no-pet after starting an assistance profile")
+
+                        # Compute suspected recurring/one-time
+                        s_recurring_mo = 0
+                        s_onetime_total = 0
+                        if _has_suspected:
+                            for _v in _suspected_data.values():
+                                _cnt = _v.get("missing_count", 0)
+                                if _cnt == 0:
+                                    continue
+                                s_recurring_mo += _cnt * _v.get("avg_recurring", 0)
+                                s_onetime_total += _cnt * _v.get("avg_onetime", 0)
+                        s_annual_recurring = s_recurring_mo * 12
+                        s_annual_impact = s_annual_recurring + s_onetime_total
+
+                        sc1, sc2, sc3 = st.columns(3)
+                        sc1.metric(
+                            "Suspected Tenants",
+                            f"{s_total:,}",
+                            help=f"Tenants showing signals of undisclosed pets, across {s_props} properties.",
+                        )
+                        sc2.metric(
+                            "Potential Pet Rent",
+                            f"${s_recurring_mo:,.0f}/mo",
+                            help="Estimated recurring pet rent if these tenants were confirmed and charged.",
+                        )
+                        sc3.metric(
+                            "Potential Annual Impact",
+                            f"${s_annual_impact:,.0f}/yr",
+                            help=f"Estimated annual revenue if suspected undisclosed pets are confirmed and charged.",
+                        )
+
+                    # ── Combined: total opportunity ──
+                    if _has_confirmed and c_total > 0 and _has_suspected and s_total > 0:
+                        st.markdown("---")
+                        _combined_recurring_mo = c_recurring_mo + s_recurring_mo
+                        _combined_onetime = c_onetime_total + s_onetime_total
+                        _combined_annual = _combined_recurring_mo * 12 + _combined_onetime
+                        _combined_value = _combined_annual / _cap_rate if _combined_annual > 0 else 0
+                        st.markdown(
+                            f"**Combined opportunity:** If all confirmed and suspected tenants were charged, "
+                            f"that would be **${_combined_recurring_mo:,.0f}/mo** in pet rent"
+                            + (f" + ${_combined_onetime:,.0f} in one-time fees" if _combined_onetime > 0 else "")
+                            + f" — **${_combined_annual:,.0f}/yr** in total revenue, "
+                            f"adding **${_combined_value:,.0f}** in property value at a 5% cap rate."
+                        )
 
                     # ── "Show the Math" transparency section ──
                     if _has_confirmed and c_total > 0 and c_recurring_mo > 0:
