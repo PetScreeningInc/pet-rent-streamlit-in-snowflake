@@ -3108,10 +3108,6 @@ def generate_tranche_pdf(
     # ═══════════════════════════════════════════════════════════
     section_heading("Revenue Opportunity", orange)
 
-    # Combine confirmed + suspected undisclosed for total opportunity
-    _total_unpaying = t2_tenants + (su_total_profiles or 0)
-    _total_uncollected_mo = t2_mo + (su_current_mo or 0)
-
     # Split recurring vs one-time from missing_rent_data
     _opp_recurring_mo = 0
     _opp_onetime_total = 0
@@ -3131,51 +3127,27 @@ def generate_tranche_pdf(
     _opp_cap_rate = 0.05
     _opp_value_impact = _opp_annual_impact / _opp_cap_rate if _opp_annual_impact > 0 else 0
 
-    # ── Row 1: The Gap ──
+    # ── Single row: 3 cards ──
     draw_card_row([
         {
-            "value": f"{_total_unpaying:,}" if _total_unpaying > 0 else "0",
+            "value": f"{t2_tenants:,}" if t2_tenants > 0 else "0",
             "label": "Tenants Not Paying",
             "sub": f"Across {t2_props} properties" if t2_tenants > 0 else "All tenants compliant",
-            "color": orange if _total_unpaying > 0 else green,
+            "color": orange if t2_tenants > 0 else green,
         },
         {
             "value": f"${_opp_recurring_mo:,.0f}" if _opp_recurring_mo > 0 else "$0",
             "label": "Missing Pet Rent",
-            "sub": "Per month, based on each property's avg fee" if _opp_recurring_mo > 0 else "Fully collected",
+            "sub": "Recurring monthly pet rent not collected" if _opp_recurring_mo > 0 else "Fully collected",
             "color": orange if _opp_recurring_mo > 0 else green,
         },
         {
-            "value": f"${_opp_onetime_total:,.0f}" if _opp_onetime_total > 0 else "--",
-            "label": "One-Time Fees Not Collected",
-            "sub": "Pet deposits and one-time pet fees" if _opp_onetime_total > 0 else None,
-            "color": orange if _opp_onetime_total > 0 else dark_blue,
+            "value": f"${_opp_annual_impact:,.0f}/yr" if _opp_annual_impact > 0 else "$0",
+            "label": "Annual Revenue Impact",
+            "sub": f"${_opp_recurring_mo:,.0f}/mo x 12" + (f" + ${_opp_onetime_total:,.0f} one-time" if _opp_onetime_total > 0 else "") if _opp_annual_impact > 0 else "No revenue gap identified",
+            "color": orange if _opp_annual_impact > 0 else green,
         },
     ])
-
-    # ── Row 2: The Impact ──
-    if _opp_annual_impact > 0 or (total_projected and total_projected > 0):
-        _proj_str = f"${total_projected:,.0f}" if total_projected and total_projected > 0 else "--"
-        draw_card_row([
-            {
-                "value": f"${_opp_annual_impact:,.0f}",
-                "label": "Annual Revenue Impact",
-                "sub": f"Pet rent (${_opp_annual_recurring:,.0f}/yr) + one-time fees (${_opp_onetime_total:,.0f})" if _opp_onetime_total > 0 else f"${_opp_recurring_mo:,.0f}/mo x 12",
-                "color": orange,
-            },
-            {
-                "value": f"${_opp_value_impact:,.0f}",
-                "label": "Unrealized Property Value",
-                "sub": "Annual impact / 5% cap rate",
-                "color": orange,
-            },
-            {
-                "value": _proj_str,
-                "label": "Projected at 100% Adoption",
-                "sub": f"Currently {t3_adoption:.1f}% adopted" if t3_adoption is not None else None,
-                "color": warm,
-            },
-        ])
 
     if t2_tenants > 0:
         narrative(
@@ -3250,11 +3222,19 @@ def generate_tranche_pdf(
     ])
 
     if t3_adoption is not None:
-        narrative(
+        _ph_narrative = (
             f"Your portfolio is running at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
             f"{n_with_launch} of {n_props_total} properties have an established PetScreening launch date, "
             f"and {n_props_with_data} have sufficient charge data for analysis."
         )
+        if total_projected and total_projected > 0:
+            _additional_at_100 = total_projected - (current_monthly_rev or 0)
+            if _additional_at_100 > 0:
+                _ph_narrative += (
+                    f" At 100% {adopt_type_label.lower()} adoption, projected pet fee revenue would be "
+                    f"${total_projected:,.0f}/mo -- an additional ${_additional_at_100:,.0f}/mo opportunity."
+                )
+        narrative(_ph_narrative)
     else:
         narrative(
             f"{n_with_launch} of {n_props_total} properties have an established PetScreening "
@@ -7533,7 +7513,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     unsafe_allow_html=True,
                 )
 
-                # ── Row 1: The Gap ──
+                # ── Single row: 3 cards ──
                 _ro1, _ro2, _ro3 = st.columns(3)
                 with _ro1:
                     if _has_missing_rent_data:
@@ -7583,38 +7563,11 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         ), unsafe_allow_html=True)
                 with _ro3:
                     if _has_missing_rent_data:
-                        if _s2_onetime_total > 0:
-                            st.markdown(_summary_card(
-                                f"${_s2_onetime_total:,.0f}",
-                                "One-Time Fees Not Collected",
-                                "Pet deposits and one-time pet fees",
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "--",
-                                "One-Time Fees",
-                                "None identified or no one-time codes selected",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "One-Time Fees",
-                            "Enable on Charts tab to calculate",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-
-                # ── Row 2: The Impact ──
-                if _has_missing_rent_data and (_s2_annual_impact > 0 or (_t3_adoption is not None and _total_projected > 0)):
-                    _ri1, _ri2, _ri3 = st.columns(3)
-                    with _ri1:
                         if _s2_annual_impact > 0:
-                            _sub = f"Pet rent (${_s2_annual_recurring:,.0f}/yr) + one-time fees (${_s2_onetime_total:,.0f})" if _s2_onetime_total > 0 else f"${_s2_recurring_mo:,.0f}/mo × 12"
                             st.markdown(_summary_card(
-                                f"${_s2_annual_impact:,.0f}",
+                                f"${_s2_annual_impact:,.0f}/yr",
                                 "Annual Revenue Impact",
-                                _sub,
+                                f"${_s2_recurring_mo:,.0f}/mo × 12" + (f" + ${_s2_onetime_total:,.0f} one-time" if _s2_onetime_total > 0 else ""),
                                 color="#DD7B45",
                             ), unsafe_allow_html=True)
                         else:
@@ -7624,38 +7577,15 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                 "No revenue gap identified",
                                 color="#677848",
                             ), unsafe_allow_html=True)
-                    with _ri2:
-                        if _s2_value_impact > 0:
-                            st.markdown(_summary_card(
-                                f"${_s2_value_impact:,.0f}",
-                                "Unrealized Property Value",
-                                "Annual impact / 5% cap rate",
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "--",
-                                "Unrealized Property Value",
-                                "",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
-                    with _ri3:
-                        if _t3_adoption is not None and _total_projected > 0:
-                            st.markdown(_summary_card(
-                                f"${_total_projected:,.0f}/mo",
-                                "Projected at 100% Adoption",
-                                f"Currently {_t3_adoption:.1f}% adopted",
-                                color="#B17455",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "--",
-                                "Projected at 100% Adoption",
-                                "Enable adoption overlay on Charts tab",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_summary_card(
+                            "--",
+                            "Annual Revenue Impact",
+                            "Enable on Charts tab to calculate",
+                            color="#636569",
+                        ), unsafe_allow_html=True)
 
-                # ── Narrative ──
+                # ── Narrative — tells the full story including cap rate ──
                 if _has_missing_rent_data and _t2_tenants > 0:
                     _narrative_parts = [
                         f'{_t2_tenants:,} tenants have completed PetScreening profiles but are not being charged pet rent — '
@@ -7669,9 +7599,15 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             f' On an annual basis, that is <strong>${_s2_annual_impact:,.0f}</strong> in revenue not being captured.'
                         )
                         _narrative_parts.append(
-                            f' At a 5% cap rate, collecting these fees would add <strong>${_s2_value_impact:,.0f}</strong> in property value.'
+                            f' At a 5% cap rate, collecting these fees would add '
+                            f'<strong>${_s2_value_impact:,.0f} in property value</strong>.'
                         )
                     _narrative_parts.append(' This is a billing correction, not a sales effort.')
+                    if _su_total_profiles > 0:
+                        _narrative_parts.append(
+                            f' Additionally, {_su_total_profiles:,} tenants show signals of undisclosed pets, '
+                            f'representing ~${_su_current_mo:,.0f}/mo in potential additional revenue.'
+                        )
                     st.markdown(
                         f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
                         f'text-align:center;margin:8px 0 4px 0">'
@@ -7825,11 +7761,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             color="#677848",
                         ), unsafe_allow_html=True)
 
+                # ── Adoption narrative + Projected at 100% ──
                 if _avg_adoption is not None:
+                    _adopt_narrative = f'{_adopt_type_label} adoption averaged across properties with both revenue and adoption data.'
+                    if _t3_adoption is not None and _total_projected > 0:
+                        _adopt_narrative += (
+                            f' At 100% {_adopt_type_label.lower()} adoption, projected pet fee revenue would be '
+                            f'<strong>${_total_projected:,.0f}/mo</strong> — '
+                            f'an additional <strong>${_t3_additional:,.0f}/mo</strong> opportunity.'
+                        )
                     st.markdown(
                         f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
                         f'text-align:center;margin:8px 0 28px 0">'
-                        f'{_adopt_type_label} adoption averaged across properties with both revenue and adoption data.</p>',
+                        f'{_adopt_narrative}</p>',
                         unsafe_allow_html=True,
                     )
                 else:
