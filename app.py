@@ -2988,7 +2988,7 @@ def generate_tranche_pdf(
     USABLE_W = PAGE_R - PAGE_L  # 180mm
     CARD_GAP = 4
     CARD_W = (USABLE_W - 2 * CARD_GAP) / 3  # ~57.3mm
-    CARD_H = 34
+    CARD_H = 30          # compact cards to fit 3 sections on page 1
 
     # ── Helper: draw a row of 3 KPI cards ──
     def draw_card_row(cards):
@@ -2996,8 +2996,8 @@ def generate_tranche_pdf(
         {value: str, label: str, sub: str|None, color: tuple}
         """
         start_y = pdf.get_y()
-        # Check if we need a page break (card row + narrative below ~55mm)
-        if start_y + CARD_H + 30 > pdf.h - pdf.b_margin:
+        # Check if we need a page break (card row + narrative below ~50mm)
+        if start_y + CARD_H + 25 > pdf.h - pdf.b_margin:
             pdf.add_page()
             start_y = pdf.get_y()
 
@@ -3008,53 +3008,93 @@ def generate_tranche_pdf(
             pdf.set_draw_color(*card_border)
             pdf.rect(x, start_y, CARD_W, CARD_H, 'DF')
             # Big number
-            pdf.set_font('Helvetica', 'B', 22)
+            pdf.set_font('Helvetica', 'B', 20)
             pdf.set_text_color(*card.get("color", dark_blue))
-            pdf.set_xy(x + 2, start_y + 4)
-            pdf.cell(CARD_W - 4, 10, card["value"], align='C')
+            pdf.set_xy(x + 2, start_y + 3)
+            pdf.cell(CARD_W - 4, 9, card["value"], align='C')
             # Label
-            pdf.set_font('Helvetica', '', 8)
+            pdf.set_font('Helvetica', '', 7.5)
             pdf.set_text_color(*light_gray)
-            pdf.set_xy(x + 2, start_y + 16)
-            pdf.cell(CARD_W - 4, 5, card["label"].upper(), align='C')
+            pdf.set_xy(x + 2, start_y + 14)
+            pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
             # Sub-label (optional)
             if card.get("sub"):
-                pdf.set_font('Helvetica', '', 7)
+                pdf.set_font('Helvetica', '', 6.5)
                 pdf.set_text_color(150, 150, 150)
-                pdf.set_xy(x + 2, start_y + 22)
+                pdf.set_xy(x + 2, start_y + 19)
                 pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
 
-        pdf.set_y(start_y + CARD_H + 4)
+        pdf.set_y(start_y + CARD_H + 3)
+
+    # ── Helper: highlighted callout box (for cap rate) ──
+    def callout_box(text, color=orange):
+        """Draw a prominent highlighted callout with colored left border."""
+        start_y = pdf.get_y()
+        box_x = PAGE_L + 4
+        box_w = USABLE_W - 8
+        # Measure text height
+        pdf.set_font('Helvetica', 'B', 10)
+        # Draw background
+        pdf.set_fill_color(255, 248, 240)  # warm cream
+        pdf.set_draw_color(*color)
+        box_h = 12
+        pdf.rect(box_x, start_y, box_w, box_h, 'F')
+        # Left accent bar
+        pdf.set_fill_color(*color)
+        pdf.rect(box_x, start_y, 2.5, box_h, 'F')
+        # Text
+        pdf.set_text_color(*color)
+        pdf.set_xy(box_x + 6, start_y + 2)
+        pdf.cell(box_w - 10, 8, text, align='C')
+        pdf.set_y(start_y + box_h + 3)
 
     # ── Helper: section heading ──
     def section_heading(title, color=dark_blue):
         # Check for page break
-        if pdf.get_y() + 50 > pdf.h - pdf.b_margin:
+        if pdf.get_y() + 45 > pdf.h - pdf.b_margin:
             pdf.add_page()
-        pdf.set_font('Helvetica', 'B', 13)
+        pdf.set_font('Helvetica', 'B', 12)
         pdf.set_text_color(*color)
-        pdf.cell(0, 8, title, ln=True)
+        pdf.cell(0, 7, title, ln=True)
         # Colored underline
         y = pdf.get_y()
         pdf.set_draw_color(*color)
         pdf.set_line_width(0.6)
         pdf.line(PAGE_L, y, PAGE_L + 50, y)
         pdf.set_line_width(0.2)
-        pdf.ln(4)
+        pdf.ln(3)
 
     # ── Helper: narrative text ──
     def narrative(text):
-        pdf.set_font('Helvetica', '', 9.5)
+        pdf.set_font('Helvetica', '', 9)
         pdf.set_text_color(*body_gray)
-        pdf.multi_cell(0, 5, text)
-        pdf.ln(3)
+        pdf.multi_cell(0, 4.5, text)
+        pdf.ln(2)
 
     # ── Helper: divider ──
     def divider():
         pdf.set_draw_color(*card_border)
         y = pdf.get_y()
         pdf.line(PAGE_L, y, PAGE_R, y)
-        pdf.ln(7)
+        pdf.ln(5)
+
+    # ── Pre-compute recurring vs one-time (used by both sections) ──
+    _opp_recurring_mo = 0
+    _opp_onetime_total = 0
+    if missing_rent_data:
+        for _v in missing_rent_data.values():
+            _cnt = _v.get("missing_count", 0)
+            if _cnt == 0:
+                continue
+            _opp_recurring_mo += _cnt * _v.get("avg_recurring", 0)
+            _opp_onetime_total += _cnt * _v.get("avg_onetime", 0)
+    else:
+        _opp_recurring_mo = t2_mo
+
+    _opp_annual_recurring = _opp_recurring_mo * 12
+    _opp_annual_impact = _opp_annual_recurring + _opp_onetime_total
+    _opp_cap_rate = 0.05
+    _opp_value_impact = _opp_annual_impact / _opp_cap_rate if _opp_annual_impact > 0 else 0
 
     # ═══════════════════════════════════════════════════════════
     #  SECTION 1: VALUE CREATED
@@ -3087,13 +3127,37 @@ def generate_tranche_pdf(
     ])
 
     if comparable_count > 0 and t1_mo != 0:
-        pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
-        narrative(
-            f"PetScreening has generated an incremental ${t1_mo:,.0f}/mo above your "
-            f"pre-launch baseline of ${pre_baseline:,.0f}/mo{pct_note}. Over {t1_months} months, "
-            f"this has compounded to ${t1_total:,.0f} in cumulative revenue that would not exist "
-            f"without the program."
-        )
+        if t1_mo > 0:
+            pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
+            narrative(
+                f"PetScreening has generated an incremental ${t1_mo:,.0f}/mo above your "
+                f"pre-launch baseline of ${pre_baseline:,.0f}/mo{pct_note}. Over {t1_months} months, "
+                f"this has compounded to ${t1_total:,.0f} in cumulative revenue that would not exist "
+                f"without the program."
+            )
+        else:
+            # Negative lift — acknowledge and pivot to opportunity
+            _neg_mo = abs(t1_mo)
+            _neg_total = abs(t1_total)
+            _pivot_parts = [
+                f"Pet fee revenue is currently ${_neg_mo:,.0f}/mo below the pre-launch baseline "
+                f"of ${pre_baseline:,.0f}/mo (${_neg_total:,.0f} cumulative over {t1_months} months). "
+            ]
+            # Pivot to opportunity
+            if t2_tenants > 0 and _opp_recurring_mo > 0:
+                _pivot_parts.append(
+                    f"However, ${_opp_recurring_mo:,.0f}/mo in pet rent is going uncollected from "
+                    f"tenants who have already completed screening -- a billing correction that would "
+                    f"more than close this gap. "
+                )
+            if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
+                _additional_at_100 = total_projected - (current_monthly_rev or 0)
+                if _additional_at_100 > 0:
+                    _pivot_parts.append(
+                        f"Combined with closing the adoption gap from {t3_adoption:.1f}% to 100% "
+                        f"(+${_additional_at_100:,.0f}/mo), the revenue picture changes significantly."
+                    )
+            narrative("".join(_pivot_parts))
     else:
         narrative(
             "Revenue lift data is not yet available. Once properties have sufficient "
@@ -3107,25 +3171,6 @@ def generate_tranche_pdf(
     #  SECTION 2: REVENUE OPPORTUNITY
     # ═══════════════════════════════════════════════════════════
     section_heading("Revenue Opportunity", orange)
-
-    # Split recurring vs one-time from missing_rent_data
-    _opp_recurring_mo = 0
-    _opp_onetime_total = 0
-    if missing_rent_data:
-        for _v in missing_rent_data.values():
-            _cnt = _v.get("missing_count", 0)
-            if _cnt == 0:
-                continue
-            _opp_recurring_mo += _cnt * _v.get("avg_recurring", 0)
-            _opp_onetime_total += _cnt * _v.get("avg_onetime", 0)
-    else:
-        # Fallback: use t2_mo as recurring (best we have without per-property data)
-        _opp_recurring_mo = t2_mo
-
-    _opp_annual_recurring = _opp_recurring_mo * 12
-    _opp_annual_impact = _opp_annual_recurring + _opp_onetime_total
-    _opp_cap_rate = 0.05
-    _opp_value_impact = _opp_annual_impact / _opp_cap_rate if _opp_annual_impact > 0 else 0
 
     # ── Single row: 3 cards ──
     draw_card_row([
@@ -3159,9 +3204,10 @@ def generate_tranche_pdf(
         )
         if _opp_annual_impact > 0:
             narrative(
-                f"On an annual basis, that is ${_opp_annual_impact:,.0f} in revenue not being captured. "
-                f"At a 5% cap rate, collecting these fees would add ${_opp_value_impact:,.0f} "
-                f"in property value."
+                f"On an annual basis, that is ${_opp_annual_impact:,.0f} in revenue not being captured."
+            )
+            callout_box(
+                f"Unrealized Property Value: ${_opp_value_impact:,.0f}  (${_opp_annual_impact:,.0f}/yr at 5% cap rate)"
             )
         if su_total_profiles and su_total_profiles > 0:
             narrative(
@@ -3244,11 +3290,9 @@ def generate_tranche_pdf(
     divider()
 
     # ═══════════════════════════════════════════════════════════
-    #  KEY METRICS TABLE
+    #  KEY METRICS TABLE (always starts on page 2)
     # ═══════════════════════════════════════════════════════════
-    # Page break check -- table needs ~80mm
-    if pdf.get_y() + 80 > pdf.h - pdf.b_margin:
-        pdf.add_page()
+    pdf.add_page()
 
     pdf.set_font('Helvetica', 'B', 12)
     pdf.set_text_color(*dark_blue)
