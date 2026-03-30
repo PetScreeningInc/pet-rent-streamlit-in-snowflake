@@ -2937,7 +2937,7 @@ def generate_tranche_pdf(
     n_props_total, n_with_launch, n_props_with_data,
     include_pm=False, pm_rows=None,
     su_total_profiles=0, su_current_mo=0, total_projected=0,
-    missing_rent_data=None,
+    missing_rent_data=None, total_units=0,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3133,11 +3133,14 @@ def generate_tranche_pdf(
     if comparable_count > 0 and t1_mo != 0:
         if t1_mo > 0:
             pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
+            _simple_diff = current_monthly_rev - pre_baseline
             narrative(
-                f"PetScreening has generated an incremental ${t1_mo:,.0f}/mo above your "
-                f"pre-launch baseline of ${pre_baseline:,.0f}/mo{pct_note}. Over {t1_months} months, "
-                f"this has compounded to ${t1_total:,.0f} in cumulative revenue that would not exist "
-                f"without the program."
+                f"Before PetScreening, this portfolio collected ${pre_baseline:,.0f}/mo in pet fees. "
+                f"Today it collects ${current_monthly_rev:,.0f}/mo - a ${_simple_diff:,.0f}/mo increase. "
+                f"After adjusting for property-by-property pre/post averages across {comparable_count} "
+                f"comparable properties, the net revenue change is ${t1_mo:,.0f}/mo{pct_note}. "
+                f"Over {t1_months} months, this has resulted in ${t1_total:,.0f} in cumulative "
+                f"incremental revenue."
             )
         else:
             # Negative lift — acknowledge and pivot to opportunity
@@ -3187,7 +3190,7 @@ def generate_tranche_pdf(
         {
             "value": f"${_opp_recurring_mo:,.0f}" if _opp_recurring_mo > 0 else "$0",
             "label": "Missing Monthly Pet Rent",
-            "sub": "Recurring monthly pet rent not collected" if _opp_recurring_mo > 0 else "Fully collected",
+            "sub": f"{t2_tenants:,} tenants x ${_opp_recurring_mo / t2_tenants:,.0f}/mo avg fee" if t2_tenants > 0 and _opp_recurring_mo > 0 else "Fully collected",
             "color": orange if _opp_recurring_mo > 0 else green,
         },
         {
@@ -3199,9 +3202,11 @@ def generate_tranche_pdf(
     ])
 
     if t2_tenants > 0:
+        _avg_fee_per_tenant = _opp_recurring_mo / t2_tenants if t2_tenants > 0 else 0
         narrative(
             f"{t2_tenants:,} tenants have completed PetScreening profiles but are not being "
-            f"charged pet rent. That is ${_opp_recurring_mo:,.0f}/mo in recurring pet rent"
+            f"charged pet rent. At an average pet fee of ${_avg_fee_per_tenant:,.0f}/mo per tenant "
+            f"({t2_tenants:,} x ${_avg_fee_per_tenant:,.0f} = ${_opp_recurring_mo:,.0f}/mo)"
             + (f" plus ${_opp_onetime_total:,.0f} in uncollected one-time fees" if _opp_onetime_total > 0 else "")
             + f" across {t2_props} properties. "
             f"This is a billing correction, not a sales effort."
@@ -3329,6 +3334,11 @@ def generate_tranche_pdf(
         metrics.append(("Additional Opportunity at 100%", f"+${t3_additional:,.0f}/mo"))
     if total_projected and total_projected > 0:
         metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo"))
+    if total_units and total_units > 0:
+        metrics.append(("Total Units", f"{total_units:,}"))
+        if current_monthly_rev and total_units > 0:
+            _rev_per_unit = current_monthly_rev / total_units
+            metrics.append(("Pet Revenue per Unit", f"${_rev_per_unit:,.2f}/mo"))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}"))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}"))
 
@@ -7491,6 +7501,13 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 n_props_total = len(_prop_ids)
                 n_props_with_data = len(_monthly_by_prop)
+                # Calculate total unique units from charge data
+                _total_units = 0
+                if 'unit_code' in df.columns and 'property_name' in df.columns:
+                    _unit_df = df[df['property_name'].isin(_monthly_by_prop.keys())]
+                    _unit_df = _unit_df[_unit_df['unit_code'].notna() & (_unit_df['unit_code'] != '')]
+                    _total_units = _unit_df.drop_duplicates(subset=['property_name', 'unit_code']).shape[0]
+                st.session_state["_total_units"] = _total_units
                 _launch_in_data_wn = {p: d for p, d in _launch_dates.items() if p in _monthly_by_prop}
                 n_with_launch = len(_launch_in_data_wn)
 
@@ -7936,6 +7953,10 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     _quick_rows.append({"Metric": "Additional Opportunity at 100%", "Value": f"+${_t3_additional:,.0f}/mo", "Period": "at 100% adoption"})
                 if _su_total_profiles > 0:
                     _quick_rows.append({"Metric": "Suspected Undisclosed Pets", "Value": f"{_su_total_profiles:,}", "Period": f"~${_su_current_mo:,.0f}/mo potential"})
+                if _total_units > 0:
+                    _quick_rows.append({"Metric": "Total Units", "Value": f"{_total_units:,}", "Period": f"across {n_props_with_data} properties"})
+                    if _current_monthly_rev > 0:
+                        _quick_rows.append({"Metric": "Pet Revenue per Unit", "Value": f"${_current_monthly_rev / _total_units:,.2f}/mo", "Period": ""})
                 _quick_rows.append({"Metric": "Properties with Launch Date", "Value": f"{n_with_launch} of {n_props_total}", "Period": ""})
                 _quick_rows.append({"Metric": "Properties with Charge Data", "Value": f"{n_props_with_data} of {n_props_total}", "Period": ""})
 
@@ -8183,6 +8204,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             su_current_mo=_su_current_mo,
                             total_projected=_total_projected,
                             missing_rent_data=_mr_data,
+                            total_units=st.session_state.get("_total_units", 0),
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
