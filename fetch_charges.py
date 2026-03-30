@@ -31,7 +31,7 @@ load_dotenv(Path(__file__).parent / ".env")
 JOBS = [
     {
         "name": "TruAmerica",
-        "property_ids": [98802, 26952, 98862, 84053],
+        "property_ids": [98862, 84053],
     },
     {
         "name": "AEW_Capital",
