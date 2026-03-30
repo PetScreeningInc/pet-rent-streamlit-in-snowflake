@@ -330,9 +330,10 @@ def run_job(conn, job):
             print(f"    [{i}/{len(properties)}] {marker} {status['property_name']} — {status['status']}")
 
     # 4. Save CSV
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    ts = now.strftime("%Y%m%d_%H%M%S")
+
     if all_charges:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        ts = now.strftime("%Y%m%d_%H%M%S")
         filename = f"charges_{name}_{ts}.csv"
         filepath = os.path.join(OUTPUT_DIR, filename)
         df = pd.DataFrame(all_charges)
@@ -344,6 +345,14 @@ def run_job(conn, job):
         print(f"     Columns: {list(df.columns)}")
     else:
         print(f"\n  ❌ No charges returned for any property in {name}.")
+
+    # 5. Save fetch log CSV (always, even if no charges returned)
+    if fetch_log:
+        log_filename = f"fetch_log_{name}_{ts}.csv"
+        log_filepath = os.path.join(OUTPUT_DIR, log_filename)
+        log_df = pd.DataFrame(fetch_log)
+        log_df.to_csv(log_filepath, index=False)
+        print(f"  📋 Fetch log → {log_filepath}")
 
     return fetch_log
 

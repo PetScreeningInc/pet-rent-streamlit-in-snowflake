@@ -2318,7 +2318,7 @@ def generate_html_report(
             <h2>Revenue Opportunity at 100% {overlay_mode_label} Adoption</h2>
             <div class="kpi-row">
                 <div class="kpi-card">
-                    <div class="kpi-label">Current Monthly Revenue</div>
+                    <div class="kpi-label">Current Monthly Pet-Related Revenue</div>
                     <div class="kpi-value">${total_current:,.0f}</div>
                 </div>
                 <div class="kpi-card">
@@ -2363,7 +2363,7 @@ def generate_html_report(
             <table style="margin:12px 0;font-size:12px;max-width:600px">
               <thead><tr><th>Input</th><th>Source</th><th>Example</th></tr></thead>
               <tbody>
-                <tr><td>Current Monthly Revenue</td><td>Selected pet fee charges (Yardi)</td><td>$5,000/mo</td></tr>
+                <tr><td>Current Monthly Pet-Related Revenue</td><td>Selected pet fee charges (Yardi)</td><td>$5,000/mo</td></tr>
                 <tr><td>Current {overlay_mode_label} Adoption</td><td>{_metric_desc} (QBR)</td><td>65%</td></tr>
               </tbody>
             </table>
@@ -2830,14 +2830,14 @@ def generate_html_report(
     <h2>PetScreening Revenue Impact</h2>
     <div class="kpi-row">
       <div class="kpi-card">
-        <div class="kpi-label">Total Revenue Change</div>
+        <div class="kpi-label">Cumulative Pet Revenue Impact</div>
         <div class="kpi-value">{sign_t}${agg_diff:,.0f}</div>
-        <div class="kpi-caption">Cumulative impact since launch</div>
+        <div class="kpi-caption">Cumulative pet fee impact since launch</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Monthly Revenue Change</div>
+        <div class="kpi-label">Monthly Pet Revenue Change</div>
         <div class="kpi-value">{sign_mo}${agg_diff_mo:,.0f}/mo</div>
-        <div class="kpi-caption">Average monthly uplift since launch across {n_comparable} properties</div>
+        <div class="kpi-caption">Average monthly pet fee uplift since launch across {n_comparable} properties</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Properties with Launch Date</div>
@@ -2951,22 +2951,26 @@ def generate_tranche_pdf(
     class PDF(FPDF):
         def header(self):
             self.set_fill_color(31, 34, 87)  # #1F2257
-            self.rect(0, 0, 210, 32, 'F')
-            self.set_font('Helvetica', 'B', 16)
+            self.rect(0, 0, 210, 38, 'F')
+            self.set_font('Helvetica', 'B', 18)
+            self.set_text_color(255, 255, 255)
+            self.set_xy(15, 6)
+            self.cell(0, 8, label, ln=True)
+            self.set_font('Helvetica', '', 11)
             self.set_text_color(226, 171, 88)  # #E2AB58
-            self.set_xy(15, 8)
-            self.cell(0, 8, 'PetScreening Impact Analysis', ln=True)
-            self.set_font('Helvetica', '', 10)
+            self.set_xy(15, 15)
+            self.cell(0, 6, 'PetScreening Value Report', ln=True)
+            self.set_font('Helvetica', '', 9)
             self.set_text_color(218, 235, 245)  # #DAEBF5
-            self.set_xy(15, 18)
-            self.cell(0, 6, f'{label}  |  {today_str}', ln=True)
+            self.set_xy(15, 23)
+            self.cell(0, 6, today_str, ln=True)
             self.ln(12)
 
         def footer(self):
             self.set_y(-15)
             self.set_font('Helvetica', 'I', 8)
             self.set_text_color(150, 150, 150)
-            self.cell(0, 10, f'PetScreening Impact Analysis  |  {label}  |  Page {self.page_no()}', align='C')
+            self.cell(0, 10, f'PetScreening Value Report  |  {label}  |  Page {self.page_no()}', align='C')
 
     pdf = PDF()
     pdf.set_auto_page_break(auto=True, margin=20)
@@ -3108,19 +3112,19 @@ def generate_tranche_pdf(
     draw_card_row([
         {
             "value": f"${current_monthly_rev:,.0f}",
-            "label": "Current Monthly Revenue",
+            "label": "Current Monthly Pet-Related Revenue",
             "sub": "Total pet fee revenue",
             "color": dark_blue,
         },
         {
             "value": f"{_sign_t1}${t1_mo:,.0f}" if comparable_count > 0 and t1_mo != 0 else "--",
-            "label": "Revenue Change Since PS",
+            "label": "Pet Revenue Change Since PS",
             "sub": f"{t1_pct:+.1f}% vs baseline" if comparable_count > 0 and t1_pct != 0 else None,
             "color": _t1_color,
         },
         {
             "value": _cum_str,
-            "label": "Cumulative Impact",
+            "label": "Cumulative Pet Revenue Impact",
             "sub": f"Over {t1_months} months" if comparable_count > 0 and t1_months > 0 else None,
             "color": green if t1_total > 0 else dark_blue,
         },
@@ -3182,7 +3186,7 @@ def generate_tranche_pdf(
         },
         {
             "value": f"${_opp_recurring_mo:,.0f}" if _opp_recurring_mo > 0 else "$0",
-            "label": "Missing Pet Rent",
+            "label": "Missing Monthly Pet Rent",
             "sub": "Recurring monthly pet rent not collected" if _opp_recurring_mo > 0 else "Fully collected",
             "color": orange if _opp_recurring_mo > 0 else green,
         },
@@ -3309,7 +3313,7 @@ def generate_tranche_pdf(
 
     metrics = []
     metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo"))
-    metrics.append(("Current Monthly Revenue", f"${current_monthly_rev:,.0f}/mo"))
+    metrics.append(("Current Monthly Pet-Related Revenue", f"${current_monthly_rev:,.0f}/mo"))
     if comparable_count > 0 and t1_mo != 0:
         metrics.append(("Monthly Revenue Lift", f"+${t1_mo:,.0f}/mo"))
         metrics.append(("Cumulative Revenue Impact", f"${t1_total:,.0f}"))
@@ -3374,6 +3378,51 @@ def generate_tranche_pdf(
             pdf.cell(90, 5, ", ".join(emails)[:80], border='LR', ln=True)
         # Close table bottom
         pdf.cell(180, 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  METHODOLOGY
+    # ═══════════════════════════════════════════════════════════
+    pdf.add_page()
+    section_heading("Methodology", dark_blue)
+
+    narrative(
+        "Current Monthly Pet-Related Revenue: The total monthly revenue from the "
+        "selected pet-related charge codes (e.g. pet rent, pet deposits) as reported "
+        "in the property management system. This is the sum of active charges in the "
+        "most recent month of data."
+    )
+
+    narrative(
+        "Pet Revenue Change Since PetScreening: For each property with a known launch "
+        "date, we compare the average monthly pet fee revenue in the post-launch period "
+        "to the pre-launch baseline using a 6-and-6 methodology — up to 6 months of "
+        "pre-launch data as the baseline, compared against completed post-launch months. "
+        "The portfolio-level change is the sum of each comparable property's monthly lift."
+    )
+
+    narrative(
+        "Cumulative Pet Revenue Impact: The total observed post-launch pet fee revenue "
+        "minus the projected baseline (pre-launch average extended across the same number "
+        "of months). This represents the total incremental revenue attributable to the "
+        "PetScreening program across all comparable properties."
+    )
+
+    narrative(
+        "Revenue Opportunity — Missing Monthly Pet Rent: PetScreening profiles with "
+        "active household pets are matched against charge data. Tenants who have a "
+        "compliant profile with at least one active household pet but no matching pet "
+        "charge code are counted as 'missing.' The missing revenue estimate equals the "
+        "count of missing tenants multiplied by the median pet rent charge at their "
+        "respective property. Each property's actual average fee from paying tenants "
+        "is used, not a flat portfolio-wide number."
+    )
+
+    narrative(
+        "Property Scoping: Only properties that have at least one charge matching "
+        "the selected pet-related charge codes are included in the missing rent "
+        "analysis. Properties with PetScreening profiles but no pet charges in "
+        "the data are excluded to avoid false positives."
+    )
 
     # Return bytes
     buf = io.BytesIO()
@@ -3732,12 +3781,12 @@ def generate_exec_summary_html(
   <h2 style="font-size:13px;font-weight:600;color:var(--catnip-green);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Value Created</h2>
   <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
     <div class="kpi-card">
-      <div class="kpi-label">Current Monthly Revenue</div>
+      <div class="kpi-label">Current Monthly Pet-Related Revenue</div>
       <div class="kpi-value">${current_monthly_rev:,.0f}<span style="font-size:16px">/mo</span></div>
       <div class="kpi-caption">Total pet fee revenue (latest month)</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Revenue Change Since PS</div>
+      <div class="kpi-label">Pet Revenue Change Since PS</div>
       <div class="kpi-value" style="color:{color_rev}">{sign}${rev_change_mo:,.0f}<span style="font-size:16px">/mo</span></div>
       <div class="kpi-caption">vs pre-launch baseline</div>
     </div>
@@ -4149,11 +4198,13 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
 
-    # ── Scope to properties that actually have charge data ──────────────
-    # Without this, properties not in the API export (no charges at all)
-    # would have ALL their PetScreening profiles flagged as "missing,"
-    # inflating the count with unknowns.
-    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    # Only include properties with at least 1 charge matching selected codes.
+    # Without this, properties with other charges but no pet charges would
+    # have ALL their PetScreening profiles flagged as "missing," inflating
+    # the count with unknowns.
+    _pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)]
+    _charge_pids = set(_pet_charges['property_id'].astype(str).str.strip().unique())
     property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
     if not property_ids:
         return pd.DataFrame()
@@ -4342,11 +4393,13 @@ def fetch_missing_pet_rent_by_property(
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
 
-    # ── Scope to properties that actually have charge data ──────────────
-    # Without this, properties not in the API export (no charges at all)
-    # would have ALL their PetScreening profiles flagged as "missing,"
-    # inflating the count with unknowns.
-    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    # Only include properties with at least 1 charge matching selected codes.
+    # Without this, properties with other charges but no pet charges would
+    # have ALL their PetScreening profiles flagged as "missing," inflating
+    # the count with unknowns.
+    pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)].copy()
+    _charge_pids = set(pet_charges['property_id'].astype(str).str.strip().unique())
     property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
     if not property_ids:
         return {}
@@ -4354,7 +4407,6 @@ def fetch_missing_pet_rent_by_property(
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
     # ── Step 1: From LIVE API data, classify charge codes and compute avg fees ──
-    pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)].copy()
     pet_charges['_amt'] = pd.to_numeric(pet_charges['charge_amount'], errors='coerce').fillna(0)
     pet_charges['_from'] = pet_charges['charge_from_date'].apply(parse_date)
     pet_charges['_to'] = pet_charges['charge_to_date'].apply(parse_date)
@@ -4641,8 +4693,9 @@ def fetch_suspected_undisclosed_by_property(
     conn = get_snowflake_connection()
     cur = conn.cursor(snowflake.connector.DictCursor)
 
-    # ── Scope to properties that actually have charge data ──────────────
-    _charge_pids = set(all_charges_df['property_id'].astype(str).str.strip().unique())
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    _pet_charges_filter = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)]
+    _charge_pids = set(_pet_charges_filter['property_id'].astype(str).str.strip().unique())
     property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
     if not property_ids:
         return {}
@@ -5287,6 +5340,11 @@ with st.sidebar:
                 # Recover property_ids from the loaded data
                 if 'property_id' in _loaded_df.columns:
                     st.session_state.property_ids = _loaded_df['property_id'].dropna().unique().tolist()
+                # Recover selection_label from parent_company column if not already set
+                if not st.session_state.get("selection_label") and 'parent_company' in _loaded_df.columns:
+                    _pc_vals = _loaded_df['parent_company'].dropna().unique()
+                    if len(_pc_vals) > 0:
+                        st.session_state.selection_label = str(_pc_vals[0]).strip()
                 st.success(f"Loaded **{len(_loaded_df):,}** charges from `{_selected_export}`")
                 st.rerun()
 
@@ -6270,13 +6328,13 @@ if st.session_state.all_charges_df is not None:
 
                     lcol1, lcol2, lcol3 = st.columns(3)
                     lcol1.metric(
-                        "Total Revenue Change",
+                        "Cumulative Pet Revenue Impact",
                         f"{sign_t}${agg_diff:,.0f}",
                         help="Sum of each comparable property's (Monthly Change × post months). "
                              "Matches the Total Change column in the table below."
                     )
                     lcol2.metric(
-                        "Monthly Revenue Change",
+                        "Monthly Pet Revenue Change",
                         f"{sign_mo}${agg_diff_mo:,.0f}/mo",
                         help="Sum of each comparable property's Monthly Change. "
                              "You can verify: add up the Monthly Change column in the table below."
@@ -6429,7 +6487,7 @@ The pre-launch baseline uses up to 6 months *before* the launch month (e.g., May
                         st.divider()
                         ic1, ic2, ic3 = st.columns(3)
                         ic1.metric(
-                            "Current Monthly Revenue",
+                            "Current Monthly Pet-Related Revenue",
                             f"${total_current:,.0f}",
                             help="Sum of latest-month pet fee revenue for properties with adoption data.",
                         )
@@ -6473,7 +6531,7 @@ For each property, we take two numbers from the **latest month**:
 
 | Input | Source | Example |
 |-------|--------|---------|
-| **Current Monthly Revenue** | Sum of selected pet fee charge codes from Yardi (this app) | $5,000/mo |
+| **Current Monthly Pet-Related Revenue** | Sum of selected pet fee charge codes from Yardi (this app) | $5,000/mo |
 | **Current {_overlay_mode_label} Adoption** | {'Active units ÷ Total units' if _overlay == 'unit' else 'Active users ÷ Total users'} from QBR table | 65% |
 
 Then we calculate:
@@ -6610,7 +6668,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             help=f"Active tenants with household profiles not being charged pet rent, across {c_props} properties.",
                         )
                         cc2.metric(
-                            "Missing Pet Rent",
+                            "Missing Monthly Pet Rent",
                             f"${c_recurring_mo:,.0f}/mo",
                             help=f"Recurring monthly pet rent not collected. Based on each property's avg fee from paying tenants.",
                         )
@@ -7510,7 +7568,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 with _vc1:
                     st.markdown(_summary_card(
                         f"${_current_monthly_rev:,.0f}",
-                        "Current Monthly Revenue",
+                        "Current Monthly Pet-Related Revenue",
                         _latest_str,
                         color="#677848",
                     ), unsafe_allow_html=True)
@@ -7519,14 +7577,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _sign = "+" if _t1_mo > 0 else ""
                         st.markdown(_summary_card(
                             f"{_sign}${_t1_mo:,.0f}/mo",
-                            "Revenue Change Since PS",
+                            "Pet Revenue Change Since PS",
                             f"Across {len(_comparable)} comparable properties",
                             color="#677848" if _t1_mo > 0 else "#DD7B45",
                         ), unsafe_allow_html=True)
                     else:
                         st.markdown(_summary_card(
                             "N/A",
-                            "Revenue Change Since PS",
+                            "Pet Revenue Change Since PS",
                             "Requires launch dates and pre-launch data",
                             color="#636569",
                         ), unsafe_allow_html=True)
@@ -7535,14 +7593,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _sign = "+" if _t1_total > 0 else ""
                         st.markdown(_summary_card(
                             f"{_sign}${_t1_total:,.0f}",
-                            "Cumulative Impact",
+                            "Cumulative Pet Revenue Impact",
                             f"Over {_t1_months} months",
                             color="#677848" if _t1_total > 0 else "#DD7B45",
                         ), unsafe_allow_html=True)
                     else:
                         st.markdown(_summary_card(
                             "N/A",
-                            "Cumulative Impact",
+                            "Cumulative Pet Revenue Impact",
                             "Requires launch dates and pre-launch data",
                             color="#636569",
                         ), unsafe_allow_html=True)
@@ -7620,21 +7678,21 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         if _s2_recurring_mo > 0:
                             st.markdown(_summary_card(
                                 f"${_s2_recurring_mo:,.0f}/mo",
-                                "Missing Pet Rent",
+                                "Missing Monthly Pet Rent",
                                 "Recurring monthly pet rent not collected",
                                 color="#DD7B45",
                             ), unsafe_allow_html=True)
                         else:
                             st.markdown(_summary_card(
                                 "$0",
-                                "Missing Pet Rent",
+                                "Missing Monthly Pet Rent",
                                 "Fully collected",
                                 color="#677848",
                             ), unsafe_allow_html=True)
                     else:
                         st.markdown(_summary_card(
                             "--",
-                            "Missing Pet Rent",
+                            "Missing Monthly Pet Rent",
                             "Enable on Charts tab to calculate",
                             color="#636569",
                         ), unsafe_allow_html=True)
@@ -8161,7 +8219,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.download_button(
                             label="Download PDF",
                             data=st.session_state["exec_pdf"],
-                            file_name=f"PetScreening_Impact_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            file_name=f"PetScreening_Value_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
                             mime="application/pdf",
                             use_container_width=True,
                             key="dl_exec_pdf",
@@ -8177,7 +8235,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.download_button(
                             label="Download HTML",
                             data=st.session_state["exec_html"],
-                            file_name=f"PetScreening_Impact_{safe_name}_{datetime.now().strftime('%Y%m%d')}.html",
+                            file_name=f"PetScreening_Value_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.html",
                             mime="text/html",
                             use_container_width=True,
                             key="dl_exec_html",
@@ -8885,7 +8943,7 @@ The adoption overlay adds a **purple line** on top of each property's revenue ba
 The overlay uses a **secondary Y-axis** (right side, 0–100%) so the scales don't clash.
 
 **When an overlay is active**, additional KPIs appear:
-- **Current Monthly Revenue** — what the portfolio earns today
+- **Current Monthly Pet-Related Revenue** — what the portfolio earns today in pet fees
 - **Projected at 100% Adoption** — linear extrapolation: `current_revenue ÷ (adoption_rate / 100)`
 - **Average Adoption** — mean across properties that have **both** revenue and adoption data
 
@@ -8895,7 +8953,7 @@ A per-property table also appears below the charts showing each property's curre
             with st.expander("**How does 'Projected Revenue at 100% Adoption' work?**"):
                 st.markdown("""
 For each property, we take two data points from the **latest month**:
-- **Current Monthly Revenue** (from the selected pet fee charge codes)
+- **Current Monthly Pet-Related Revenue** (from the selected pet fee charge codes)
 - **Current Adoption Rate** (unit or resident, from the QBR table)
 
 Then: `Projected Revenue = Current Revenue ÷ (Current Adoption / 100)`
