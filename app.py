@@ -2172,13 +2172,20 @@ def build_individual_property_charts(
         fig.update_layout(barmode="stack")
 
     row_height = 300 if rows <= 15 else (250 if rows <= 30 else 200)
+    # Use property name as title when only 1 property
+    _chart_title_prefix = title_prefix
+    if n_props == 1:
+        _single_prop_name = sorted_props[0]
+        _short_single = _single_prop_name.split(" - ", 1)[-1] if " - " in _single_prop_name else _single_prop_name
+        _chart_title_prefix = _short_single
+
     fig.update_layout(
         height=max(450, rows * row_height),
         autosize=True,
         template="plotly_white",
         title=dict(
             text=(
-                f"{title_prefix}: Individual Property Fee Trends ({n_props} properties)<br>"
+                f"{_chart_title_prefix}: {'Pet Fee Trend' if n_props == 1 else f'Individual Property Fee Trends ({n_props} properties)'}<br>"
                 f"<sub style='font-size:11px;color:#636569'>"
                 f"<span style='color:#7D9BC1'>■</span> Before PetScreening  ·  "
                 f"<span style='color:#677848'>■</span> After PetScreening  ·  "
@@ -3521,13 +3528,13 @@ def generate_tranche_pdf(
         section_heading("Impact by Property", dark_blue)
         narrative(
             "Each property's pre-launch average (up to 6 months before launch) is compared "
-            "against its current post-launch average. Simple Diff = Current - Pre. "
-            "Adjusted Lift accounts for the number of post-launch months."
+            "against its post-launch average across all completed months. "
+            "Lift = Post Avg - Pre Avg. Cumulative = total post revenue minus projected baseline."
         )
 
         # Table header
-        _col_widths = [52, 24, 26, 24, 26, 17, 11]  # total = 180
-        _col_headers = ['Property', 'Pre Avg', 'Current Avg', 'Simple Diff', 'Adj. Lift', 'Cumul.', 'Mo']
+        _col_widths = [55, 25, 25, 25, 25, 14, 11]  # total = 180
+        _col_headers = ['Property', 'Pre Avg', 'Post Avg', 'Lift ($/mo)', 'Cumul.', 'Lift %', 'Mo']
         pdf.set_fill_color(249, 244, 230)
         pdf.set_draw_color(*card_border)
         pdf.set_font('Helvetica', 'B', 7)
@@ -3576,20 +3583,21 @@ def generate_tranche_pdf(
             pdf.cell(_col_widths[1], 5, f' ${_pre:,.0f}/mo', border='LR', fill=True)
             pdf.cell(_col_widths[2], 5, f' ${_post:,.0f}/mo', border='LR', fill=True)
 
-            # Color-code simple diff
-            pdf.set_text_color(*lift_color(_sdiff))
-            _sd_sign = "+" if _sdiff > 0 else ""
-            pdf.cell(_col_widths[3], 5, f' {_sd_sign}${_sdiff:,.0f}', border='LR', fill=True)
-
-            # Color-code adjusted lift
+            # Color-code lift
             pdf.set_text_color(*lift_color(_adj))
             _adj_sign = "+" if _adj > 0 else ""
-            pdf.cell(_col_widths[4], 5, f' {_adj_sign}${_adj:,.0f}/mo', border='LR', fill=True)
+            pdf.cell(_col_widths[3], 5, f' {_adj_sign}${_adj:,.0f}', border='LR', fill=True)
 
             # Color-code cumulative
             pdf.set_text_color(*lift_color(_cum))
             _cum_sign = "+" if _cum > 0 else ""
-            pdf.cell(_col_widths[5], 5, f' {_cum_sign}${_cum:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[4], 5, f' {_cum_sign}${_cum:,.0f}', border='LR', fill=True)
+
+            # Lift %
+            _lift_pct = (((_post - _pre) / _pre) * 100) if _pre > 0 else 0
+            pdf.set_text_color(*lift_color(_lift_pct))
+            _pct_sign = "+" if _lift_pct > 0 else ""
+            pdf.cell(_col_widths[5], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
 
             pdf.set_text_color(*body_gray)
             pdf.cell(_col_widths[6], 5, f' {_npost}', border='LR', fill=True)
@@ -3617,8 +3625,8 @@ def generate_tranche_pdf(
             "your property managers for billing corrections."
         )
 
-        _app_col_w = [50, 18, 50, 30, 32]  # total = 180
-        _app_headers = ['Property', 'Unit', 'Tenant Name', 'Profile Status', 'Avg Fee at Prop']
+        _app_col_w = [38, 14, 36, 48, 22, 22]  # total = 180
+        _app_headers = ['Property', 'Unit', 'Tenant Name', 'Email', 'Status', 'Avg Fee']
         pdf.set_fill_color(249, 244, 230)
         pdf.set_draw_color(*card_border)
         pdf.set_font('Helvetica', 'B', 7)
@@ -3653,17 +3661,19 @@ def generate_tranche_pdf(
                 else:
                     pdf.set_fill_color(250, 250, 248)
 
-                _tname = str(tenant.get("name", "Unknown"))[:28]
-                _tunit = str(tenant.get("unit", ""))[:10]
-                _tstatus = str(tenant.get("profile_status", tenant.get("status", "Compliant")))[:18]
+                _tname = str(tenant.get("name", "Unknown"))[:20]
+                _tunit = str(tenant.get("unit", ""))[:8]
+                _temail = str(tenant.get("email", ""))[:30]
+                _tstatus = str(tenant.get("profile_status", tenant.get("status", "Compliant")))[:12]
 
                 pdf.set_text_color(*body_gray)
                 pdf.cell(_app_col_w[0], 5, f' {_short_prop}', border='LR', fill=True)
                 pdf.cell(_app_col_w[1], 5, f' {_tunit}', border='LR', fill=True)
                 pdf.cell(_app_col_w[2], 5, f' {_tname}', border='LR', fill=True)
-                pdf.cell(_app_col_w[3], 5, f' {_tstatus}', border='LR', fill=True)
+                pdf.cell(_app_col_w[3], 5, f' {_temail}', border='LR', fill=True)
+                pdf.cell(_app_col_w[4], 5, f' {_tstatus}', border='LR', fill=True)
                 pdf.set_text_color(*orange)
-                pdf.cell(_app_col_w[4], 5, f' ${_avg_fee:,.0f}/mo', border='LR', fill=True)
+                pdf.cell(_app_col_w[5], 5, f' ${_avg_fee:,.0f}/mo', border='LR', fill=True)
                 pdf.ln()
                 _app_ri += 1
 
@@ -7817,12 +7827,35 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 n_props_total = len(_prop_ids)
                 n_props_with_data = len(_monthly_by_prop)
-                # Calculate total unique units from charge data
+                # Calculate total units — prefer Snowflake QBR data, fall back to charge data
                 _total_units = 0
-                if 'unit_code' in df.columns and 'property_name' in df.columns:
-                    _unit_df = df[df['property_name'].isin(_monthly_by_prop.keys())]
-                    _unit_df = _unit_df[_unit_df['unit_code'].notna() & (_unit_df['unit_code'] != '')]
-                    _total_units = _unit_df.drop_duplicates(subset=['property_name', 'unit_code']).shape[0]
+                _units_from_qbr = False
+                try:
+                    _pid_list = [int(p) for p in st.session_state.get("property_ids", []) if str(p).strip()]
+                    if _pid_list:
+                        _qbr_conn = get_snowflake_connection()
+                        _qbr_cur = _qbr_conn.cursor(snowflake.connector.DictCursor)
+                        _qbr_ids = ", ".join(str(p) for p in _pid_list)
+                        _qbr_cur.execute(f"""
+                            SELECT PROPERTY_ID, MAX(TOTAL_UNITS) AS TOTAL_UNITS
+                            FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
+                            WHERE PROPERTY_ID IN ({_qbr_ids})
+                              AND TOTAL_UNITS > 0
+                            GROUP BY PROPERTY_ID
+                        """)
+                        _qbr_rows = _qbr_cur.fetchall()
+                        _qbr_cur.close()
+                        if _qbr_rows:
+                            _total_units = sum(r["TOTAL_UNITS"] for r in _qbr_rows)
+                            _units_from_qbr = True
+                except Exception:
+                    pass
+                if not _units_from_qbr:
+                    # Fall back to unique unit_codes in charge data
+                    if 'unit_code' in df.columns and 'property_name' in df.columns:
+                        _unit_df = df[df['property_name'].isin(_monthly_by_prop.keys())]
+                        _unit_df = _unit_df[_unit_df['unit_code'].notna() & (_unit_df['unit_code'] != '')]
+                        _total_units = _unit_df.drop_duplicates(subset=['property_name', 'unit_code']).shape[0]
                 st.session_state["_total_units"] = _total_units
                 _launch_in_data_wn = {p: d for p, d in _launch_dates.items() if p in _monthly_by_prop}
                 n_with_launch = len(_launch_in_data_wn)
