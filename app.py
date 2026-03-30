@@ -3395,7 +3395,7 @@ def generate_tranche_pdf(
     narrative(
         "Pet Revenue Change Since PetScreening: For each property with a known launch "
         "date, we compare the average monthly pet fee revenue in the post-launch period "
-        "to the pre-launch baseline using a 6-and-6 methodology — up to 6 months of "
+        "to the pre-launch baseline using a 6-and-6 methodology: up to 6 months of "
         "pre-launch data as the baseline, compared against completed post-launch months. "
         "The portfolio-level change is the sum of each comparable property's monthly lift."
     )
@@ -3408,7 +3408,7 @@ def generate_tranche_pdf(
     )
 
     narrative(
-        "Revenue Opportunity — Missing Monthly Pet Rent: PetScreening profiles with "
+        "Revenue Opportunity - Missing Monthly Pet Rent: PetScreening profiles with "
         "active household pets are matched against charge data. Tenants who have a "
         "compliant profile with at least one active household pet but no matching pet "
         "charge code are counted as 'missing.' The missing revenue estimate equals the "
@@ -5319,7 +5319,13 @@ with st.sidebar:
                         )
 
                 st.session_state.all_charges_df = _loaded_df
-                st.session_state.fetch_log = None
+                # Try to load matching fetch log file
+                _log_name = _selected_export.replace("charges_", "fetch_log_", 1)
+                _log_path = os.path.join(_auto_dir, _log_name)
+                if os.path.isfile(_log_path):
+                    st.session_state.fetch_log = pd.read_csv(_log_path, low_memory=False)
+                else:
+                    st.session_state.fetch_log = None
                 # Try to load matching AR file
                 _ar_name = _selected_export.replace("charges_", "ar_charges_", 1)
                 _ar_path = os.path.join(_auto_dir, _ar_name)
