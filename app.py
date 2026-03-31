@@ -28,7 +28,7 @@ load_dotenv()
 # ─── Page config ─────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PetScreening · Value Report",
-    page_icon="PS",
+    page_icon="🐾",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -5961,6 +5961,24 @@ with st.sidebar:
         if choice:
             selected_property_id = prop_options[choice]
 
+        # Multi-ID input: paste comma-separated or one-per-line from CSV
+        _multi_ids_raw = st.text_area(
+            "Or paste Property IDs (comma or newline separated):",
+            height=68,
+            placeholder="e.g. 12345, 67890, 11111  or one per line",
+            key="multi_property_ids_input",
+        )
+        _multi_ids_parsed = []
+        if _multi_ids_raw and _multi_ids_raw.strip():
+            import re
+            _tokens = re.split(r'[,\n\r\t;]+', _multi_ids_raw)
+            for _tok in _tokens:
+                _tok = _tok.strip()
+                if _tok and _tok.isdigit():
+                    _multi_ids_parsed.append(int(_tok))
+            if _multi_ids_parsed:
+                st.caption(f"{len(_multi_ids_parsed)} property IDs detected")
+
     # Display window is now derived from the data (no slider).
     # Set a large default; the actual window will be clamped to the
     # earliest charge date once data is loaded.
@@ -5990,13 +6008,14 @@ with st.sidebar:
     fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
 
     if _saved_files:
-        with st.expander("📂 Or load from saved export"):
+        with st.expander("Load from saved export", expanded=False):
             _selected_export = st.selectbox(
-                "Saved files",
+                "Select a saved file:",
                 options=_saved_files,
                 key="load_export_select",
+                label_visibility="collapsed",
             )
-            if st.button("Load selected file", key="load_export_btn", use_container_width=True):
+            if st.button("Load", key="load_export_btn", use_container_width=True):
                 _load_path = os.path.join(_auto_dir, _selected_export)
                 _loaded_df = pd.read_csv(_load_path, low_memory=False)
 
@@ -6071,27 +6090,45 @@ if "chart_data" not in st.session_state:
 
 # ─── Fetch data ──────────────────────────────────────────────────────
 if fetch_btn:
-    if not selected_parent and not selected_property_id and not selected_ancestry_id:
+    # Support multi-ID paste input
+    _use_multi_ids = bool(_multi_ids_parsed) if '_multi_ids_parsed' in dir() else False
+    if not selected_parent and not selected_property_id and not selected_ancestry_id and not _use_multi_ids:
         st.warning("Please select a parent company, ancestry ID, or property first.")
     else:
-        # Route to correct property loader based on PMC system
-        if _is_entrata:
-            properties = load_entrata_properties_for_selection(
-                parent_company_name=selected_parent,
-                property_id=selected_property_id,
-                ancestry_id=selected_ancestry_id,
-            )
+        if _use_multi_ids:
+            # Fetch by multiple property IDs directly
+            _multi_ids_str = ", ".join(str(p) for p in _multi_ids_parsed)
+            _conn = get_snowflake_connection()
+            _cur = _conn.cursor(snowflake.connector.DictCursor)
+            _cur.execute(f"""
+                SELECT PROPERTY_ID, PROPERTY_NAME
+                FROM PROD.COMMON.D_PROPERTIES
+                WHERE PROPERTY_ID IN ({_multi_ids_str})
+            """)
+            properties = _cur.fetchall()
+            _cur.close()
         else:
-            properties = load_properties_for_selection(
-                parent_company_name=selected_parent,
-                property_id=selected_property_id,
-                ancestry_id=selected_ancestry_id,
-            )
+            # Route to correct property loader based on PMC system
+            if _is_entrata:
+                properties = load_entrata_properties_for_selection(
+                    parent_company_name=selected_parent,
+                    property_id=selected_property_id,
+                    ancestry_id=selected_ancestry_id,
+                )
+            else:
+                properties = load_properties_for_selection(
+                    parent_company_name=selected_parent,
+                    property_id=selected_property_id,
+                    ancestry_id=selected_ancestry_id,
+                )
 
         if not properties:
             st.error(f"No {_system_label} properties with active integrations found for that selection.")
         else:
-            label = selected_parent or (f"Ancestry {selected_ancestry_id}" if selected_ancestry_id else f"Property {selected_property_id}")
+            if _use_multi_ids:
+                label = f"{len(properties)} Properties"
+            else:
+                label = selected_parent or (f"Ancestry {selected_ancestry_id}" if selected_ancestry_id else f"Property {selected_property_id}")
             st.session_state.selection_label = label
             st.session_state.property_ids = [p['PROPERTY_ID'] for p in properties]
 
