@@ -2981,7 +2981,7 @@ def generate_tranche_pdf(
     USABLE_W = PAGE_R - PAGE_L  # 180mm
     CARD_GAP = 4
     CARD_W = (USABLE_W - 2 * CARD_GAP) / 3  # ~57.3mm
-    CARD_H = 30          # compact cards to fit 3 sections on page 1
+    CARD_H = 24          # compact cards to fit 4 rows + How This Scales on page 1
 
     # ── Helper: draw a row of 3 KPI cards ──
     def draw_card_row(cards):
@@ -3001,20 +3001,20 @@ def generate_tranche_pdf(
             pdf.set_draw_color(*card_border)
             pdf.rect(x, start_y, CARD_W, CARD_H, 'DF')
             # Big number
-            pdf.set_font('Helvetica', 'B', 20)
+            pdf.set_font('Helvetica', 'B', 16)
             pdf.set_text_color(*card.get("color", dark_blue))
-            pdf.set_xy(x + 2, start_y + 3)
-            pdf.cell(CARD_W - 4, 9, card["value"], align='C')
+            pdf.set_xy(x + 2, start_y + 2)
+            pdf.cell(CARD_W - 4, 7, card["value"], align='C')
             # Label
-            pdf.set_font('Helvetica', '', 7.5)
+            pdf.set_font('Helvetica', '', 6.5)
             pdf.set_text_color(*light_gray)
-            pdf.set_xy(x + 2, start_y + 14)
+            pdf.set_xy(x + 2, start_y + 10)
             pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
             # Sub-label (optional)
             if card.get("sub"):
-                pdf.set_font('Helvetica', '', 6.5)
+                pdf.set_font('Helvetica', '', 5.5)
                 pdf.set_text_color(150, 150, 150)
-                pdf.set_xy(x + 2, start_y + 19)
+                pdf.set_xy(x + 2, start_y + 15)
                 pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
 
         pdf.set_y(start_y + CARD_H + 3)
@@ -3300,14 +3300,34 @@ def generate_tranche_pdf(
             _glance_row3.append({"value": "", "label": "", "sub": None, "color": dark_blue})
 
         draw_card_row(_glance_row3)
+        pdf.ln(1)
 
-        # Combined summary line below leakage row
-        pdf.set_font('Helvetica', 'B', 7)
-        pdf.set_text_color(*dark_blue)
-        pdf.cell(0, 4,
-            f"Combined Est. Value Impact (Actuals + Leakage): "
-            f"${_asset_value_impact:,.0f} + ${_leakage_asset_value:,.0f} = ${_combined_asset_value:,.0f}",
-            ln=True, align='C')
+        # ── KPI cards -- row 4: Combined (Actuals + Leakage) ──
+        _glance_row4 = []
+        _glance_row4.append({
+            "value": f"${_total_combined_mo:,.0f}/mo",
+            "label": "Total Opportunity",
+            "sub": f"Actuals ${_monthly_lift:,.0f} + Leakage ${_leakage_mo:,.0f}",
+            "color": green,
+        })
+        if total_units and total_units > 0:
+            _glance_row4.append({
+                "value": f"${_cumulative_lift_per_unit:,.2f}/unit/mo",
+                "label": "Combined Lift per Unit",
+                "sub": f"${_lift_per_unit:,.2f} actual + ${_leakage_per_unit:,.2f} leakage",
+                "color": green,
+            })
+        _glance_row4.append({
+            "value": _format_large_currency(_combined_asset_value),
+            "label": "Combined Est. Value Impact",
+            "sub": f"${_total_combined_mo:,.0f}/mo x 12 / 5% cap rate",
+            "color": green,
+        })
+        while len(_glance_row4) < 3:
+            _glance_row4.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+
+        draw_card_row(_glance_row4)
+
     elif _asset_value_impact > 0:
         # No leakage — show cap rate callout instead
         pdf.ln(1)
