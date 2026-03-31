@@ -3871,7 +3871,7 @@ def generate_tranche_pdf(
         _lift_sign = "+" if _total_lift >= 0 else ""
         _lift_color_t = green if _total_lift >= 0 else orange
         pdf.cell(100, 4,
-            f'Portfolio Total:  ${_total_pre:,.0f}/mo → ${_total_post:,.0f}/mo', align='L')
+            f'Portfolio Total:  ${_total_pre:,.0f}/mo -> ${_total_post:,.0f}/mo', align='L')
         pdf.set_text_color(*_lift_color_t)
         pdf.cell(40, 4, f'({_lift_sign}${_total_lift:,.0f}/mo, {_lift_sign}{_pct_lift:.0f}%)', align='L')
 
