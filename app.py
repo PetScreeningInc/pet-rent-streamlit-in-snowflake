@@ -2967,6 +2967,7 @@ def generate_tranche_pdf(
 
     # ── Brand colors ──
     dark_blue = (31, 34, 87)
+    light_blue = (70, 130, 180)  # steel blue for actuals row
     green = (103, 120, 72)
     orange = (221, 123, 69)
     warm = (177, 116, 85)
@@ -3217,7 +3218,7 @@ def generate_tranche_pdf(
             "value": f"{_lift_sign}${_monthly_lift:,.0f}/mo",
             "label": "Monthly Lift",
             "sub": f"${current_monthly_rev:,.0f} - ${pre_baseline:,.0f} ({_simple_pct:+.1f}%)",
-            "color": green if _monthly_lift > 0 else orange,
+            "color": light_blue if _monthly_lift > 0 else orange,
         })
     if total_units and total_units > 0 and _lift_per_unit != 0:
         _lpu_sign = "+" if _lift_per_unit > 0 else ""
@@ -3225,14 +3226,14 @@ def generate_tranche_pdf(
             "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
             "label": "Lift per Unit",
             "sub": f"${_monthly_lift:,.0f} / {total_units:,} units",
-            "color": green if _lift_per_unit > 0 else orange,
+            "color": light_blue if _lift_per_unit > 0 else orange,
         })
     elif total_units and total_units > 0 and _rev_per_unit > 0:
         _glance_row2.append({
             "value": f"${_rev_per_unit:,.2f}/unit/mo",
             "label": "Revenue per Unit",
             "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
-            "color": dark_blue,
+            "color": light_blue,
         })
     if _asset_value_impact > 0:
         _avi_str = _format_large_currency(_asset_value_impact)
@@ -3240,7 +3241,7 @@ def generate_tranche_pdf(
             "value": _avi_str,
             "label": "Est. Asset Value Impact",
             "sub": f"${_monthly_lift:,.0f}/mo x 12 / 5% cap rate",
-            "color": green,
+            "color": light_blue,
         })
 
     # Pad row 2 to 3 cards
