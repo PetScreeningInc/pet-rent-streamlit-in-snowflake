@@ -3271,6 +3271,9 @@ def generate_tranche_pdf(
     _projected_annual_combined = _total_combined_mo * 12
     _combined_asset_value = _projected_annual_combined / _cap_rate if _projected_annual_combined > 0 else 0
 
+    _leakage_annual = _leakage_mo * 12
+    _leakage_asset_value = _leakage_annual / _cap_rate if _leakage_annual > 0 else 0
+
     if _leakage_mo > 0:
         _glance_row3 = []
         _glance_row3.append({
@@ -3287,16 +3290,24 @@ def generate_tranche_pdf(
                 "color": orange,
             })
         _glance_row3.append({
-            "value": f"${_projected_annual_combined:,.0f}/yr",
-            "label": "Projected Annual Lift",
-            "sub": f"Actuals ${_annual_lift:,.0f} + Leakage ${_leakage_mo * 12:,.0f}",
-            "color": green if _projected_annual_combined > 0 else dark_blue,
+            "value": _format_large_currency(_leakage_asset_value),
+            "label": "Est. Value Impact (Leakage)",
+            "sub": f"${_leakage_mo:,.0f}/mo x 12 / 5% cap rate",
+            "color": orange,
         })
         # Pad to 3 cards
         while len(_glance_row3) < 3:
             _glance_row3.append({"value": "", "label": "", "sub": None, "color": dark_blue})
 
         draw_card_row(_glance_row3)
+
+        # Combined summary line below leakage row
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 4,
+            f"Combined Est. Value Impact (Actuals + Leakage): "
+            f"${_asset_value_impact:,.0f} + ${_leakage_asset_value:,.0f} = ${_combined_asset_value:,.0f}",
+            ln=True, align='C')
         pdf.ln(1)
 
     pdf.ln(2)
@@ -3313,19 +3324,22 @@ def generate_tranche_pdf(
         )
 
     # ═══════════════════════════════════════════════════════════
-    #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION
+    #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION (same page)
     # ═══════════════════════════════════════════════════════════
-    if total_portfolio_units and total_portfolio_units > 0 and _lift_per_unit != 0 and _lift_per_unit > 0:
-        pdf.ln(4)
+    # Use combined lift per unit (actuals + leakage) for scaling
+    _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
+    if total_portfolio_units and total_portfolio_units > 0 and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0:
+        pdf.ln(3)
         section_heading("How This Scales", green)
 
-        _proj_monthly = _lift_per_unit * total_portfolio_units
+        _proj_monthly = _scale_lift_per_unit * total_portfolio_units
         _proj_annual = _proj_monthly * 12
         _proj_asset_value = _proj_annual / _cap_rate
 
+        _lift_source = "combined lift + leakage" if _leakage_mo > 0 else "lift"
         _scale_text = (
             f"If {label} were to roll PetScreening across their full portfolio of "
-            f"~{total_portfolio_units:,} units, that same ${_lift_per_unit:,.2f}/unit/mo lift "
+            f"~{total_portfolio_units:,} units, the ${_scale_lift_per_unit:,.2f}/unit/mo {_lift_source} "
             f"would translate to approximately ${_proj_annual:,.0f}/yr in additional pet fee revenue. "
             f"Capitalized at a 5% cap rate, that represents ~${_proj_asset_value:,.0f} in added asset value."
         )
@@ -3342,7 +3356,7 @@ def generate_tranche_pdf(
             {
                 "value": f"${_proj_annual:,.0f}/yr",
                 "label": "Projected Annual Lift",
-                "sub": f"${_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units x 12",
+                "sub": f"${_scale_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units x 12",
                 "color": green,
             },
             {
@@ -3354,7 +3368,7 @@ def generate_tranche_pdf(
         ])
 
         show_work(
-            f"Per-unit lift: ${_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units "
+            f"Per-unit {_lift_source}: ${_scale_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units "
             f"= ${_proj_monthly:,.0f}/mo x 12 = ${_proj_annual:,.0f}/yr / 0.05 = ${_proj_asset_value:,.0f}"
         )
 
