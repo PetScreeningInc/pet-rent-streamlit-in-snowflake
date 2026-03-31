@@ -27,8 +27,7 @@ load_dotenv()
 
 # ─── Page config ─────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="PetScreening · Value Report",
-    page_icon="🐾",
+    page_title="PetScreening Value Report",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -6008,7 +6007,8 @@ with st.sidebar:
     fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
 
     if _saved_files:
-        with st.expander("Load from saved export", expanded=False):
+        _show_saved = st.checkbox("Load from saved export", key="show_saved_exports")
+        if _show_saved:
             _selected_export = st.selectbox(
                 "Select a saved file:",
                 options=_saved_files,
@@ -6096,17 +6096,16 @@ if fetch_btn:
         st.warning("Please select a parent company, ancestry ID, or property first.")
     else:
         if _use_multi_ids:
-            # Fetch by multiple property IDs directly
-            _multi_ids_str = ", ".join(str(p) for p in _multi_ids_parsed)
-            _conn = get_snowflake_connection()
-            _cur = _conn.cursor(snowflake.connector.DictCursor)
-            _cur.execute(f"""
-                SELECT PROPERTY_ID, PROPERTY_NAME
-                FROM PROD.COMMON.D_PROPERTIES
-                WHERE PROPERTY_ID IN ({_multi_ids_str})
-            """)
-            properties = _cur.fetchall()
-            _cur.close()
+            # Load all integrated properties, then filter to the pasted IDs
+            _all_integrated = load_entrata_properties_for_selection() if _is_entrata else load_properties_for_selection()
+            _multi_id_set = set(_multi_ids_parsed)
+            properties = [p for p in _all_integrated if int(p['PROPERTY_ID']) in _multi_id_set]
+            if not properties:
+                # Show which IDs weren't found
+                _found_ids = {int(p['PROPERTY_ID']) for p in _all_integrated}
+                _missing = [str(pid) for pid in _multi_ids_parsed if pid not in _found_ids]
+                st.warning(f"None of the pasted IDs have active {_system_label} integrations. "
+                           f"Missing/inactive: {', '.join(_missing[:10])}")
         else:
             # Route to correct property loader based on PMC system
             if _is_entrata:
@@ -6123,7 +6122,8 @@ if fetch_btn:
                 )
 
         if not properties:
-            st.error(f"No {_system_label} properties with active integrations found for that selection.")
+            if not _use_multi_ids:  # multi-ID already showed its own warning
+                st.error(f"No {_system_label} properties with active integrations found for that selection.")
         else:
             if _use_multi_ids:
                 label = f"{len(properties)} Properties"
