@@ -3121,9 +3121,10 @@ def generate_tranche_pdf(
     #  PAGE 1: AT A GLANCE
     # ═══════════════════════════════════════════════════════════
     _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
-    _simple_increase = current_monthly_rev - pre_baseline if comparable_count > 0 else 0
-    _simple_pct = (_simple_increase / pre_baseline * 100) if pre_baseline > 0 and comparable_count > 0 else 0
-    _monthly_lift = t1_mo if comparable_count > 0 else 0
+    # At a Glance uses SIMPLE math: current - baseline = lift
+    _monthly_lift = current_monthly_rev - pre_baseline if comparable_count > 0 and pre_baseline > 0 else 0
+    _simple_pct = (_monthly_lift / pre_baseline * 100) if pre_baseline > 0 and _monthly_lift else 0
+    _adjusted_lift = t1_mo if comparable_count > 0 else 0  # kept for Value Created section
     _lift_per_unit = _monthly_lift / total_units if total_units and total_units > 0 and _monthly_lift else 0
     _annual_lift = _monthly_lift * 12
     _cap_rate = 0.05
@@ -3149,7 +3150,8 @@ def generate_tranche_pdf(
         )
         _glance_parts.append(
             f" As of the most recently completed month, that figure has grown to "
-            f"${current_monthly_rev:,.0f}/mo, a ${_monthly_lift:,.0f} monthly lift, or roughly "
+            f"${current_monthly_rev:,.0f}/mo -- a ${_monthly_lift:,.0f}/mo increase "
+            f"(${current_monthly_rev:,.0f} - ${pre_baseline:,.0f}), or roughly "
             f"${_lift_per_unit:,.2f} per unit per month."
         )
         if _asset_value_impact > 0:
@@ -3214,7 +3216,7 @@ def generate_tranche_pdf(
         _glance_row2.append({
             "value": f"{_lift_sign}${_monthly_lift:,.0f}/mo",
             "label": "Monthly Lift",
-            "sub": f"{t1_pct:+.1f}% vs baseline" if t1_pct != 0 else None,
+            "sub": f"${current_monthly_rev:,.0f} - ${pre_baseline:,.0f} ({_simple_pct:+.1f}%)",
             "color": green if _monthly_lift > 0 else orange,
         })
     if total_units and total_units > 0 and _lift_per_unit != 0:
@@ -3731,17 +3733,21 @@ def generate_tranche_pdf(
         pdf.cell(sum(_col_widths), 0, '', border='T', ln=True)
 
     # ═══════════════════════════════════════════════════════════
-    #  MONTHLY REVENUE TREND CHART
+    #  MONTHLY REVENUE TREND CHART (compact, same page if space)
     # ═══════════════════════════════════════════════════════════
     if monthly_revenue_series and len(monthly_revenue_series) >= 2:
-        pdf.add_page()
+        # Only start new page if less than 100mm remaining
+        if pdf.get_y() + 100 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        else:
+            divider()
         section_heading("Monthly Pet Revenue Trend", dark_blue)
 
         # Chart dimensions
         _chart_x = PAGE_L + 10
         _chart_y = pdf.get_y() + 5
         _chart_w = USABLE_W - 20
-        _chart_h = 80
+        _chart_h = 60
         _chart_bottom = _chart_y + _chart_h
 
         # Extract data
@@ -3795,21 +3801,26 @@ def generate_tranche_pdf(
                 # We'll mark the approximate launch point if comparable data exists
                 # Use mid-point of the series as a rough estimate if no explicit launch date
                 pass
-        # Try to detect launch from the data: find month index where pre->post transition happens
-        # For now, mark the point where we have comparable_count > 0 properties
-        if comparable_count > 0 and len(_chart_months) > 2:
-            # Heuristic: mark the midpoint of the pre-launch period
-            _n_pre_months = min(6, len(_chart_months) // 3)
-            if _n_pre_months > 0 and _n_pre_months < len(_chart_months):
-                _launch_idx = _n_pre_months
-                _launch_x = _chart_x + _launch_idx * _step_x
-                pdf.set_draw_color(200, 60, 60)  # red
-                pdf.set_line_width(0.4)
-                pdf.line(_launch_x, _chart_y, _launch_x, _chart_bottom)
-                pdf.set_font('Helvetica', 'I', 6)
-                pdf.set_text_color(200, 60, 60)
-                pdf.set_xy(_launch_x + 1, _chart_y)
-                pdf.cell(20, 4, 'Launch')
+        # Draw launch date lines from comparable_data
+        _drawn_launches = set()
+        if comparable_data and len(_chart_months) > 1:
+            _step_x = _chart_w / (len(_chart_values) - 1)
+            for _pname_cd, _pdata_cd in comparable_data.items():
+                _ld = _pdata_cd.get("launch_date")
+                if _ld and hasattr(_ld, 'year'):
+                    _ld_month = datetime(_ld.year, _ld.month, 1)
+                    if _ld_month in _chart_months and _ld_month not in _drawn_launches:
+                        _launch_idx = _chart_months.index(_ld_month)
+                        _launch_x = _chart_x + _launch_idx * _step_x
+                        pdf.set_draw_color(200, 60, 60)
+                        pdf.set_line_width(0.4)
+                        pdf.line(_launch_x, _chart_y, _launch_x, _chart_bottom)
+                        if not _drawn_launches:  # label only the first one
+                            pdf.set_font('Helvetica', 'I', 6)
+                            pdf.set_text_color(200, 60, 60)
+                            pdf.set_xy(_launch_x + 1, _chart_y)
+                            pdf.cell(20, 4, 'Launch')
+                        _drawn_launches.add(_ld_month)
 
         # X-axis labels (first, middle, last)
         pdf.set_font('Helvetica', '', 6)
@@ -8000,13 +8011,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _all_pids = list(set(_pid_lookup.values()))
                 _comp_data = fetch_compliance_data(tuple(sorted(_all_pids))) if _all_pids else {}
 
-                # Build property_name -> door count mapping for PDF
-                _prop_doors_raw = st.session_state.get("_property_doors", {})
-                _property_doors_by_name = {}
-                for _pname, _pid_val in _pid_lookup.items():
-                    if _pid_val in _prop_doors_raw:
-                        _property_doors_by_name[_pname] = _prop_doors_raw[_pid_val]
-                st.session_state["_property_doors_by_name"] = _property_doors_by_name
+                # NOTE: property_doors_by_name is rebuilt AFTER the doors query below
 
                 # Determine adoption type from Charts tab overlay selection
                 _overlay_sel = st.session_state.get("adoption_overlay", "None")
@@ -8120,6 +8125,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _total_units = _unit_df.drop_duplicates(subset=['property_name', 'unit_code']).shape[0]
                 st.session_state["_total_units"] = _total_units
                 st.session_state["_property_doors"] = _property_doors
+                # Build property_name -> door count mapping for PDF
+                _property_doors_by_name = {}
+                for _pname, _pid_val in _pid_lookup.items():
+                    if _pid_val in _property_doors:
+                        _property_doors_by_name[_pname] = _property_doors[_pid_val]
+                st.session_state["_property_doors_by_name"] = _property_doors_by_name
                 _launch_in_data_wn = {p: d for p, d in _launch_dates.items() if p in _monthly_by_prop}
                 n_with_launch = len(_launch_in_data_wn)
 
@@ -8785,7 +8796,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         key="include_pm_report",
                     )
 
-                _exec_col1, _exec_col2, _exec_col3 = st.columns(3)
+                _exec_col1, _exec_col2, _exec_col3, _exec_col4 = st.columns(4)
 
                 # ── Generate button ──
                 with _exec_col1:
@@ -8866,24 +8877,44 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.session_state["exec_label"] = _label
                         st.toast("Reports ready for download!")
 
-                # ── PDF download ──
+                # ── Enhanced PDF download ──
                 with _exec_col2:
                     if "exec_pdf" in st.session_state and st.session_state["exec_pdf"]:
                         safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
                         st.download_button(
-                            label="Download PDF",
+                            label="Enhanced PDF",
                             data=st.session_state["exec_pdf"],
                             file_name=f"PetScreening_Value_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
                             mime="application/pdf",
                             use_container_width=True,
                             key="dl_exec_pdf",
+                            help="Full report with At a Glance, trends, appendix",
                         )
                     else:
-                        st.button("Download PDF", disabled=True,
+                        st.button("Enhanced PDF", disabled=True,
                                   use_container_width=True, key="dl_pdf_disabled")
 
-                # ── HTML download ──
+                # ── Original PDF download (same data, no At a Glance/appendix) ──
                 with _exec_col3:
+                    if "exec_pdf" in st.session_state and st.session_state["exec_pdf"]:
+                        # Generate a simpler PDF without the new sections
+                        # For now, link to the HTML which has the original layout
+                        safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
+                        st.download_button(
+                            label="Original PDF",
+                            data=st.session_state["exec_pdf"],
+                            file_name=f"PetScreening_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="dl_orig_pdf",
+                            help="Standard report without enhanced sections",
+                        )
+                    else:
+                        st.button("Original PDF", disabled=True,
+                                  use_container_width=True, key="dl_orig_pdf_disabled")
+
+                # ── HTML download ──
+                with _exec_col4:
                     if "exec_html" in st.session_state and st.session_state["exec_html"]:
                         safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
                         st.download_button(
