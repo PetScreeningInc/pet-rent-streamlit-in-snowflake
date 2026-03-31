@@ -2923,6 +2923,9 @@ def generate_tranche_pdf(
     su_total_profiles=0, su_current_mo=0, total_projected=0,
     missing_rent_data=None, total_units=0,
     comparable_data=None,
+    total_portfolio_units=0,
+    property_doors=None,
+    monthly_revenue_series=None,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -2955,7 +2958,7 @@ def generate_tranche_pdf(
             self.set_y(-15)
             self.set_font('Helvetica', 'I', 8)
             self.set_text_color(150, 150, 150)
-            _gen_ts = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+            _gen_ts = datetime.now().strftime("%B %d, %Y at %I:%M %p") + " ET"
             self.cell(0, 10, f'PetScreening Value Report  |  {label}  |  Page {self.page_no()}  |  Generated {_gen_ts}', align='C')
 
     pdf = PDF()
@@ -3100,12 +3103,31 @@ def generate_tranche_pdf(
             return (160, 160, 160)  # gray for N/A
         return green if val >= 0 else orange
 
+    # ── Helper: format large currency values with K/M suffixes ──
+    def _format_large_currency(val):
+        """Format a currency value with K/M suffix for readability."""
+        if val is None or val == 0:
+            return "$0"
+        sign = "-" if val < 0 else ""
+        val = abs(val)
+        if val >= 1_000_000:
+            return f"{sign}${val / 1_000_000:,.1f}M"
+        elif val >= 100_000:
+            return f"{sign}${val / 1_000:,.0f}K"
+        else:
+            return f"{sign}${val:,.0f}"
+
     # ═══════════════════════════════════════════════════════════
     #  PAGE 1: AT A GLANCE
     # ═══════════════════════════════════════════════════════════
     _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
     _simple_increase = current_monthly_rev - pre_baseline if comparable_count > 0 else 0
     _simple_pct = (_simple_increase / pre_baseline * 100) if pre_baseline > 0 and comparable_count > 0 else 0
+    _monthly_lift = t1_mo if comparable_count > 0 else 0
+    _lift_per_unit = _monthly_lift / total_units if total_units and total_units > 0 and _monthly_lift else 0
+    _annual_lift = _monthly_lift * 12
+    _cap_rate = 0.05
+    _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
 
     # Title
     pdf.set_font('Helvetica', 'B', 14)
@@ -3118,98 +3140,177 @@ def generate_tranche_pdf(
     pdf.set_line_width(0.2)
     pdf.ln(6)
 
-    # Big KPI cards — 2 rows of 2-3 cards
-    _glance_row1 = [
-        {
-            "value": f"${current_monthly_rev:,.0f}/mo",
-            "label": "Pet Fee Revenue (Current)",
-            "sub": f"Sum of pet fee charges across {n_props_with_data} properties",
-            "color": dark_blue,
-        },
-    ]
-    if comparable_count > 0 and _simple_increase != 0:
-        _inc_sign = "+" if _simple_increase > 0 else ""
-        _glance_row1.append({
-            "value": f"{_inc_sign}${_simple_increase:,.0f}/mo",
-            "label": "Revenue Increase Since PS",
-            "sub": f"{_simple_pct:+.1f}% vs pre-launch baseline",
-            "color": green if _simple_increase > 0 else orange,
-        })
-    if _opp_recurring_mo > 0 and t2_tenants > 0:
-        _glance_row1.append({
-            "value": f"${_opp_recurring_mo:,.0f}/mo",
-            "label": "Revenue Left on Table",
-            "sub": f"{t2_tenants:,} tenants not paying pet rent",
-            "color": orange,
-        })
+    # ── Narrative paragraph mirroring Eduardo's Slack pitch ──
+    _glance_parts = []
+    if total_units and total_units > 0 and comparable_count > 0:
+        _glance_parts.append(
+            f"Across {label}'s {total_units:,} live units, average monthly pet revenue "
+            f"before PetScreening was ${pre_baseline:,.0f}/mo."
+        )
+        _glance_parts.append(
+            f" As of the most recently completed month, that figure has grown to "
+            f"${current_monthly_rev:,.0f}/mo, a ${_monthly_lift:,.0f} monthly lift, or roughly "
+            f"${_lift_per_unit:,.2f} per unit per month."
+        )
+        if _asset_value_impact > 0:
+            _glance_parts.append(
+                f" Capitalized at a 5% cap rate, the existing {total_units:,} units represent "
+                f"a ~${_asset_value_impact:,.0f} increase in asset value."
+            )
     elif comparable_count > 0:
+        _glance_parts.append(
+            f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
+            f"across {n_props_with_data} properties."
+        )
+        if _simple_increase > 0:
+            _glance_parts.append(
+                f" Since PetScreening launched, revenue is up ${_simple_increase:,.0f}/mo ({_simple_pct:+.1f}%)."
+            )
+    else:
+        _glance_parts.append(
+            f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
+            f"across {n_props_with_data} properties."
+        )
+    narrative("".join(_glance_parts))
+
+    pdf.ln(2)
+
+    # ── KPI cards -- row 1: core metrics ──
+    _glance_row1 = []
+    if total_units and total_units > 0:
         _glance_row1.append({
-            "value": "$0/mo",
-            "label": "Revenue Left on Table",
-            "sub": "All screened tenants paying",
-            "color": green,
-        })
-    # Pad to 3 if needed
-    while len(_glance_row1) < 3:
-        if total_units and total_units > 0 and _rev_per_unit > 0:
-            _glance_row1.append({
-                "value": f"${_rev_per_unit:,.2f}/mo",
-                "label": "Revenue per Unit",
-                "sub": f"{total_units:,} total units",
-                "color": dark_blue,
-            })
-        else:
-            _glance_row1.append({
-                "value": f"{n_props_with_data}",
-                "label": "Properties Analyzed",
-                "sub": f"of {n_props_total} total",
-                "color": dark_blue,
-            })
-        break
-
-    draw_card_row(_glance_row1)
-    pdf.ln(1)
-
-    # Second row for remaining metrics
-    _glance_row2 = []
-    if total_units and total_units > 0 and _rev_per_unit > 0 and not any("Revenue per Unit" in c.get("label", "") for c in _glance_row1):
-        _glance_row2.append({
-            "value": f"${_rev_per_unit:,.2f}/mo",
-            "label": "Revenue per Unit",
-            "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
+            "value": f"{total_units:,}",
+            "label": "Live Units",
+            "sub": f"Across {n_props_with_data} properties",
             "color": dark_blue,
         })
-    if not any("Properties" in c.get("label", "") for c in _glance_row1):
-        _glance_row2.append({
+    else:
+        _glance_row1.append({
             "value": f"{n_props_with_data}",
             "label": "Properties Analyzed",
             "sub": f"of {n_props_total} total",
             "color": dark_blue,
         })
-    if total_units and total_units > 0 and not any("Unit" in c.get("label", "") for c in _glance_row2) and not any("Revenue per Unit" in c.get("label", "") for c in _glance_row1):
+
+    _glance_row1.append({
+        "value": f"${pre_baseline:,.0f}/mo" if comparable_count > 0 and pre_baseline > 0 else "--",
+        "label": "Pre-PS Revenue",
+        "sub": "Avg monthly baseline before launch" if comparable_count > 0 else None,
+        "color": dark_blue,
+    })
+    _glance_row1.append({
+        "value": f"${current_monthly_rev:,.0f}/mo",
+        "label": "Current Revenue",
+        "sub": "Most recently completed month",
+        "color": dark_blue,
+    })
+    draw_card_row(_glance_row1)
+    pdf.ln(1)
+
+    # ── KPI cards -- row 2: lift + per-unit + cap rate ──
+    _glance_row2 = []
+    if comparable_count > 0 and _monthly_lift != 0:
+        _lift_sign = "+" if _monthly_lift > 0 else ""
         _glance_row2.append({
-            "value": f"{total_units:,}",
-            "label": "Total Units",
-            "sub": None,
+            "value": f"{_lift_sign}${_monthly_lift:,.0f}/mo",
+            "label": "Monthly Lift",
+            "sub": f"{t1_pct:+.1f}% vs baseline" if t1_pct != 0 else None,
+            "color": green if _monthly_lift > 0 else orange,
+        })
+    if total_units and total_units > 0 and _lift_per_unit != 0:
+        _lpu_sign = "+" if _lift_per_unit > 0 else ""
+        _glance_row2.append({
+            "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
+            "label": "Lift per Unit",
+            "sub": f"${_monthly_lift:,.0f} / {total_units:,} units",
+            "color": green if _lift_per_unit > 0 else orange,
+        })
+    elif total_units and total_units > 0 and _rev_per_unit > 0:
+        _glance_row2.append({
+            "value": f"${_rev_per_unit:,.2f}/unit/mo",
+            "label": "Revenue per Unit",
+            "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
             "color": dark_blue,
         })
+    if _asset_value_impact > 0:
+        _avi_str = _format_large_currency(_asset_value_impact)
+        _glance_row2.append({
+            "value": _avi_str,
+            "label": "Est. Asset Value Impact",
+            "sub": f"${_monthly_lift:,.0f}/mo x 12 / 5% cap rate",
+            "color": green,
+        })
+
+    # Pad row 2 to 3 cards
+    while len(_glance_row2) < 3:
+        if _opp_recurring_mo > 0 and t2_tenants > 0:
+            _glance_row2.append({
+                "value": f"${_opp_recurring_mo:,.0f}/mo",
+                "label": "Revenue Left on Table",
+                "sub": f"{t2_tenants:,} tenants not paying pet rent",
+                "color": orange,
+            })
+        else:
+            _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+        break
 
     if _glance_row2:
-        # Pad to 3
-        while len(_glance_row2) < 3:
-            _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
         draw_card_row(_glance_row2)
 
-    pdf.ln(3)
+    pdf.ln(2)
 
-    # One-sentence summary
-    _glance_parts = []
-    _glance_parts.append(f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue across {n_props_with_data} properties.")
-    if comparable_count > 0 and _simple_increase > 0:
-        _glance_parts.append(f" Since PetScreening launched, revenue is up ${_simple_increase:,.0f}/mo ({_simple_pct:+.1f}%).")
-    if _opp_recurring_mo > 0 and t2_tenants > 0:
-        _glance_parts.append(f" An additional ${_opp_recurring_mo:,.0f}/mo is going uncollected from {t2_tenants:,} tenants who have completed screening but are not being charged.")
-    narrative("".join(_glance_parts))
+    # ── Cap rate callout box (if we have a lift) ──
+    if _asset_value_impact > 0:
+        callout_box(
+            f"Estimated Asset Value Impact: ${_asset_value_impact:,.0f} "
+            f"(${_monthly_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION
+    # ═══════════════════════════════════════════════════════════
+    if total_portfolio_units and total_portfolio_units > 0 and _lift_per_unit != 0 and _lift_per_unit > 0:
+        pdf.ln(4)
+        section_heading("How This Scales", green)
+
+        _proj_monthly = _lift_per_unit * total_portfolio_units
+        _proj_annual = _proj_monthly * 12
+        _proj_asset_value = _proj_annual / _cap_rate
+
+        _scale_text = (
+            f"If {label} were to roll PetScreening across their full portfolio of "
+            f"~{total_portfolio_units:,} units, that same ${_lift_per_unit:,.2f}/unit/mo lift "
+            f"would translate to approximately ${_proj_annual:,.0f}/yr in additional pet fee revenue. "
+            f"Capitalized at a 5% cap rate, that represents ~${_proj_asset_value:,.0f} in added asset value."
+        )
+        narrative(_scale_text)
+
+        pdf.ln(2)
+        draw_card_row([
+            {
+                "value": f"~{total_portfolio_units:,}",
+                "label": "Total Portfolio Units",
+                "sub": "Full portfolio rollout target",
+                "color": dark_blue,
+            },
+            {
+                "value": f"${_proj_annual:,.0f}/yr",
+                "label": "Projected Annual Lift",
+                "sub": f"${_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units x 12",
+                "color": green,
+            },
+            {
+                "value": _format_large_currency(_proj_asset_value),
+                "label": "Projected Asset Value Impact",
+                "sub": f"${_proj_annual:,.0f}/yr at 5% cap rate",
+                "color": green,
+            },
+        ])
+
+        show_work(
+            f"Per-unit lift: ${_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units "
+            f"= ${_proj_monthly:,.0f}/mo x 12 = ${_proj_annual:,.0f}/yr / 0.05 = ${_proj_asset_value:,.0f}"
+        )
 
     # Force new page for detailed sections
     pdf.add_page()
@@ -3450,9 +3551,16 @@ def generate_tranche_pdf(
     metrics.append(("Current Monthly Pet-Related Revenue", f"${current_monthly_rev:,.0f}/mo", None))
     if comparable_count > 0 and t1_mo != 0:
         _t1_sign_m = "+" if t1_mo > 0 else ""
-        metrics.append(("Simple Revenue Change", f"{'+' if (current_monthly_rev - pre_baseline) > 0 else ''}${current_monthly_rev - pre_baseline:,.0f}/mo", lift_color(current_monthly_rev - pre_baseline)))
+        _simple_chg = current_monthly_rev - pre_baseline
+        _simple_chg_sign = "+" if _simple_chg > 0 else ""
+        metrics.append(("Simple Revenue Change", f"{_simple_chg_sign}${_simple_chg:,.0f}/mo", lift_color(_simple_chg)))
         metrics.append(("Adjusted Monthly Lift", f"{_t1_sign_m}${t1_mo:,.0f}/mo", lift_color(t1_mo)))
         metrics.append(("Cumulative Revenue Impact", f"${t1_total:,.0f}", lift_color(t1_total)))
+        _annual_lift_m = t1_mo * 12
+        metrics.append(("Annualized Lift", f"${_annual_lift_m:,.0f}/yr", lift_color(_annual_lift_m)))
+        if _annual_lift_m > 0:
+            _avi_m = _annual_lift_m / 0.05
+            metrics.append(("Est. Asset Value Impact (5% Cap)", _format_large_currency(_avi_m), green))
     if t2_tenants > 0:
         metrics.append(("Tenants Not Paying Pet Rent", f"{t2_tenants:,}", orange))
         metrics.append(("Uncollected Revenue", f"${_opp_recurring_mo:,.0f}/mo", orange))
@@ -3469,7 +3577,7 @@ def generate_tranche_pdf(
         metrics.append(("Total Units", f"{total_units:,}", None))
         if current_monthly_rev and total_units > 0:
             _rev_per_unit_m = current_monthly_rev / total_units
-            metrics.append(("Pet Revenue per Unit", f"${_rev_per_unit_m:,.2f}/mo", None))
+            metrics.append(("Pet Revenue per Unit", f"${_rev_per_unit_m:,.2f}/unit/mo", None))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
 
@@ -3523,6 +3631,7 @@ def generate_tranche_pdf(
     # ═══════════════════════════════════════════════════════════
     #  PROPERTY-LEVEL IMPACT TABLE
     # ═══════════════════════════════════════════════════════════
+    _doors_dict = property_doors if property_doors else {}
     if comparable_data and len(comparable_data) > 0:
         pdf.add_page()
         section_heading("Impact by Property", dark_blue)
@@ -3532,9 +3641,9 @@ def generate_tranche_pdf(
             "Lift = Post Avg - Pre Avg. Cumulative = total post revenue minus projected baseline."
         )
 
-        # Table header
-        _col_widths = [55, 25, 25, 25, 25, 14, 11]  # total = 180
-        _col_headers = ['Property', 'Pre Avg', 'Post Avg', 'Lift ($/mo)', 'Cumul.', 'Lift %', 'Mo']
+        # Table header — with Units and Lift/Unit columns
+        _col_widths = [42, 14, 22, 22, 22, 18, 22, 9, 9]  # total = 180
+        _col_headers = ['Property', 'Units', 'Pre Avg', 'Post Avg', 'Lift/mo', 'Lift/Unit', 'Cumul.', '%', 'Mo']
         pdf.set_fill_color(249, 244, 230)
         pdf.set_draw_color(*card_border)
         pdf.set_font('Helvetica', 'B', 7)
@@ -3571,40 +3680,167 @@ def generate_tranche_pdf(
             _adj = pdata.get("diff_monthly", 0)
             _cum = pdata.get("diff_total", 0)
             _npost = pdata.get("n_post", 0)
+            _prop_units = _doors_dict.get(prop_name, 0)
+            _lift_per_u = _adj / _prop_units if _prop_units > 0 else 0
 
             # Truncate property name
             _short_name = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
-            _short_name = _short_name[:30]
+            _short_name = _short_name[:24]
 
             pdf.set_text_color(*body_gray)
             pdf.cell(_col_widths[0], 5, f' {_short_name}', border='LR', fill=True)
 
+            # Units column
             pdf.set_text_color(*dark_blue)
-            pdf.cell(_col_widths[1], 5, f' ${_pre:,.0f}/mo', border='LR', fill=True)
-            pdf.cell(_col_widths[2], 5, f' ${_post:,.0f}/mo', border='LR', fill=True)
+            _units_str = str(_prop_units) if _prop_units > 0 else "--"
+            pdf.cell(_col_widths[1], 5, f' {_units_str}', border='LR', fill=True)
+
+            pdf.cell(_col_widths[2], 5, f' ${_pre:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[3], 5, f' ${_post:,.0f}', border='LR', fill=True)
 
             # Color-code lift
             pdf.set_text_color(*lift_color(_adj))
             _adj_sign = "+" if _adj > 0 else ""
-            pdf.cell(_col_widths[3], 5, f' {_adj_sign}${_adj:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[4], 5, f' {_adj_sign}${_adj:,.0f}', border='LR', fill=True)
+
+            # Lift per unit
+            pdf.set_text_color(*lift_color(_lift_per_u))
+            if _prop_units > 0:
+                _lpu_sign = "+" if _lift_per_u > 0 else ""
+                pdf.cell(_col_widths[5], 5, f' {_lpu_sign}${_lift_per_u:,.2f}', border='LR', fill=True)
+            else:
+                pdf.set_text_color(160, 160, 160)
+                pdf.cell(_col_widths[5], 5, ' --', border='LR', fill=True)
 
             # Color-code cumulative
             pdf.set_text_color(*lift_color(_cum))
             _cum_sign = "+" if _cum > 0 else ""
-            pdf.cell(_col_widths[4], 5, f' {_cum_sign}${_cum:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[6], 5, f' {_cum_sign}${_cum:,.0f}', border='LR', fill=True)
 
             # Lift %
             _lift_pct = (((_post - _pre) / _pre) * 100) if _pre > 0 else 0
             pdf.set_text_color(*lift_color(_lift_pct))
             _pct_sign = "+" if _lift_pct > 0 else ""
-            pdf.cell(_col_widths[5], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
+            pdf.cell(_col_widths[7], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
 
             pdf.set_text_color(*body_gray)
-            pdf.cell(_col_widths[6], 5, f' {_npost}', border='LR', fill=True)
+            pdf.cell(_col_widths[8], 5, f' {_npost}', border='LR', fill=True)
             pdf.ln()
 
         # Close table
         pdf.cell(sum(_col_widths), 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  MONTHLY REVENUE TREND CHART
+    # ═══════════════════════════════════════════════════════════
+    if monthly_revenue_series and len(monthly_revenue_series) >= 2:
+        pdf.add_page()
+        section_heading("Monthly Pet Revenue Trend", dark_blue)
+
+        # Chart dimensions
+        _chart_x = PAGE_L + 10
+        _chart_y = pdf.get_y() + 5
+        _chart_w = USABLE_W - 20
+        _chart_h = 80
+        _chart_bottom = _chart_y + _chart_h
+
+        # Extract data
+        _chart_months = [item[0] for item in monthly_revenue_series]
+        _chart_values = [item[1] for item in monthly_revenue_series]
+        _max_val = max(_chart_values) if _chart_values else 1
+        _min_val = 0
+
+        # Draw axes
+        pdf.set_draw_color(180, 180, 180)
+        pdf.set_line_width(0.3)
+        pdf.line(_chart_x, _chart_y, _chart_x, _chart_bottom)  # Y axis
+        pdf.line(_chart_x, _chart_bottom, _chart_x + _chart_w, _chart_bottom)  # X axis
+
+        # Y-axis labels (4 ticks)
+        pdf.set_font('Helvetica', '', 6)
+        pdf.set_text_color(140, 140, 140)
+        for i in range(5):
+            _tick_val = _max_val * (4 - i) / 4
+            _tick_y = _chart_y + (_chart_h * i / 4)
+            pdf.set_draw_color(230, 230, 230)
+            pdf.set_line_width(0.1)
+            pdf.line(_chart_x, _tick_y, _chart_x + _chart_w, _tick_y)  # grid line
+            pdf.set_xy(_chart_x - 25, _tick_y - 2)
+            pdf.cell(24, 4, _format_large_currency(_tick_val), align='R')
+
+        # Plot the line
+        if len(_chart_values) > 1:
+            _step_x = _chart_w / (len(_chart_values) - 1)
+            pdf.set_draw_color(*dark_blue)
+            pdf.set_line_width(0.6)
+            for i in range(len(_chart_values) - 1):
+                _x1 = _chart_x + i * _step_x
+                _y1 = _chart_bottom - ((_chart_values[i] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
+                _x2 = _chart_x + (i + 1) * _step_x
+                _y2 = _chart_bottom - ((_chart_values[i + 1] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
+                pdf.line(_x1, _y1, _x2, _y2)
+
+            # Draw data points as small circles
+            pdf.set_fill_color(*dark_blue)
+            for i in range(len(_chart_values)):
+                _px = _chart_x + i * _step_x
+                _py = _chart_bottom - ((_chart_values[i] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
+                pdf.ellipse(_px - 0.8, _py - 0.8, 1.6, 1.6, 'F')
+
+        # Find and draw launch date line (find earliest launch that falls in chart range)
+        _launch_month = None
+        if comparable_data:
+            # The launch analysis data has launch dates; find the earliest one in our series
+            for _cm in _chart_months:
+                # We'll mark the approximate launch point if comparable data exists
+                # Use mid-point of the series as a rough estimate if no explicit launch date
+                pass
+        # Try to detect launch from the data: find month index where pre->post transition happens
+        # For now, mark the point where we have comparable_count > 0 properties
+        if comparable_count > 0 and len(_chart_months) > 2:
+            # Heuristic: mark the midpoint of the pre-launch period
+            _n_pre_months = min(6, len(_chart_months) // 3)
+            if _n_pre_months > 0 and _n_pre_months < len(_chart_months):
+                _launch_idx = _n_pre_months
+                _launch_x = _chart_x + _launch_idx * _step_x
+                pdf.set_draw_color(200, 60, 60)  # red
+                pdf.set_line_width(0.4)
+                pdf.line(_launch_x, _chart_y, _launch_x, _chart_bottom)
+                pdf.set_font('Helvetica', 'I', 6)
+                pdf.set_text_color(200, 60, 60)
+                pdf.set_xy(_launch_x + 1, _chart_y)
+                pdf.cell(20, 4, 'Launch')
+
+        # X-axis labels (first, middle, last)
+        pdf.set_font('Helvetica', '', 6)
+        pdf.set_text_color(140, 140, 140)
+        _label_indices = [0]
+        if len(_chart_months) > 2:
+            _label_indices.append(len(_chart_months) // 2)
+        _label_indices.append(len(_chart_months) - 1)
+        for idx in _label_indices:
+            _lx = _chart_x + idx * (_chart_w / max(len(_chart_months) - 1, 1))
+            _m = _chart_months[idx]
+            _m_label = _m.strftime("%b %y") if hasattr(_m, 'strftime') else str(_m)[:7]
+            pdf.set_xy(_lx - 8, _chart_bottom + 1)
+            pdf.cell(16, 4, _m_label, align='C')
+
+        # Label first and current values
+        if _chart_values:
+            pdf.set_font('Helvetica', 'B', 6)
+            pdf.set_text_color(*dark_blue)
+            # First month value
+            _first_y = _chart_bottom - ((_chart_values[0] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
+            pdf.set_xy(_chart_x + 1, _first_y - 5)
+            pdf.cell(20, 4, f'${_chart_values[0]:,.0f}')
+            # Current month value
+            _last_x = _chart_x + (len(_chart_values) - 1) * (_chart_w / max(len(_chart_values) - 1, 1))
+            _last_y = _chart_bottom - ((_chart_values[-1] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
+            pdf.set_xy(_last_x - 20, _last_y - 5)
+            pdf.cell(20, 4, f'${_chart_values[-1]:,.0f}', align='R')
+
+        pdf.set_y(_chart_bottom + 10)
+        pdf.set_line_width(0.2)
 
     # ═══════════════════════════════════════════════════════════
     #  MISSING RENT APPENDIX — TENANT LIST
@@ -3690,7 +3926,7 @@ def generate_tranche_pdf(
     _cov_y = pdf.get_y()
     pdf.set_fill_color(245, 248, 250)
     pdf.set_draw_color(180, 190, 200)
-    pdf.rect(PAGE_L, _cov_y, USABLE_W, 22, 'DF')
+    pdf.rect(PAGE_L, _cov_y, USABLE_W, 26, 'DF')
     pdf.set_font('Helvetica', 'B', 9)
     pdf.set_text_color(*dark_blue)
     pdf.set_xy(PAGE_L + 4, _cov_y + 2)
@@ -3700,8 +3936,10 @@ def generate_tranche_pdf(
     pdf.set_x(PAGE_L + 4)
     pdf.cell(0, 4, f'Data covers {n_props_with_data} of {n_props_total} properties ({_coverage_pct:.0f}%)', ln=True)
     pdf.set_x(PAGE_L + 4)
-    _gen_ts_cov = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-    pdf.cell(0, 4, f'Data pulled via Yardi API on {today_str}  |  Report generated {_gen_ts_cov}', ln=True)
+    pdf.cell(0, 4, f'Data as of {today_str}', ln=True)
+    pdf.set_x(PAGE_L + 4)
+    _gen_ts_cov = datetime.now().strftime("%B %d, %Y at %I:%M %p") + " ET"
+    pdf.cell(0, 4, f'Report generated {_gen_ts_cov}', ln=True)
     # List excluded properties if we can infer them
     if n_props_with_data < n_props_total:
         _excluded_count = n_props_total - n_props_with_data
@@ -3709,7 +3947,7 @@ def generate_tranche_pdf(
         pdf.set_font('Helvetica', 'I', 7)
         pdf.set_text_color(140, 140, 140)
         pdf.cell(0, 4, f'{_excluded_count} properties excluded due to insufficient charge data.', ln=True)
-    pdf.set_y(_cov_y + 26)
+    pdf.set_y(_cov_y + 30)
 
     section_heading("Methodology", dark_blue)
 
@@ -3723,9 +3961,12 @@ def generate_tranche_pdf(
     narrative(
         "Pet Revenue Change Since PetScreening: For each property with a known launch "
         "date, we compare the average monthly pet fee revenue in the post-launch period "
-        "to the pre-launch baseline using a 6-and-6 methodology: up to 6 months of "
-        "pre-launch data as the baseline, compared against ALL completed post-launch months. "
-        "The monthly lift = cumulative impact / number of completed post months. "
+        "to the pre-launch baseline. The pre-launch baseline uses up to 6 months of "
+        "charge data before the launch date. The post-launch average includes ALL "
+        "completed post-launch months (the current partial month is excluded). "
+        "Monthly lift = post-launch average minus pre-launch average. "
+        "Cumulative impact = total post-launch revenue minus (pre-launch average x "
+        "number of completed post-launch months). "
         "The portfolio-level change is the sum of each comparable property's monthly lift."
     )
 
@@ -5616,6 +5857,16 @@ with st.sidebar:
     # Set a large default; the actual window will be clamped to the
     # earliest charge date once data is loaded.
     lookback_months = 120  # 10 years — effectively "all data"
+
+    st.divider()
+
+    # ── Total Portfolio Units (for value extrapolation in PDF) ──
+    _total_portfolio_units = st.number_input(
+        "Total Portfolio Units (optional)",
+        min_value=0, value=st.session_state.get("_total_portfolio_units", 0), step=100,
+        help="Enter the total units across the full portfolio for value extrapolation in the PDF report."
+    )
+    st.session_state["_total_portfolio_units"] = _total_portfolio_units
 
     st.divider()
 
@@ -7749,6 +8000,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _all_pids = list(set(_pid_lookup.values()))
                 _comp_data = fetch_compliance_data(tuple(sorted(_all_pids))) if _all_pids else {}
 
+                # Build property_name -> door count mapping for PDF
+                _prop_doors_raw = st.session_state.get("_property_doors", {})
+                _property_doors_by_name = {}
+                for _pname, _pid_val in _pid_lookup.items():
+                    if _pid_val in _prop_doors_raw:
+                        _property_doors_by_name[_pname] = _prop_doors_raw[_pid_val]
+                st.session_state["_property_doors_by_name"] = _property_doors_by_name
+
                 # Determine adoption type from Charts tab overlay selection
                 _overlay_sel = st.session_state.get("adoption_overlay", "None")
                 if _overlay_sel == "Resident Adoption %":
@@ -7829,34 +8088,38 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 n_props_with_data = len(_monthly_by_prop)
                 # Calculate total units — prefer Snowflake QBR data, fall back to charge data
                 _total_units = 0
-                _units_from_qbr = False
+                _property_doors = {}  # {PROPERTY_ID: door_count}
+                _units_from_doors = False
                 try:
                     _pid_list = [int(p) for p in st.session_state.get("property_ids", []) if str(p).strip()]
                     if _pid_list:
-                        _qbr_conn = get_snowflake_connection()
-                        _qbr_cur = _qbr_conn.cursor(snowflake.connector.DictCursor)
-                        _qbr_ids = ", ".join(str(p) for p in _pid_list)
-                        _qbr_cur.execute(f"""
-                            SELECT PROPERTY_ID, MAX(TOTAL_UNITS) AS TOTAL_UNITS
-                            FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
-                            WHERE PROPERTY_ID IN ({_qbr_ids})
-                              AND TOTAL_UNITS > 0
-                            GROUP BY PROPERTY_ID
+                        _doors_conn = get_snowflake_connection()
+                        _doors_cur = _doors_conn.cursor(snowflake.connector.DictCursor)
+                        _doors_ids = ", ".join(str(p) for p in _pid_list)
+                        _doors_cur.execute(f"""
+                            SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
+                            FROM PROD.COMMON.D_PROPERTIES
+                            WHERE PROPERTY_ID IN ({_doors_ids})
+                              AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
+                              AND PROPERTY_NUMBER_OF_DOORS > 0
                         """)
-                        _qbr_rows = _qbr_cur.fetchall()
-                        _qbr_cur.close()
-                        if _qbr_rows:
-                            _total_units = sum(r["TOTAL_UNITS"] for r in _qbr_rows)
-                            _units_from_qbr = True
+                        _doors_rows = _doors_cur.fetchall()
+                        _doors_cur.close()
+                        if _doors_rows:
+                            for r in _doors_rows:
+                                _property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
+                            _total_units = sum(_property_doors.values())
+                            _units_from_doors = True
                 except Exception:
                     pass
-                if not _units_from_qbr:
+                if not _units_from_doors:
                     # Fall back to unique unit_codes in charge data
                     if 'unit_code' in df.columns and 'property_name' in df.columns:
                         _unit_df = df[df['property_name'].isin(_monthly_by_prop.keys())]
                         _unit_df = _unit_df[_unit_df['unit_code'].notna() & (_unit_df['unit_code'] != '')]
                         _total_units = _unit_df.drop_duplicates(subset=['property_name', 'unit_code']).shape[0]
                 st.session_state["_total_units"] = _total_units
+                st.session_state["_property_doors"] = _property_doors
                 _launch_in_data_wn = {p: d for p, d in _launch_dates.items() if p in _monthly_by_prop}
                 n_with_launch = len(_launch_in_data_wn)
 
@@ -8532,6 +8795,16 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _pm_for_report = _pm_cache if _include_pm_in_report else None
 
                         # Generate PDF
+                        # Build monthly revenue series for PDF chart
+                        _pdf_monthly_series = []
+                        if _months and _monthly_by_prop:
+                            for _m in _months:
+                                _m_total = sum(
+                                    _monthly_by_prop.get(p, {}).get(_m, 0)
+                                    for p in _monthly_by_prop
+                                )
+                                _pdf_monthly_series.append((_m, _m_total))
+
                         pdf_bytes = generate_tranche_pdf(
                             label=_label,
                             today_str=_today_str,
@@ -8555,6 +8828,9 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             missing_rent_data=_mr_data,
                             total_units=st.session_state.get("_total_units", 0),
                             comparable_data=_comparable if _comparable else None,
+                            total_portfolio_units=st.session_state.get("_total_portfolio_units", 0),
+                            property_doors=st.session_state.get("_property_doors_by_name", {}),
+                            monthly_revenue_series=_pdf_monthly_series if _pdf_monthly_series else None,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
