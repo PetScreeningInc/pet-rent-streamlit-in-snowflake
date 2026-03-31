@@ -8852,12 +8852,50 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         # Build monthly revenue series for PDF chart
                         _pdf_monthly_series = []
                         if _months and _monthly_by_prop:
+                            _raw_series = []
                             for _m in _months:
                                 _m_total = sum(
                                     _monthly_by_prop.get(p, {}).get(_m, 0)
                                     for p in _monthly_by_prop
                                 )
-                                _pdf_monthly_series.append((_m, _m_total))
+                                _raw_series.append((_m, _m_total))
+                            # Trim leading and trailing zero-revenue months so the
+                            # chart only shows the range with actual data
+                            _first_nonzero = None
+                            _last_nonzero = None
+                            for _idx, (_m, _v) in enumerate(_raw_series):
+                                if _v > 0:
+                                    if _first_nonzero is None:
+                                        _first_nonzero = _idx
+                                    _last_nonzero = _idx
+                            if _first_nonzero is not None and _last_nonzero is not None:
+                                _trimmed = _raw_series[_first_nonzero:_last_nonzero + 1]
+                            else:
+                                _trimmed = _raw_series
+                            # Fill interior zero months with linear interpolation
+                            # so the line chart doesn't have misleading dips to $0
+                            _pdf_monthly_series = list(_trimmed)
+                            for _i in range(1, len(_pdf_monthly_series) - 1):
+                                if _pdf_monthly_series[_i][1] == 0:
+                                    # Find previous and next non-zero values
+                                    _prev_val = None
+                                    for _j in range(_i - 1, -1, -1):
+                                        if _pdf_monthly_series[_j][1] > 0:
+                                            _prev_val = _pdf_monthly_series[_j][1]
+                                            _prev_idx = _j
+                                            break
+                                    _next_val = None
+                                    for _j in range(_i + 1, len(_pdf_monthly_series)):
+                                        if _pdf_monthly_series[_j][1] > 0:
+                                            _next_val = _pdf_monthly_series[_j][1]
+                                            _next_idx = _j
+                                            break
+                                    if _prev_val is not None and _next_val is not None:
+                                        # Linear interpolation
+                                        _span = _next_idx - _prev_idx
+                                        _frac = (_i - _prev_idx) / _span
+                                        _interp = _prev_val + (_next_val - _prev_val) * _frac
+                                        _pdf_monthly_series[_i] = (_pdf_monthly_series[_i][0], _interp)
 
                         pdf_bytes = generate_tranche_pdf(
                             label=_label,
