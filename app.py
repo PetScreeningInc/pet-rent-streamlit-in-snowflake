@@ -2990,7 +2990,7 @@ def generate_tranche_pdf(
         """
         start_y = pdf.get_y()
         # Check if we need a page break (card row + narrative below ~50mm)
-        if start_y + CARD_H + 25 > pdf.h - pdf.b_margin:
+        if start_y + CARD_H + 10 > pdf.h - pdf.b_margin:
             pdf.add_page()
             start_y = pdf.get_y()
 
@@ -3042,9 +3042,9 @@ def generate_tranche_pdf(
         pdf.set_y(start_y + box_h + 3)
 
     # ── Helper: section heading ──
-    def section_heading(title, color=dark_blue):
+    def section_heading(title, color=dark_blue, min_space=45):
         # Check for page break
-        if pdf.get_y() + 45 > pdf.h - pdf.b_margin:
+        if pdf.get_y() + min_space > pdf.h - pdf.b_margin:
             pdf.add_page()
         pdf.set_font('Helvetica', 'B', 12)
         pdf.set_text_color(*color)
@@ -3175,7 +3175,7 @@ def generate_tranche_pdf(
         )
     narrative("".join(_glance_parts))
 
-    pdf.ln(2)
+    pdf.ln(1)
 
     # ── KPI cards -- row 1: core metrics ──
     _glance_row1 = []
@@ -3308,19 +3308,12 @@ def generate_tranche_pdf(
             f"Combined Est. Value Impact (Actuals + Leakage): "
             f"${_asset_value_impact:,.0f} + ${_leakage_asset_value:,.0f} = ${_combined_asset_value:,.0f}",
             ln=True, align='C')
+    elif _asset_value_impact > 0:
+        # No leakage — show cap rate callout instead
         pdf.ln(1)
-
-    pdf.ln(2)
-
-    # ── Cap rate callout box (if we have a lift) ──
-    # Use combined (actuals + leakage) for asset value impact when leakage exists
-    _display_asset_value = _combined_asset_value if _leakage_mo > 0 and _combined_asset_value > 0 else _asset_value_impact
-    _display_annual = _projected_annual_combined if _leakage_mo > 0 else _annual_lift
-    _display_monthly = _total_combined_mo if _leakage_mo > 0 else _monthly_lift
-    if _display_asset_value > 0:
         callout_box(
-            f"Estimated Asset Value Impact: ${_display_asset_value:,.0f} "
-            f"(${_display_monthly:,.0f}/mo x 12 = ${_display_annual:,.0f}/yr at 5% cap rate)"
+            f"Estimated Asset Value Impact: ${_asset_value_impact:,.0f} "
+            f"(${_monthly_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
         )
 
     # ═══════════════════════════════════════════════════════════
@@ -3329,8 +3322,8 @@ def generate_tranche_pdf(
     # Use combined lift per unit (actuals + leakage) for scaling
     _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
     if total_portfolio_units and total_portfolio_units > 0 and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0:
-        pdf.ln(3)
-        section_heading("How This Scales", green)
+        pdf.ln(2)
+        section_heading("How This Scales", green, min_space=30)
 
         _proj_monthly = _scale_lift_per_unit * total_portfolio_units
         _proj_annual = _proj_monthly * 12
@@ -3345,7 +3338,7 @@ def generate_tranche_pdf(
         )
         narrative(_scale_text)
 
-        pdf.ln(2)
+        pdf.ln(1)
         draw_card_row([
             {
                 "value": f"~{total_portfolio_units:,}",
