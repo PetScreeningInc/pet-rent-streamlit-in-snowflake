@@ -7968,6 +7968,13 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         else:
                             _cc2[(pn, cc)] = "recurring" if _median > 60 else "onetime"
 
+                # Apply user charge-type overrides (same as Charts tab)
+                _user_overrides2 = st.session_state.get("charge_type_overrides", {})
+                if _user_overrides2:
+                    for (pn, cc) in list(_cc2.keys()):
+                        if cc in _user_overrides2:
+                            _cc2[(pn, cc)] = _user_overrides2[cc]
+
                 _monthly_portfolio = defaultdict(float)
                 _monthly_by_prop = defaultdict(lambda: defaultdict(float))
                 for rec in _cd["parsed_charges"]:
@@ -8091,34 +8098,68 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 n_props_total = len(_prop_ids)
                 n_props_with_data = len(_monthly_by_prop)
-                # Calculate total units — prefer Snowflake QBR data, fall back to charge data
+                # Calculate total units — use QBR reporting table (authoritative), fall back to charge data
                 _total_units = 0
                 _property_doors = {}  # {PROPERTY_ID: door_count}
+                _property_doors_by_name = {}  # {PROPERTY_NAME: door_count}
                 _units_from_doors = False
                 try:
+                    # Build list of property names from the data for QBR lookup
+                    _prop_names_for_doors = list(_monthly_by_prop.keys())
                     _pid_list = [int(p) for p in st.session_state.get("property_ids", []) if str(p).strip()]
-                    if _pid_list:
+                    if _prop_names_for_doors or _pid_list:
                         _doors_conn = get_snowflake_connection()
                         _doors_cur = _doors_conn.cursor(snowflake.connector.DictCursor)
-                        _doors_ids = ", ".join(str(p) for p in _pid_list)
-                        _doors_cur.execute(f"""
-                            SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
-                            FROM PROD.COMMON.D_PROPERTIES
-                            WHERE PROPERTY_ID IN ({_doors_ids})
-                              AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
-                              AND PROPERTY_NUMBER_OF_DOORS > 0
-                        """)
-                        _doors_rows = _doors_cur.fetchall()
+
+                        # Primary: QBR reporting table (most accurate unit counts)
+                        if _prop_names_for_doors:
+                            _name_placeholders = ", ".join(["%s"] * len(_prop_names_for_doors))
+                            _doors_cur.execute(f"""
+                                SELECT PROPERTY_NAME, PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
+                                FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
+                                WHERE PROPERTY_NAME IN ({_name_placeholders})
+                                  AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
+                                  AND PROPERTY_NUMBER_OF_DOORS > 0
+                                QUALIFY ROW_NUMBER() OVER (
+                                    PARTITION BY PROPERTY_NAME
+                                    ORDER BY PROPERTY_NUMBER_OF_DOORS DESC
+                                ) = 1
+                            """, _prop_names_for_doors)
+                            _doors_rows = _doors_cur.fetchall()
+                            if _doors_rows:
+                                for r in _doors_rows:
+                                    _pid = int(r["PROPERTY_ID"]) if r.get("PROPERTY_ID") else None
+                                    _num = int(r["NUM_DOORS"])
+                                    _pn = r.get("PROPERTY_NAME", "")
+                                    if _pid:
+                                        _property_doors[_pid] = _num
+                                    if _pn:
+                                        _property_doors_by_name[_pn] = _num
+                                _total_units = sum(_property_doors_by_name.values())
+                                _units_from_doors = True
+
+                        # Fallback: D_PROPERTIES by property_id (less accurate but works)
+                        if not _units_from_doors and _pid_list:
+                            _doors_ids = ", ".join(str(p) for p in _pid_list)
+                            _doors_cur.execute(f"""
+                                SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
+                                FROM PROD.COMMON.D_PROPERTIES
+                                WHERE PROPERTY_ID IN ({_doors_ids})
+                                  AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
+                                  AND PROPERTY_NUMBER_OF_DOORS > 0
+                            """)
+                            _doors_rows = _doors_cur.fetchall()
+                            if _doors_rows:
+                                for r in _doors_rows:
+                                    _property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
+                                _total_units = sum(_property_doors.values())
+                                _units_from_doors = True
+
                         _doors_cur.close()
-                        if _doors_rows:
-                            for r in _doors_rows:
-                                _property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
-                            _total_units = sum(_property_doors.values())
-                            _units_from_doors = True
                 except Exception:
                     pass
                 if not _units_from_doors:
-                    # Fall back to unique unit_codes in charge data
+                    # Last resort: unique unit_codes in charge data
                     if 'unit_code' in df.columns and 'property_name' in df.columns:
                         _unit_df = df[df['property_name'].isin(_monthly_by_prop.keys())]
                         _unit_df = _unit_df[_unit_df['unit_code'].notna() & (_unit_df['unit_code'] != '')]
@@ -8126,10 +8167,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 st.session_state["_total_units"] = _total_units
                 st.session_state["_property_doors"] = _property_doors
                 # Build property_name -> door count mapping for PDF
-                _property_doors_by_name = {}
-                for _pname, _pid_val in _pid_lookup.items():
-                    if _pid_val in _property_doors:
-                        _property_doors_by_name[_pname] = _property_doors[_pid_val]
+                # If QBR query populated _property_doors_by_name directly, use it;
+                # otherwise fall back to pid-based mapping from D_PROPERTIES
+                if not _property_doors_by_name:
+                    for _pname, _pid_val in _pid_lookup.items():
+                        if _pid_val in _property_doors:
+                            _property_doors_by_name[_pname] = _property_doors[_pid_val]
                 st.session_state["_property_doors_by_name"] = _property_doors_by_name
                 _launch_in_data_wn = {p: d for p, d in _launch_dates.items() if p in _monthly_by_prop}
                 n_with_launch = len(_launch_in_data_wn)
