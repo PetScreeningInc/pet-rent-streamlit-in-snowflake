@@ -3259,13 +3259,57 @@ def generate_tranche_pdf(
     if _glance_row2:
         draw_card_row(_glance_row2)
 
+    pdf.ln(1)
+
+    # ── KPI cards -- row 3: Leakage ──
+    # Leakage = confirmed missing rent + suspected undisclosed pets
+    _leakage_mo = _opp_recurring_mo + (su_current_mo or 0)
+    _leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
+    _leakage_per_unit = _leakage_mo / total_units if total_units and total_units > 0 and _leakage_mo > 0 else 0
+    _cumulative_lift_per_unit = _lift_per_unit + _leakage_per_unit  # actuals + leakage
+    _total_combined_mo = _monthly_lift + _leakage_mo  # actuals lift + leakage
+    _projected_annual_combined = _total_combined_mo * 12
+    _combined_asset_value = _projected_annual_combined / _cap_rate if _projected_annual_combined > 0 else 0
+
+    if _leakage_mo > 0:
+        _glance_row3 = []
+        _glance_row3.append({
+            "value": f"${_leakage_mo:,.0f}/mo",
+            "label": "Revenue Leakage",
+            "sub": f"{_leakage_tenants:,} residents not paying pet fees",
+            "color": orange,
+        })
+        if total_units and total_units > 0:
+            _glance_row3.append({
+                "value": f"${_leakage_per_unit:,.2f}/unit/mo",
+                "label": "Leakage per Unit",
+                "sub": f"${_leakage_mo:,.0f} / {total_units:,} units  |  Combined: ${_cumulative_lift_per_unit:,.2f}/unit/mo",
+                "color": orange,
+            })
+        _glance_row3.append({
+            "value": f"${_projected_annual_combined:,.0f}/yr",
+            "label": "Projected Annual Lift",
+            "sub": f"Actuals ${_annual_lift:,.0f} + Leakage ${_leakage_mo * 12:,.0f}",
+            "color": green if _projected_annual_combined > 0 else dark_blue,
+        })
+        # Pad to 3 cards
+        while len(_glance_row3) < 3:
+            _glance_row3.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+
+        draw_card_row(_glance_row3)
+        pdf.ln(1)
+
     pdf.ln(2)
 
     # ── Cap rate callout box (if we have a lift) ──
-    if _asset_value_impact > 0:
+    # Use combined (actuals + leakage) for asset value impact when leakage exists
+    _display_asset_value = _combined_asset_value if _leakage_mo > 0 and _combined_asset_value > 0 else _asset_value_impact
+    _display_annual = _projected_annual_combined if _leakage_mo > 0 else _annual_lift
+    _display_monthly = _total_combined_mo if _leakage_mo > 0 else _monthly_lift
+    if _display_asset_value > 0:
         callout_box(
-            f"Estimated Asset Value Impact: ${_asset_value_impact:,.0f} "
-            f"(${_monthly_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
+            f"Estimated Asset Value Impact: ${_display_asset_value:,.0f} "
+            f"(${_display_monthly:,.0f}/mo x 12 = ${_display_annual:,.0f}/yr at 5% cap rate)"
         )
 
     # ═══════════════════════════════════════════════════════════
