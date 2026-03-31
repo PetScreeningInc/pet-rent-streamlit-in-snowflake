@@ -3789,7 +3789,7 @@ def generate_tranche_pdf(
             # Property name label (left of bars)
             pdf.set_font('Helvetica', '', 6)
             pdf.set_text_color(80, 80, 80)
-            _label_text = _pname[:22] + '…' if len(_pname) > 22 else _pname
+            _label_text = _pname[:22] + '..' if len(_pname) > 22 else _pname
             pdf.set_xy(PAGE_L, _group_y + 1)
             pdf.cell(36, _bar_group_h - 2, _label_text, align='R')
 
