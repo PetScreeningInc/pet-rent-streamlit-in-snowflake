@@ -3735,122 +3735,147 @@ def generate_tranche_pdf(
     # ═══════════════════════════════════════════════════════════
     #  MONTHLY REVENUE TREND CHART (compact, same page if space)
     # ═══════════════════════════════════════════════════════════
-    if monthly_revenue_series and len(monthly_revenue_series) >= 2:
+    # ═══════════════════════════════════════════════════════════
+    #  BEFORE / AFTER BAR CHART — per-property Pre vs Post Avg
+    # ═══════════════════════════════════════════════════════════
+    if comparable_data and len(comparable_data) > 0:
         # Only start new page if less than 100mm remaining
-        if pdf.get_y() + 100 > pdf.h - pdf.b_margin:
+        _ba_needed_h = 20 + max(len(comparable_data) * 12, 40) + 25  # heading + bars + legend
+        if pdf.get_y() + _ba_needed_h > pdf.h - pdf.b_margin:
             pdf.add_page()
         else:
             divider()
-        section_heading("Monthly Pet Revenue Trend", dark_blue)
+        section_heading("Pre vs Post PetScreening Revenue", dark_blue)
+        narrative(
+            "Average monthly pet fee revenue before PetScreening launch vs. after, "
+            "for each comparable property."
+        )
 
-        # Chart dimensions
-        _chart_x = PAGE_L + 10
-        _chart_y = pdf.get_y() + 5
-        _chart_w = USABLE_W - 20
-        _chart_h = 60
-        _chart_bottom = _chart_y + _chart_h
+        # Sort by lift descending (same order as table above)
+        _ba_sorted = sorted(comparable_data.items(), key=lambda x: x[1].get("diff_monthly", 0), reverse=True)
+        _ba_names = [p[0] for p in _ba_sorted]
+        _ba_pre = [p[1].get("pre_avg", 0) for p in _ba_sorted]
+        _ba_post = [p[1].get("post_recent_avg", 0) or p[1].get("post_monthly_avg", 0) for p in _ba_sorted]
 
-        # Extract data
-        _chart_months = [item[0] for item in monthly_revenue_series]
-        _chart_values = [item[1] for item in monthly_revenue_series]
-        _max_val = max(_chart_values) if _chart_values else 1
-        _min_val = 0
+        _n_bars = len(_ba_names)
+        _chart_x = PAGE_L + 38  # leave room for property labels
+        _chart_y = pdf.get_y() + 3
+        _chart_w = USABLE_W - 48  # chart area width
+        _bar_group_h = 10  # height for each property (pre + post bars)
+        _bar_h = 4  # individual bar height
+        _bar_gap = 1  # gap between pre and post bar
+        _group_gap = 2  # gap between property groups
+        _chart_h = _n_bars * (_bar_group_h + _group_gap)
+        _max_val = max(max(_ba_pre), max(_ba_post)) if _ba_pre and _ba_post else 1
+        if _max_val == 0:
+            _max_val = 1
 
-        # Draw axes
-        pdf.set_draw_color(180, 180, 180)
-        pdf.set_line_width(0.3)
-        pdf.line(_chart_x, _chart_y, _chart_x, _chart_bottom)  # Y axis
-        pdf.line(_chart_x, _chart_bottom, _chart_x + _chart_w, _chart_bottom)  # X axis
+        # Colors
+        _pre_color = (180, 180, 190)  # gray for pre
+        _post_color = dark_blue  # navy for post
+        _lift_color = green  # green for positive lift label
 
-        # Y-axis labels (4 ticks)
-        pdf.set_font('Helvetica', '', 6)
-        pdf.set_text_color(140, 140, 140)
-        for i in range(5):
-            _tick_val = _max_val * (4 - i) / 4
-            _tick_y = _chart_y + (_chart_h * i / 4)
-            pdf.set_draw_color(230, 230, 230)
-            pdf.set_line_width(0.1)
-            pdf.line(_chart_x, _tick_y, _chart_x + _chart_w, _tick_y)  # grid line
-            pdf.set_xy(_chart_x - 25, _tick_y - 2)
-            pdf.cell(24, 4, _format_large_currency(_tick_val), align='R')
+        # Draw horizontal grid lines
+        pdf.set_draw_color(235, 235, 235)
+        pdf.set_line_width(0.1)
+        for _gi in range(5):
+            _gx = _chart_x + (_chart_w * _gi / 4)
+            pdf.line(_gx, _chart_y, _gx, _chart_y + _chart_h)
 
-        # Plot the line
-        if len(_chart_values) > 1:
-            _step_x = _chart_w / (len(_chart_values) - 1)
-            pdf.set_draw_color(*dark_blue)
-            pdf.set_line_width(0.6)
-            for i in range(len(_chart_values) - 1):
-                _x1 = _chart_x + i * _step_x
-                _y1 = _chart_bottom - ((_chart_values[i] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
-                _x2 = _chart_x + (i + 1) * _step_x
-                _y2 = _chart_bottom - ((_chart_values[i + 1] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
-                pdf.line(_x1, _y1, _x2, _y2)
+        # Draw bars for each property
+        for _bi, (_pname, _pre_v, _post_v) in enumerate(zip(_ba_names, _ba_pre, _ba_post)):
+            _group_y = _chart_y + _bi * (_bar_group_h + _group_gap)
 
-            # Draw data points as small circles
-            pdf.set_fill_color(*dark_blue)
-            for i in range(len(_chart_values)):
-                _px = _chart_x + i * _step_x
-                _py = _chart_bottom - ((_chart_values[i] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
-                pdf.ellipse(_px - 0.8, _py - 0.8, 1.6, 1.6, 'F')
+            # Property name label (left of bars)
+            pdf.set_font('Helvetica', '', 6)
+            pdf.set_text_color(80, 80, 80)
+            _label_text = _pname[:22] + '…' if len(_pname) > 22 else _pname
+            pdf.set_xy(PAGE_L, _group_y + 1)
+            pdf.cell(36, _bar_group_h - 2, _label_text, align='R')
 
-        # Find and draw launch date line (find earliest launch that falls in chart range)
-        _launch_month = None
-        if comparable_data:
-            # The launch analysis data has launch dates; find the earliest one in our series
-            for _cm in _chart_months:
-                # We'll mark the approximate launch point if comparable data exists
-                # Use mid-point of the series as a rough estimate if no explicit launch date
-                pass
-        # Draw launch date lines from comparable_data
-        _drawn_launches = set()
-        if comparable_data and len(_chart_months) > 1:
-            _step_x = _chart_w / (len(_chart_values) - 1)
-            for _pname_cd, _pdata_cd in comparable_data.items():
-                _ld = _pdata_cd.get("launch_date")
-                if _ld and hasattr(_ld, 'year'):
-                    _ld_month = datetime(_ld.year, _ld.month, 1)
-                    if _ld_month in _chart_months and _ld_month not in _drawn_launches:
-                        _launch_idx = _chart_months.index(_ld_month)
-                        _launch_x = _chart_x + _launch_idx * _step_x
-                        pdf.set_draw_color(200, 60, 60)
-                        pdf.set_line_width(0.4)
-                        pdf.line(_launch_x, _chart_y, _launch_x, _chart_bottom)
-                        if not _drawn_launches:  # label only the first one
-                            pdf.set_font('Helvetica', 'I', 6)
-                            pdf.set_text_color(200, 60, 60)
-                            pdf.set_xy(_launch_x + 1, _chart_y)
-                            pdf.cell(20, 4, 'Launch')
-                        _drawn_launches.add(_ld_month)
+            # Pre bar (top bar in group)
+            _pre_w = (_pre_v / _max_val) * _chart_w if _max_val > 0 else 0
+            pdf.set_fill_color(*_pre_color)
+            pdf.rect(_chart_x, _group_y, max(_pre_w, 0.5), _bar_h, 'F')
+            # Pre value label
+            pdf.set_font('Helvetica', '', 5.5)
+            pdf.set_text_color(120, 120, 120)
+            pdf.set_xy(_chart_x + _pre_w + 1, _group_y)
+            pdf.cell(20, _bar_h, f'${_pre_v:,.0f}', align='L')
 
-        # X-axis labels (first, middle, last)
-        pdf.set_font('Helvetica', '', 6)
-        pdf.set_text_color(140, 140, 140)
-        _label_indices = [0]
-        if len(_chart_months) > 2:
-            _label_indices.append(len(_chart_months) // 2)
-        _label_indices.append(len(_chart_months) - 1)
-        for idx in _label_indices:
-            _lx = _chart_x + idx * (_chart_w / max(len(_chart_months) - 1, 1))
-            _m = _chart_months[idx]
-            _m_label = _m.strftime("%b %y") if hasattr(_m, 'strftime') else str(_m)[:7]
-            pdf.set_xy(_lx - 8, _chart_bottom + 1)
-            pdf.cell(16, 4, _m_label, align='C')
-
-        # Label first and current values
-        if _chart_values:
-            pdf.set_font('Helvetica', 'B', 6)
+            # Post bar (bottom bar in group)
+            _post_w = (_post_v / _max_val) * _chart_w if _max_val > 0 else 0
+            pdf.set_fill_color(*_post_color)
+            pdf.rect(_chart_x, _group_y + _bar_h + _bar_gap, max(_post_w, 0.5), _bar_h, 'F')
+            # Post value label
+            pdf.set_font('Helvetica', 'B', 5.5)
             pdf.set_text_color(*dark_blue)
-            # First month value
-            _first_y = _chart_bottom - ((_chart_values[0] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
-            pdf.set_xy(_chart_x + 1, _first_y - 5)
-            pdf.cell(20, 4, f'${_chart_values[0]:,.0f}')
-            # Current month value
-            _last_x = _chart_x + (len(_chart_values) - 1) * (_chart_w / max(len(_chart_values) - 1, 1))
-            _last_y = _chart_bottom - ((_chart_values[-1] / _max_val) * _chart_h) if _max_val > 0 else _chart_bottom
-            pdf.set_xy(_last_x - 20, _last_y - 5)
-            pdf.cell(20, 4, f'${_chart_values[-1]:,.0f}', align='R')
+            pdf.set_xy(_chart_x + _post_w + 1, _group_y + _bar_h + _bar_gap)
+            pdf.cell(20, _bar_h, f'${_post_v:,.0f}', align='L')
 
-        pdf.set_y(_chart_bottom + 10)
+            # Lift label (right side, between bars)
+            _lift = _post_v - _pre_v
+            if _lift > 0:
+                pdf.set_font('Helvetica', 'B', 5.5)
+                pdf.set_text_color(*green)
+                _lift_x = _chart_x + max(_pre_w, _post_w) + 22
+                if _lift_x + 25 < PAGE_L + USABLE_W:
+                    pdf.set_xy(_lift_x, _group_y + 2)
+                    pdf.cell(25, _bar_h, f'+${_lift:,.0f}/mo', align='L')
+            elif _lift < 0:
+                pdf.set_font('Helvetica', 'B', 5.5)
+                pdf.set_text_color(*orange)
+                _lift_x = _chart_x + max(_pre_w, _post_w) + 22
+                if _lift_x + 25 < PAGE_L + USABLE_W:
+                    pdf.set_xy(_lift_x, _group_y + 2)
+                    pdf.cell(25, _bar_h, f'-${abs(_lift):,.0f}/mo', align='L')
+
+        # X-axis tick labels
+        pdf.set_font('Helvetica', '', 5.5)
+        pdf.set_text_color(140, 140, 140)
+        _axis_y = _chart_y + _chart_h + 1
+        pdf.set_draw_color(180, 180, 180)
+        pdf.set_line_width(0.2)
+        pdf.line(_chart_x, _axis_y, _chart_x + _chart_w, _axis_y)
+        for _ti in range(5):
+            _tv = _max_val * _ti / 4
+            _tx = _chart_x + (_chart_w * _ti / 4)
+            pdf.set_xy(_tx - 10, _axis_y + 1)
+            pdf.cell(20, 3, f'${_tv:,.0f}', align='C')
+
+        # Legend
+        _legend_y = _axis_y + 6
+        pdf.set_font('Helvetica', '', 6)
+        # Pre legend
+        pdf.set_fill_color(*_pre_color)
+        pdf.rect(PAGE_L + 40, _legend_y, 4, 3, 'F')
+        pdf.set_text_color(100, 100, 100)
+        pdf.set_xy(PAGE_L + 45, _legend_y - 0.5)
+        pdf.cell(30, 4, 'Before PetScreening')
+        # Post legend
+        pdf.set_fill_color(*_post_color)
+        pdf.rect(PAGE_L + 80, _legend_y, 4, 3, 'F')
+        pdf.set_text_color(*dark_blue)
+        pdf.set_xy(PAGE_L + 85, _legend_y - 0.5)
+        pdf.cell(30, 4, 'After PetScreening')
+
+        # Portfolio totals below legend
+        _total_pre = sum(_ba_pre)
+        _total_post = sum(_ba_post)
+        _total_lift = _total_post - _total_pre
+        _pct_lift = (_total_lift / _total_pre * 100) if _total_pre > 0 else 0
+        _totals_y = _legend_y + 6
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_text_color(*dark_blue)
+        pdf.set_xy(PAGE_L + 40, _totals_y)
+        _lift_sign = "+" if _total_lift >= 0 else ""
+        _lift_color_t = green if _total_lift >= 0 else orange
+        pdf.cell(100, 4,
+            f'Portfolio Total:  ${_total_pre:,.0f}/mo → ${_total_post:,.0f}/mo', align='L')
+        pdf.set_text_color(*_lift_color_t)
+        pdf.cell(40, 4, f'({_lift_sign}${_total_lift:,.0f}/mo, {_lift_sign}{_pct_lift:.0f}%)', align='L')
+
+        pdf.set_y(_totals_y + 8)
         pdf.set_line_width(0.2)
 
     # ═══════════════════════════════════════════════════════════
