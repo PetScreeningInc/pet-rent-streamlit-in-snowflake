@@ -2925,6 +2925,7 @@ def generate_tranche_pdf(
     total_portfolio_units=0,
     property_doors=None,
     monthly_revenue_series=None,
+    comparable_current_rev=0,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3131,24 +3132,24 @@ def generate_tranche_pdf(
     _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
 
     # ── Comparable-only analysis ──
-    # Compute current revenue using ONLY comparable properties so the simple lift
-    # is an apples-to-apples comparison (same properties in pre and current).
-    _comp_current_rev = 0
+    # Use the actual latest month revenue for comparable properties (passed from call site)
+    _comp_current_rev = comparable_current_rev or 0
     _comp_units = 0
     _noncomp_count = 0
     _noncomp_current_rev = 0
     _noncomp_units = 0
     if comparable_data and property_doors:
         _comp_names = set(comparable_data.keys())
-        for pname, pdata in comparable_data.items():
-            _comp_current_rev += pdata.get("post_recent_avg", 0) or pdata.get("post_monthly_avg", 0)
+        for pname in comparable_data:
             _comp_units += property_doors.get(pname, 0)
-        # Non-comparable = all properties with data minus comparable
         _noncomp_count = n_props_with_data - comparable_count
         _noncomp_current_rev = current_monthly_rev - _comp_current_rev
         for pname in (property_doors or {}):
             if pname not in _comp_names:
                 _noncomp_units += property_doors.get(pname, 0)
+    elif comparable_data:
+        _noncomp_count = n_props_with_data - comparable_count
+        _noncomp_current_rev = current_monthly_rev - _comp_current_rev
     _comp_lift = _comp_current_rev - pre_baseline if _comp_current_rev > 0 and pre_baseline > 0 else 0
     _comp_lift_pct = (_comp_lift / pre_baseline * 100) if pre_baseline > 0 and _comp_lift else 0
 
@@ -3493,90 +3494,50 @@ def generate_tranche_pdf(
 
     # ── DATA TRANSPARENCY: Comparable-Only vs Full Portfolio ──
     if comparable_count > 0 and _noncomp_count > 0 and _comp_current_rev > 0:
-        pdf.ln(1)
-        # Draw a light info box
-        _dt_y = pdf.get_y()
-        if _dt_y + 40 > pdf.h - pdf.b_margin:
-            pdf.add_page()
-            _dt_y = pdf.get_y()
+        pdf.ln(2)
+        _comp_lift_sign = "+" if _comp_lift >= 0 else ""
 
-        pdf.set_fill_color(240, 245, 250)  # light blue-gray
-        pdf.set_draw_color(180, 200, 220)
-        _dt_box_x = PAGE_L
-        _dt_box_w = USABLE_W
-
-        # Estimate box height based on content
-        pdf.set_font('Helvetica', 'B', 9)
-        pdf.set_text_color(*dark_blue)
-        pdf.set_xy(_dt_box_x + 4, _dt_y + 3)
-        pdf.cell(0, 5, 'Data Transparency: Comparable vs Full Portfolio', ln=True)
-
-        pdf.set_font('Helvetica', '', 7.5)
-        pdf.set_text_color(*body_gray)
-        pdf.set_x(_dt_box_x + 4)
-
-        _dt_lines = []
-        _dt_lines.append(
-            f"The simple lift above compares current revenue across ALL {n_props_with_data} properties "
-            f"to the pre-launch baseline of {comparable_count} comparable properties. "
-            f"{_noncomp_count} properties have no pre-launch data and contribute "
-            f"${_noncomp_current_rev:,.0f}/mo to the current total without a matching baseline."
+        # Build text
+        _dt_context = (
+            f"The numbers above include ALL {n_props_with_data} properties. "
+            f"{_noncomp_count} of those have no pre-launch data"
         )
-        _dt_lines.append("")
-        _dt_lines.append(
-            f"Apples-to-apples (comparable only): "
-            f"${pre_baseline:,.0f}/mo (pre) -> ${_comp_current_rev:,.0f}/mo (current) = "
-            f"{'+'if _comp_lift >= 0 else ''}${_comp_lift:,.0f}/mo lift "
-            f"({_comp_lift_pct:+.1f}%) across {comparable_count} properties"
+        if _noncomp_units > 0:
+            _dt_context += f" ({_noncomp_units:,} units)"
+        _dt_context += (
+            f" and add ${_noncomp_current_rev:,.0f}/mo to the current total "
+            f"with no baseline to compare against."
+        )
+
+        _dt_comparable = (
+            f"Comparable only ({comparable_count} properties"
         )
         if _comp_units > 0:
-            _comp_lift_per_unit = _comp_lift / _comp_units if _comp_units > 0 else 0
-            _dt_lines[-1] += f" ({_comp_units:,} units, {'+'if _comp_lift_per_unit >= 0 else ''}${_comp_lift_per_unit:,.2f}/unit/mo)."
-        else:
-            _dt_lines[-1] += "."
+            _dt_comparable += f", {_comp_units:,} units"
+        _dt_comparable += (
+            f"):  ${pre_baseline:,.0f}/mo pre  ->  ${_comp_current_rev:,.0f}/mo current  =  "
+            f"{_comp_lift_sign}${_comp_lift:,.0f}/mo lift ({_comp_lift_pct:+.1f}%)"
+        )
+        if _comp_units > 0:
+            _comp_lift_pu = _comp_lift / _comp_units if _comp_units > 0 else 0
+            _dt_comparable += f"  |  {_comp_lift_sign}${_comp_lift_pu:,.2f}/unit/mo"
 
-        if _noncomp_units > 0:
-            _dt_lines.append(
-                f"Excluded from comparison: {_noncomp_count} properties ({_noncomp_units:,} units) "
-                f"contributing ${_noncomp_current_rev:,.0f}/mo with no pre-launch baseline."
-            )
-        elif _noncomp_count > 0:
-            _dt_lines.append(
-                f"Excluded from comparison: {_noncomp_count} properties "
-                f"contributing ${_noncomp_current_rev:,.0f}/mo with no pre-launch baseline."
-            )
-
-        _dt_text = "  ".join(_dt_lines)
-
-        # Measure text and draw box
-        _saved_y = pdf.get_y()
-        # Calculate multi_cell height by writing to temp position
-        _test_pdf_y = pdf.get_y()
-        pdf.multi_cell(_dt_box_w - 8, 4, _dt_text)
-        _text_h = pdf.get_y() - _test_pdf_y
-        _dt_box_h = _text_h + 12  # padding top + bottom
-
-        # Now actually draw (reset and re-render)
-        pdf.set_y(_dt_y)
-        pdf.set_fill_color(240, 245, 250)
-        pdf.set_draw_color(180, 200, 220)
-        pdf.rect(_dt_box_x, _dt_y, _dt_box_w, _dt_box_h, 'DF')
-
-        # Left accent bar
-        pdf.set_fill_color(70, 130, 180)  # steel blue
-        pdf.rect(_dt_box_x, _dt_y, 2.5, _dt_box_h, 'F')
-
+        # Section heading style (no box — just clean text)
         pdf.set_font('Helvetica', 'B', 9)
-        pdf.set_text_color(*dark_blue)
-        pdf.set_xy(_dt_box_x + 6, _dt_y + 3)
-        pdf.cell(0, 5, 'Data Transparency: Comparable vs Full Portfolio', ln=True)
+        pdf.set_text_color(*light_blue)
+        pdf.cell(0, 5, 'Data Transparency', ln=True)
+        pdf.ln(1)
 
         pdf.set_font('Helvetica', '', 7.5)
         pdf.set_text_color(*body_gray)
-        pdf.set_xy(_dt_box_x + 6, _dt_y + 9)
-        pdf.multi_cell(_dt_box_w - 12, 4, _dt_text)
+        pdf.multi_cell(USABLE_W, 4, _dt_context)
+        pdf.ln(2)
 
-        pdf.set_y(_dt_y + _dt_box_h + 4)
+        # Comparable line — bold, darker
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_text_color(*dark_blue)
+        pdf.multi_cell(USABLE_W, 4.5, _dt_comparable)
+        pdf.ln(2)
 
     divider()
 
@@ -9040,6 +9001,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                         _interp = _prev_val + (_next_val - _prev_val) * _frac
                                         _pdf_monthly_series[_i] = (_pdf_monthly_series[_i][0], _interp)
 
+                        # Compute comparable-only current month revenue (apples-to-apples)
+                        _comp_current_rev_latest = 0
+                        if _comparable and _latest_month:
+                            _comp_current_rev_latest = sum(
+                                _monthly_by_prop.get(p, {}).get(_latest_month, 0)
+                                for p in _comparable
+                            )
+
                         pdf_bytes = generate_tranche_pdf(
                             label=_label,
                             today_str=_today_str,
@@ -9066,6 +9035,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             total_portfolio_units=st.session_state.get("_total_portfolio_units", 0),
                             property_doors=st.session_state.get("_property_doors_by_name", {}),
                             monthly_revenue_series=_pdf_monthly_series if _pdf_monthly_series else None,
+                            comparable_current_rev=_comp_current_rev_latest,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
