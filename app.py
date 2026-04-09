@@ -2926,6 +2926,7 @@ def generate_tranche_pdf(
     property_doors=None,
     monthly_revenue_series=None,
     comparable_current_rev=0,
+    pmc_system="yardi",
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3119,20 +3120,12 @@ def generate_tranche_pdf(
             return f"{sign}${val:,.0f}"
 
     # ═══════════════════════════════════════════════════════════
-    #  PAGE 1: AT A GLANCE
+    #  PAGE 1: AT A GLANCE  (comparable-only = apples-to-apples)
     # ═══════════════════════════════════════════════════════════
-    _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
-    # At a Glance uses SIMPLE math: current - baseline = lift
-    _monthly_lift = current_monthly_rev - pre_baseline if comparable_count > 0 and pre_baseline > 0 else 0
-    _simple_pct = (_monthly_lift / pre_baseline * 100) if pre_baseline > 0 and _monthly_lift else 0
-    _adjusted_lift = t1_mo if comparable_count > 0 else 0  # kept for Value Created section
-    _lift_per_unit = _monthly_lift / total_units if total_units and total_units > 0 and _monthly_lift else 0
-    _annual_lift = _monthly_lift * 12
     _cap_rate = 0.05
-    _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
 
     # ── Comparable-only analysis ──
-    # Use the actual latest month revenue for comparable properties (passed from call site)
+    # Headline numbers use ONLY properties with pre AND post data.
     _comp_current_rev = comparable_current_rev or 0
     _comp_units = 0
     _noncomp_count = 0
@@ -3150,8 +3143,29 @@ def generate_tranche_pdf(
     elif comparable_data:
         _noncomp_count = n_props_with_data - comparable_count
         _noncomp_current_rev = current_monthly_rev - _comp_current_rev
-    _comp_lift = _comp_current_rev - pre_baseline if _comp_current_rev > 0 and pre_baseline > 0 else 0
-    _comp_lift_pct = (_comp_lift / pre_baseline * 100) if pre_baseline > 0 and _comp_lift else 0
+
+    # Use comparable numbers for headline when available, fall back to full portfolio
+    _has_comparable = comparable_count > 0 and _comp_current_rev > 0 and pre_baseline > 0
+    if _has_comparable:
+        _headline_current = _comp_current_rev
+        _headline_pre = pre_baseline
+        _headline_units = _comp_units
+        _headline_props = comparable_count
+    else:
+        _headline_current = current_monthly_rev
+        _headline_pre = pre_baseline
+        _headline_units = total_units
+        _headline_props = n_props_with_data
+
+    _monthly_lift = _headline_current - _headline_pre if _headline_pre > 0 else 0
+    _simple_pct = (_monthly_lift / _headline_pre * 100) if _headline_pre > 0 and _monthly_lift else 0
+    _adjusted_lift = t1_mo if comparable_count > 0 else 0  # kept for Value Created section
+    _lift_per_unit = _monthly_lift / _headline_units if _headline_units and _headline_units > 0 and _monthly_lift else 0
+    _annual_lift = _monthly_lift * 12
+    _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
+
+    # Full portfolio rev-per-unit (used if no comparable)
+    _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
 
     # Title
     pdf.set_font('Helvetica', 'B', 14)
@@ -3164,33 +3178,29 @@ def generate_tranche_pdf(
     pdf.set_line_width(0.2)
     pdf.ln(6)
 
-    # ── Narrative paragraph mirroring Eduardo's Slack pitch ──
+    # ── Narrative paragraph ──
     _glance_parts = []
-    if total_units and total_units > 0 and comparable_count > 0:
+    if _has_comparable and _headline_units > 0:
         _glance_parts.append(
-            f"Across {label}'s {total_units:,} live units, average monthly pet revenue "
-            f"before PetScreening was ${pre_baseline:,.0f}/mo."
+            f"Across {comparable_count} comparable properties ({_headline_units:,} units) with "
+            f"pre- and post-launch data, pet revenue before PetScreening was "
+            f"${_headline_pre:,.0f}/mo."
         )
         _glance_parts.append(
-            f" As of the most recently completed month, that figure has grown to "
-            f"${current_monthly_rev:,.0f}/mo -- a ${_monthly_lift:,.0f}/mo increase "
-            f"(${current_monthly_rev:,.0f} - ${pre_baseline:,.0f}), or roughly "
+            f" Today those same properties generate ${_headline_current:,.0f}/mo -- "
+            f"a ${_monthly_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
             f"${_lift_per_unit:,.2f} per unit per month."
         )
         if _asset_value_impact > 0:
             _glance_parts.append(
-                f" Capitalized at a 5% cap rate, the existing {total_units:,} units represent "
-                f"a ~${_asset_value_impact:,.0f} increase in asset value."
+                f" At a 5% cap rate, that represents ~${_asset_value_impact:,.0f} in added asset value."
             )
-    elif comparable_count > 0:
+    elif _has_comparable:
         _glance_parts.append(
-            f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
-            f"across {n_props_with_data} properties."
+            f"Across {comparable_count} comparable properties, pet revenue was "
+            f"${_headline_pre:,.0f}/mo before PetScreening and is now "
+            f"${_headline_current:,.0f}/mo -- a ${_monthly_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
         )
-        if _simple_increase > 0:
-            _glance_parts.append(
-                f" Since PetScreening launched, revenue is up ${_simple_increase:,.0f}/mo ({_simple_pct:+.1f}%)."
-            )
     else:
         _glance_parts.append(
             f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
@@ -3202,7 +3212,14 @@ def generate_tranche_pdf(
 
     # ── KPI cards -- row 1: core metrics ──
     _glance_row1 = []
-    if total_units and total_units > 0:
+    if _has_comparable and _headline_units > 0:
+        _glance_row1.append({
+            "value": f"{_headline_units:,}",
+            "label": "Comparable Units",
+            "sub": f"{comparable_count} properties with pre & post data",
+            "color": dark_blue,
+        })
+    elif total_units and total_units > 0:
         _glance_row1.append({
             "value": f"{total_units:,}",
             "label": "Live Units",
@@ -3218,15 +3235,15 @@ def generate_tranche_pdf(
         })
 
     _glance_row1.append({
-        "value": f"${pre_baseline:,.0f}/mo" if comparable_count > 0 and pre_baseline > 0 else "--",
+        "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
         "label": "Pre-PS Revenue",
-        "sub": "Avg monthly baseline before launch" if comparable_count > 0 else None,
+        "sub": f"Avg baseline across {comparable_count} properties" if _has_comparable else None,
         "color": dark_blue,
     })
     _glance_row1.append({
-        "value": f"${current_monthly_rev:,.0f}/mo",
+        "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
         "label": "Current Revenue",
-        "sub": "Most recently completed month",
+        "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
         "color": dark_blue,
     })
     draw_card_row(_glance_row1)
@@ -3234,20 +3251,20 @@ def generate_tranche_pdf(
 
     # ── KPI cards -- row 2: lift + per-unit + cap rate ──
     _glance_row2 = []
-    if comparable_count > 0 and _monthly_lift != 0:
+    if _monthly_lift != 0:
         _lift_sign = "+" if _monthly_lift > 0 else ""
         _glance_row2.append({
             "value": f"{_lift_sign}${_monthly_lift:,.0f}/mo",
             "label": "Monthly Lift",
-            "sub": f"${current_monthly_rev:,.0f} - ${pre_baseline:,.0f} ({_simple_pct:+.1f}%)",
+            "sub": f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)",
             "color": light_blue if _monthly_lift > 0 else orange,
         })
-    if total_units and total_units > 0 and _lift_per_unit != 0:
+    if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
         _lpu_sign = "+" if _lift_per_unit > 0 else ""
         _glance_row2.append({
             "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
             "label": "Lift per Unit",
-            "sub": f"${_monthly_lift:,.0f} / {total_units:,} units",
+            "sub": f"${_monthly_lift:,.0f} / {_headline_units:,} units",
             "color": light_blue if _lift_per_unit > 0 else orange,
         })
     elif total_units and total_units > 0 and _rev_per_unit > 0:
@@ -3288,7 +3305,8 @@ def generate_tranche_pdf(
     # Leakage = confirmed missing rent + suspected undisclosed pets
     _leakage_mo = _opp_recurring_mo + (su_current_mo or 0)
     _leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
-    _leakage_per_unit = _leakage_mo / total_units if total_units and total_units > 0 and _leakage_mo > 0 else 0
+    _units_for_per_unit = _headline_units if _headline_units and _headline_units > 0 else total_units
+    _leakage_per_unit = _leakage_mo / _units_for_per_unit if _units_for_per_unit and _units_for_per_unit > 0 and _leakage_mo > 0 else 0
     _cumulative_lift_per_unit = _lift_per_unit + _leakage_per_unit  # actuals + leakage
     _total_combined_mo = _monthly_lift + _leakage_mo  # actuals lift + leakage
     _projected_annual_combined = _total_combined_mo * 12
@@ -3305,11 +3323,11 @@ def generate_tranche_pdf(
             "sub": f"{_leakage_tenants:,} residents not paying pet fees",
             "color": orange,
         })
-        if total_units and total_units > 0:
+        if _units_for_per_unit and _units_for_per_unit > 0:
             _glance_row3.append({
                 "value": f"${_leakage_per_unit:,.2f}/unit/mo",
                 "label": "Leakage per Unit",
-                "sub": f"${_leakage_mo:,.0f} / {total_units:,} units  |  Combined: ${_cumulative_lift_per_unit:,.2f}/unit/mo",
+                "sub": f"${_leakage_mo:,.0f} / {_units_for_per_unit:,} units  |  Combined: ${_cumulative_lift_per_unit:,.2f}/unit/mo",
                 "color": orange,
             })
         _glance_row3.append({
@@ -3333,7 +3351,7 @@ def generate_tranche_pdf(
             "sub": f"Actuals ${_monthly_lift:,.0f} + Leakage ${_leakage_mo:,.0f}",
             "color": green,
         })
-        if total_units and total_units > 0:
+        if _units_for_per_unit and _units_for_per_unit > 0:
             _glance_row4.append({
                 "value": f"${_cumulative_lift_per_unit:,.2f}/unit/mo",
                 "label": "Combined Lift per Unit",
@@ -3420,11 +3438,15 @@ def generate_tranche_pdf(
     _t1_color = green if t1_mo >= 0 else orange
     _cum_str = f"${t1_total:,.0f}" if comparable_count > 0 and t1_total != 0 else "--"
 
+    # Use comparable or full portfolio for Value Created cards
+    _vc_current = _headline_current if _has_comparable else current_monthly_rev
+    _vc_props_label = f"{comparable_count} comparable properties" if _has_comparable else f"{n_props_with_data} properties"
+
     draw_card_row([
         {
-            "value": f"${current_monthly_rev:,.0f}/mo",
+            "value": f"${_vc_current:,.0f}/mo",
             "label": "Current Monthly Pet-Related Revenue",
-            "sub": f"Across {n_props_with_data} properties",
+            "sub": f"Across {_vc_props_label}",
             "color": dark_blue,
         },
         {
@@ -3442,23 +3464,21 @@ def generate_tranche_pdf(
     ])
 
     # Show your work
-    show_work(f"Current revenue: sum of pet fee charges across {n_props_with_data} properties for the latest month of data.")
+    show_work(f"Current revenue: sum of pet fee charges across {_vc_props_label} for the latest month of data.")
     if comparable_count > 0 and t1_mo != 0:
-        _simple_diff_sw = current_monthly_rev - pre_baseline
         show_work(
-            f"Simple difference: ${pre_baseline:,.0f}/mo (pre) -> ${current_monthly_rev:,.0f}/mo (current) = "
-            f"${_simple_diff_sw:,.0f}/mo.  Adjusted lift: ${t1_mo:,.0f}/mo across {comparable_count} comparable properties."
+            f"Adjusted lift: ${t1_mo:,.0f}/mo across {comparable_count} comparable properties "
+            f"(property-by-property pre vs post average)."
         )
 
     if comparable_count > 0 and t1_mo != 0:
         if t1_mo > 0:
             pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
-            _simple_diff = current_monthly_rev - pre_baseline
             narrative(
-                f"The simple math: this portfolio collected ${pre_baseline:,.0f}/mo before PetScreening "
-                f"and ${current_monthly_rev:,.0f}/mo today -- a ${_simple_diff:,.0f}/mo increase. "
-                f"After adjusting for property-by-property pre/post averages across {comparable_count} "
-                f"comparable properties, the net adjusted lift is ${t1_mo:,.0f}/mo{pct_note}. "
+                f"Across {comparable_count} comparable properties, pet revenue grew from "
+                f"${_headline_pre:,.0f}/mo to ${_vc_current:,.0f}/mo. "
+                f"After adjusting for property-by-property pre/post averages, "
+                f"the net adjusted lift is ${t1_mo:,.0f}/mo{pct_note}. "
                 f"Over {t1_months} months, this totals ${t1_total:,.0f} in cumulative "
                 f"incremental revenue."
             )
@@ -3492,37 +3512,35 @@ def generate_tranche_pdf(
             "value PetScreening has created."
         )
 
-    # ── DATA TRANSPARENCY: Comparable-Only vs Full Portfolio ──
-    if comparable_count > 0 and _noncomp_count > 0 and _comp_current_rev > 0:
-        pdf.ln(2)
-        _comp_lift_sign = "+" if _comp_lift >= 0 else ""
+    # ── DATA TRANSPARENCY ──
+    _pmc_label = pmc_system.capitalize() if pmc_system else "PMS"
+    _dt_lines = []
 
-        # Build text
-        _dt_context = (
-            f"The numbers above include ALL {n_props_with_data} properties. "
-            f"{_noncomp_count} of those have no pre-launch data"
-        )
+    # PMC scope disclaimer
+    _dt_lines.append(
+        f"This report covers {_pmc_label} data only. If this portfolio uses "
+        f"multiple property management systems, properties on other platforms "
+        f"are not included in these numbers."
+    )
+
+    # Comparable vs non-comparable breakdown
+    if _has_comparable and _noncomp_count > 0:
+        _nc_detail = f"{_noncomp_count} additional properties"
         if _noncomp_units > 0:
-            _dt_context += f" ({_noncomp_units:,} units)"
-        _dt_context += (
-            f" and add ${_noncomp_current_rev:,.0f}/mo to the current total "
-            f"with no baseline to compare against."
+            _nc_detail += f" ({_noncomp_units:,} units)"
+        _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison."
+        _dt_lines.append(_nc_detail)
+        _dt_lines.append(
+            f"Total portfolio pet revenue across all {n_props_with_data} {_pmc_label} properties: "
+            f"${current_monthly_rev:,.0f}/mo."
+        )
+    elif _has_comparable:
+        _dt_lines.append(
+            f"All {n_props_with_data} properties with charge data have pre-launch baselines."
         )
 
-        _dt_comparable = (
-            f"Comparable only ({comparable_count} properties"
-        )
-        if _comp_units > 0:
-            _dt_comparable += f", {_comp_units:,} units"
-        _dt_comparable += (
-            f"):  ${pre_baseline:,.0f}/mo pre  ->  ${_comp_current_rev:,.0f}/mo current  =  "
-            f"{_comp_lift_sign}${_comp_lift:,.0f}/mo lift ({_comp_lift_pct:+.1f}%)"
-        )
-        if _comp_units > 0:
-            _comp_lift_pu = _comp_lift / _comp_units if _comp_units > 0 else 0
-            _dt_comparable += f"  |  {_comp_lift_sign}${_comp_lift_pu:,.2f}/unit/mo"
-
-        # Section heading style (no box — just clean text)
+    if _dt_lines:
+        pdf.ln(1)
         pdf.set_font('Helvetica', 'B', 9)
         pdf.set_text_color(*light_blue)
         pdf.cell(0, 5, 'Data Transparency', ln=True)
@@ -3530,14 +3548,10 @@ def generate_tranche_pdf(
 
         pdf.set_font('Helvetica', '', 7.5)
         pdf.set_text_color(*body_gray)
-        pdf.multi_cell(USABLE_W, 4, _dt_context)
-        pdf.ln(2)
-
-        # Comparable line — bold, darker
-        pdf.set_font('Helvetica', 'B', 8)
-        pdf.set_text_color(*dark_blue)
-        pdf.multi_cell(USABLE_W, 4.5, _dt_comparable)
-        pdf.ln(2)
+        for _dt_line in _dt_lines:
+            pdf.multi_cell(USABLE_W, 4, _dt_line)
+            pdf.ln(1)
+        pdf.ln(1)
 
     divider()
 
@@ -9036,6 +9050,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             property_doors=st.session_state.get("_property_doors_by_name", {}),
                             monthly_revenue_series=_pdf_monthly_series if _pdf_monthly_series else None,
                             comparable_current_rev=_comp_current_rev_latest,
+                            pmc_system=st.session_state.get("pmc_system", "yardi"),
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
