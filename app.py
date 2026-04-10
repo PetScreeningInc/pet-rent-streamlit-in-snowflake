@@ -2931,6 +2931,7 @@ def generate_tranche_pdf(
     asset_class="conventional",
     monthly_by_prop=None,
     latest_month=None,
+    selected_charge_codes=None,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3724,24 +3725,19 @@ def generate_tranche_pdf(
 
     # ── Suspected Undisclosed explainer ──
     if su_total_profiles and su_total_profiles > 0:
-        # Only render if enough space on current page (~20mm needed)
-        _su_space_needed = 18
-        if pdf.get_y() + _su_space_needed > pdf.h - pdf.b_margin:
-            pass  # Skip — will appear in Methodology section instead
-        else:
-            # Visual separator
-            pdf.set_draw_color(*card_border)
-            _sep_y = pdf.get_y()
-            pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
-            pdf.ln(2)
-            pdf.set_font('Helvetica', 'I', 7)
-            pdf.set_text_color(*light_gray)
-            pdf.multi_cell(USABLE_W, 3.5,
-                "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
-                "but never completed it, have an unresolved assistance animal request, or declared "
-                "'no pet' after starting an assistance profile.  Not confirmed pet owners "
-                "-- directional signals for follow-up, not billing."
-            )
+        # Visual separator
+        pdf.set_draw_color(*card_border)
+        _sep_y = pdf.get_y()
+        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'I', 7)
+        pdf.set_text_color(*light_gray)
+        pdf.multi_cell(USABLE_W, 3.5,
+            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
+            "but never completed it, have an unresolved assistance animal request, or declared "
+            "'no pet' after starting an assistance profile.  Not confirmed pet owners "
+            "-- directional signals for follow-up, not billing."
+        )
 
     # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
@@ -4101,11 +4097,18 @@ def generate_tranche_pdf(
     )
 
     # Charge codes used
-    narrative(
-        "Charge Types: Revenue figures are based on the pet-related charge codes selected "
-        "during data configuration. Only properties with at least one matching charge are "
-        "included in the analysis."
-    )
+    if selected_charge_codes and len(selected_charge_codes) > 0:
+        _codes_list = ", ".join(selected_charge_codes)
+        narrative(
+            f"Charge Codes Used: {_codes_list}. Only properties with at least one "
+            f"matching charge are included in the analysis."
+        )
+    else:
+        narrative(
+            "Charge Types: Revenue figures are based on the pet-related charge codes selected "
+            "during data configuration. Only properties with at least one matching charge are "
+            "included in the analysis."
+        )
 
     # Return bytes
     buf = io.BytesIO()
@@ -9090,6 +9093,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             use_avg_lift=_use_avg_lift,
                             monthly_by_prop=_monthly_by_prop,
                             latest_month=_latest_month,
+                            selected_charge_codes=selected_codes,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
