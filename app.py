@@ -3153,6 +3153,14 @@ def generate_tranche_pdf(
         _noncomp_count = n_props_with_data - comparable_count
         _noncomp_current_rev = current_monthly_rev - _comp_current_rev
 
+    # Compute comparable post-launch average (sum of each property's post avg)
+    _comp_post_avg = 0
+    if comparable_data:
+        _comp_post_avg = sum(
+            pdata.get("post_recent_avg", pdata.get("post_monthly_avg", 0))
+            for pdata in comparable_data.values()
+        )
+
     # Use comparable numbers for headline when available, fall back to full portfolio
     _has_comparable = comparable_count > 0 and _comp_current_rev > 0 and pre_baseline > 0
     if _has_comparable:
@@ -3202,6 +3210,10 @@ def generate_tranche_pdf(
     pdf.ln(6)
 
     # ── Narrative paragraph ──
+    # When avg lift toggled, show post avg instead of current
+    _display_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else _headline_current
+    _display_rev_label = "average" if use_avg_lift else "generate"
+
     _glance_parts = []
     if _has_comparable and _headline_units > 0:
         _glance_parts.append(
@@ -3209,21 +3221,35 @@ def generate_tranche_pdf(
             f"pre- and post-launch data, pet revenue before PetScreening was "
             f"${_headline_pre:,.0f}/mo."
         )
-        _glance_parts.append(
-            f" Today those same properties generate ${_headline_current:,.0f}/mo -- "
-            f"a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
-            f"${_lift_per_unit:,.2f} per unit per month."
-        )
+        if use_avg_lift:
+            _glance_parts.append(
+                f" Post-launch, those properties average ${_display_rev:,.0f}/mo -- "
+                f"a ${_active_lift:,.0f}/mo average monthly lift, or "
+                f"${_lift_per_unit:,.2f} per unit per month."
+            )
+        else:
+            _glance_parts.append(
+                f" Today those same properties generate ${_display_rev:,.0f}/mo -- "
+                f"a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
+                f"${_lift_per_unit:,.2f} per unit per month."
+            )
         if _asset_value_impact > 0:
             _glance_parts.append(
                 f" At a 5% cap rate, that represents ~${_asset_value_impact:,.0f} in added asset value."
             )
     elif _has_comparable:
-        _glance_parts.append(
-            f"Across {comparable_count} comparable properties, pet revenue was "
-            f"${_headline_pre:,.0f}/mo before PetScreening and is now "
-            f"${_headline_current:,.0f}/mo -- a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
-        )
+        if use_avg_lift:
+            _glance_parts.append(
+                f"Across {comparable_count} comparable properties, pet revenue was "
+                f"${_headline_pre:,.0f}/mo before PetScreening. Post-launch average is "
+                f"${_display_rev:,.0f}/mo -- a ${_active_lift:,.0f}/mo average monthly lift."
+            )
+        else:
+            _glance_parts.append(
+                f"Across {comparable_count} comparable properties, pet revenue was "
+                f"${_headline_pre:,.0f}/mo before PetScreening and is now "
+                f"${_display_rev:,.0f}/mo -- a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
+            )
     else:
         _glance_parts.append(
             f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
@@ -3263,12 +3289,20 @@ def generate_tranche_pdf(
         "sub": f"Avg baseline across {comparable_count} properties" if _has_comparable else None,
         "color": dark_blue,
     })
-    _glance_row1.append({
-        "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
-        "label": "Current Revenue",
-        "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
-        "color": dark_blue,
-    })
+    if use_avg_lift and _comp_post_avg > 0:
+        _glance_row1.append({
+            "value": f"${_comp_post_avg:,.0f}/mo",
+            "label": "Post-PS Avg Revenue",
+            "sub": f"Avg across {comparable_count} properties, all post-launch months",
+            "color": dark_blue,
+        })
+    else:
+        _glance_row1.append({
+            "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
+            "label": "Current Revenue",
+            "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
+            "color": dark_blue,
+        })
     draw_card_row(_glance_row1)
     pdf.ln(1)
 
@@ -3277,7 +3311,7 @@ def generate_tranche_pdf(
     if _active_lift != 0:
         _lift_sign = "+" if _active_lift > 0 else ""
         _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
-        _lift_sub = f"Property-by-property average" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
+        _lift_sub = f"${_comp_post_avg:,.0f} avg - ${_headline_pre:,.0f} pre" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
         _glance_row2.append({
             "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
             "label": _lift_label,
