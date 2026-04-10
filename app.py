@@ -3410,9 +3410,10 @@ def generate_tranche_pdf(
         pdf.set_font('Helvetica', 'I', 7.5)
         pdf.set_text_color(120, 120, 120)
         pdf.multi_cell(USABLE_W, 3.5,
-            f"If we apply the same per-unit lift across the {_noncomp_count} additional properties "
-            f"we don't yet have pre-launch data for, the estimated total monthly lift across your "
-            f"full portfolio would be ~${_total_portfolio_lift:,.0f}/mo."
+            f"Note: {_noncomp_count} properties ({_noncomp_units:,} units) are excluded from the "
+            f"lift analysis because they launched PetScreening too recently to have pre-launch "
+            f"charge data for comparison. Applying the same ${_lift_per_unit:,.2f}/unit/mo lift "
+            f"to those units, the estimated total portfolio lift would be ~${_total_portfolio_lift:,.0f}/mo."
         )
         pdf.ln(1)
 
@@ -3956,6 +3957,64 @@ def generate_tranche_pdf(
 
         # Close table
         pdf.cell(sum(_col_widths), 0, '', border='T', ln=True)
+
+        # ── Excluded properties (no pre-launch data) ──
+        if _noncomp_count > 0 and monthly_by_prop and latest_month:
+            _comp_names = set(comparable_data.keys())
+            _excluded_props = []
+            for pname in sorted(property_doors.keys()) if property_doors else []:
+                if pname not in _comp_names and pname in monthly_by_prop:
+                    _ep_units = _doors_dict.get(pname, 0)
+                    _ep_current = monthly_by_prop[pname].get(latest_month, 0)
+                    if _ep_current > 0 or _ep_units > 0:
+                        _excluded_props.append((pname, _ep_units, _ep_current))
+
+            if _excluded_props:
+                pdf.ln(4)
+                pdf.set_font('Helvetica', 'B', 9)
+                pdf.set_text_color(*light_gray)
+                pdf.cell(0, 5, f'Properties Excluded from Lift Analysis ({len(_excluded_props)})', ln=True)
+                pdf.set_font('Helvetica', 'I', 7)
+                pdf.cell(0, 3.5, 'No pre-launch charge data available for comparison.', ln=True)
+                pdf.ln(2)
+
+                # Mini table: Property | Units | Current Revenue
+                _ex_widths = [80, 30, 70]  # total = 180
+                _ex_headers = ['Property', 'Units', 'Current Revenue']
+                pdf.set_fill_color(249, 244, 230)
+                pdf.set_draw_color(*card_border)
+                pdf.set_font('Helvetica', 'B', 7)
+                pdf.set_text_color(*dark_blue)
+                for ci, hdr in enumerate(_ex_headers):
+                    pdf.cell(_ex_widths[ci], 6, f' {hdr}', border=1, fill=True)
+                pdf.ln()
+
+                pdf.set_font('Helvetica', '', 7)
+                for ei, (ep_name, ep_units, ep_rev) in enumerate(_excluded_props):
+                    if pdf.get_y() + 5 > pdf.h - pdf.b_margin:
+                        pdf.add_page()
+                        pdf.set_fill_color(249, 244, 230)
+                        pdf.set_font('Helvetica', 'B', 7)
+                        pdf.set_text_color(*dark_blue)
+                        for ci, hdr in enumerate(_ex_headers):
+                            pdf.cell(_ex_widths[ci], 6, f' {hdr}', border=1, fill=True)
+                        pdf.ln()
+                        pdf.set_font('Helvetica', '', 7)
+
+                    if ei % 2 == 0:
+                        pdf.set_fill_color(255, 255, 255)
+                    else:
+                        pdf.set_fill_color(250, 250, 248)
+
+                    _short_ep = ep_name.split(" - ", 1)[-1] if " - " in ep_name else ep_name
+                    _short_ep = _short_ep[:45]
+                    pdf.set_text_color(*body_gray)
+                    pdf.cell(_ex_widths[0], 5, f' {_short_ep}', border='LR', fill=True)
+                    pdf.set_text_color(*dark_blue)
+                    pdf.cell(_ex_widths[1], 5, f' {ep_units:,}' if ep_units > 0 else ' --', border='LR', fill=True)
+                    pdf.cell(_ex_widths[2], 5, f' ${ep_rev:,.0f}/mo', border='LR', fill=True)
+                    pdf.ln()
+                pdf.cell(sum(_ex_widths), 0, '', border='T', ln=True)
 
     # ═══════════════════════════════════════════════════════════
     #  MONTHLY REVENUE TREND CHART (compact, same page if space)
