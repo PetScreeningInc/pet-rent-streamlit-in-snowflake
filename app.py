@@ -3407,9 +3407,9 @@ def generate_tranche_pdf(
         pdf.ln(2)
         _extrapolated_noncomp_lift = _lift_per_unit * _noncomp_units
         _total_portfolio_lift = _active_lift + _extrapolated_noncomp_lift
-        pdf.set_font('Helvetica', 'I', 7.5)
-        pdf.set_text_color(120, 120, 120)
-        pdf.multi_cell(USABLE_W, 3.5,
+        pdf.set_font('Helvetica', '', 8.5)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(USABLE_W, 4,
             f"Note: {_noncomp_count} properties ({_noncomp_units:,} units) are excluded from the "
             f"lift analysis because they launched PetScreening too recently to have pre-launch "
             f"charge data for comparison. Applying the same ${_lift_per_unit:,.2f}/unit/mo lift "
@@ -3724,20 +3724,13 @@ def generate_tranche_pdf(
             f"launch date. Adoption data will populate once screening activity is available."
         )
 
-    # ── Suspected Undisclosed explainer ──
+    # ── Suspected Undisclosed explainer (inline with Portfolio Health) ──
     if su_total_profiles and su_total_profiles > 0:
-        # Visual separator
-        pdf.set_draw_color(*card_border)
-        _sep_y = pdf.get_y()
-        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
-        pdf.ln(2)
-        pdf.set_font('Helvetica', 'I', 7)
-        pdf.set_text_color(*light_gray)
-        pdf.multi_cell(USABLE_W, 3.5,
-            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
-            "but never completed it, have an unresolved assistance animal request, or declared "
-            "'no pet' after starting an assistance profile.  Not confirmed pet owners "
-            "-- directional signals for follow-up, not billing."
+        narrative(
+            "Suspected Undisclosed Pets are tenants who started a PetScreening profile but "
+            "never completed it, have an unresolved assistance animal request, or declared "
+            "'no pet' after starting an assistance profile. These are not confirmed pet owners "
+            "-- they are directional signals for follow-up, not billing."
         )
 
     # ═══════════════════════════════════════════════════════════
