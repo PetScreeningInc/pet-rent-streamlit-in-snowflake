@@ -3570,7 +3570,7 @@ def generate_tranche_pdf(
         _nc_detail = f"{_noncomp_count} additional properties"
         if _noncomp_units > 0:
             _nc_detail += f" ({_noncomp_units:,} units)"
-        _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison."
+        _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison, so are excluded from the lift analysis."
         _dt_lines.append(_nc_detail)
         _dt_lines.append(
             f"Total portfolio pet revenue across all {n_props_with_data} {_pmc_label} properties: "
@@ -3588,10 +3588,10 @@ def generate_tranche_pdf(
         pdf.cell(0, 5, 'Data Transparency', ln=True)
         pdf.ln(1)
 
-        pdf.set_font('Helvetica', '', 7.5)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.set_text_color(*body_gray)
         for _dt_line in _dt_lines:
-            pdf.multi_cell(USABLE_W, 4, _dt_line)
+            pdf.multi_cell(USABLE_W, 4.5, _dt_line)
             pdf.ln(1)
         pdf.ln(1)
 
