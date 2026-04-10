@@ -2929,6 +2929,8 @@ def generate_tranche_pdf(
     pmc_system="yardi",
     use_avg_lift=False,
     asset_class="conventional",
+    monthly_by_prop=None,
+    latest_month=None,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3722,21 +3724,24 @@ def generate_tranche_pdf(
 
     # ── Suspected Undisclosed explainer ──
     if su_total_profiles and su_total_profiles > 0:
-        # Visual separator
-        pdf.ln(1)
-        pdf.set_draw_color(*card_border)
-        _sep_y = pdf.get_y()
-        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
-        pdf.ln(3)
-        pdf.set_font('Helvetica', 'I', 7)
-        pdf.set_text_color(*light_gray)
-        pdf.multi_cell(USABLE_W, 3.5,
-            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
-            "but never completed it, have an unresolved assistance animal request, or declared "
-            "'no pet' after starting an assistance profile.  These are NOT confirmed pet owners "
-            "-- they are directional signals for follow-up, not billing."
-        )
-        pdf.ln(1)
+        # Only render if enough space on current page (~20mm needed)
+        _su_space_needed = 18
+        if pdf.get_y() + _su_space_needed > pdf.h - pdf.b_margin:
+            pass  # Skip — will appear in Methodology section instead
+        else:
+            # Visual separator
+            pdf.set_draw_color(*card_border)
+            _sep_y = pdf.get_y()
+            pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
+            pdf.ln(2)
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(*light_gray)
+            pdf.multi_cell(USABLE_W, 3.5,
+                "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
+                "but never completed it, have an unresolved assistance animal request, or declared "
+                "'no pet' after starting an assistance profile.  Not confirmed pet owners "
+                "-- directional signals for follow-up, not billing."
+            )
 
     # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
@@ -3848,15 +3853,15 @@ def generate_tranche_pdf(
     if comparable_data and len(comparable_data) > 0:
         pdf.add_page()
         section_heading("Impact by Property", dark_blue)
+        _impact_method = "average monthly lift" if use_avg_lift else "most recent completed month vs pre-launch average"
         narrative(
-            "Each property's pre-launch average (up to 6 months before launch) is compared "
-            "against its post-launch average across all completed months. "
-            "Lift = Post Avg - Pre Avg. Cumulative = total post revenue minus projected baseline."
+            f"Each property's lift is calculated using {_impact_method}. "
+            f"Pre-launch baseline uses up to 6 months before launch date."
         )
 
-        # Table header — with Units and Lift/Unit columns
-        _col_widths = [42, 14, 22, 22, 22, 18, 22, 9, 9]  # total = 180
-        _col_headers = ['Property', 'Units', 'Pre Avg', 'Post Avg', 'Lift/mo', 'Lift/Unit', 'Cumul.', '%', 'Mo']
+        # Table header — streamlined columns
+        _col_widths = [48, 14, 26, 26, 26, 22, 18]  # total = 180
+        _col_headers = ['Property', 'Units', 'Pre Avg', 'Current', 'Lift/mo', 'Lift/Unit', '%']
         pdf.set_fill_color(249, 244, 230)
         pdf.set_draw_color(*card_border)
         pdf.set_font('Helvetica', 'B', 7)
@@ -3869,7 +3874,15 @@ def generate_tranche_pdf(
         if use_avg_lift:
             _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("diff_monthly", 0), reverse=True)
         else:
-            _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("post_recent_avg", x[1].get("post_monthly_avg", 0)) - x[1].get("pre_avg", 0), reverse=True)
+            def _simple_lift_sort(item):
+                pname, pdata_s = item
+                _pre_s = pdata_s.get("pre_avg", 0)
+                if monthly_by_prop and latest_month and pname in monthly_by_prop:
+                    _cur_s = monthly_by_prop[pname].get(latest_month, 0)
+                else:
+                    _cur_s = pdata_s.get("post_recent_avg", pdata_s.get("post_monthly_avg", 0))
+                return _cur_s - _pre_s
+            _sorted_props = sorted(comparable_data.items(), key=_simple_lift_sort, reverse=True)
         pdf.set_font('Helvetica', '', 7)
         for ri, (prop_name, pdata) in enumerate(_sorted_props):
             # Page break check
@@ -3892,18 +3905,26 @@ def generate_tranche_pdf(
 
             _pre = pdata.get("pre_avg", 0)
             _post = pdata.get("post_recent_avg", pdata.get("post_monthly_avg", 0))
-            _sdiff = _post - _pre
             _adj = pdata.get("diff_monthly", 0)
-            _cum = pdata.get("diff_total", 0)
-            _npost = pdata.get("n_post", 0)
             _prop_units = _doors_dict.get(prop_name, 0)
-            # Use simple diff or adjusted lift depending on methodology
-            _prop_lift = _adj if use_avg_lift else _sdiff
+
+            # Get latest month revenue for this property (most recent completed month)
+            _current_mo_rev = 0
+            if monthly_by_prop and latest_month and prop_name in monthly_by_prop:
+                _current_mo_rev = monthly_by_prop[prop_name].get(latest_month, 0)
+            else:
+                _current_mo_rev = _post  # fallback to post avg
+
+            # Lift: simple = current month - pre avg; avg = property-by-property average
+            if use_avg_lift:
+                _prop_lift = _adj
+            else:
+                _prop_lift = _current_mo_rev - _pre
             _lift_per_u = _prop_lift / _prop_units if _prop_units > 0 else 0
 
             # Truncate property name
             _short_name = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
-            _short_name = _short_name[:24]
+            _short_name = _short_name[:28]
 
             pdf.set_text_color(*body_gray)
             pdf.cell(_col_widths[0], 5, f' {_short_name}', border='LR', fill=True)
@@ -3914,9 +3935,9 @@ def generate_tranche_pdf(
             pdf.cell(_col_widths[1], 5, f' {_units_str}', border='LR', fill=True)
 
             pdf.cell(_col_widths[2], 5, f' ${_pre:,.0f}', border='LR', fill=True)
-            pdf.cell(_col_widths[3], 5, f' ${_post:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[3], 5, f' ${_current_mo_rev:,.0f}', border='LR', fill=True)
 
-            # Color-code lift (uses methodology-appropriate value)
+            # Color-code lift
             pdf.set_text_color(*lift_color(_prop_lift))
             _prop_lift_sign = "+" if _prop_lift > 0 else ""
             pdf.cell(_col_widths[4], 5, f' {_prop_lift_sign}${_prop_lift:,.0f}', border='LR', fill=True)
@@ -3930,19 +3951,11 @@ def generate_tranche_pdf(
                 pdf.set_text_color(160, 160, 160)
                 pdf.cell(_col_widths[5], 5, ' --', border='LR', fill=True)
 
-            # Color-code cumulative
-            pdf.set_text_color(*lift_color(_cum))
-            _cum_sign = "+" if _cum > 0 else ""
-            pdf.cell(_col_widths[6], 5, f' {_cum_sign}${_cum:,.0f}', border='LR', fill=True)
-
             # Lift %
-            _lift_pct = (((_post - _pre) / _pre) * 100) if _pre > 0 else 0
+            _lift_pct = ((_current_mo_rev - _pre) / _pre * 100) if _pre > 0 else 0
             pdf.set_text_color(*lift_color(_lift_pct))
             _pct_sign = "+" if _lift_pct > 0 else ""
-            pdf.cell(_col_widths[7], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
-
-            pdf.set_text_color(*body_gray)
-            pdf.cell(_col_widths[8], 5, f' {_npost}', border='LR', fill=True)
+            pdf.cell(_col_widths[6], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
             pdf.ln()
 
         # Close table
@@ -4063,16 +4076,19 @@ def generate_tranche_pdf(
 
     section_heading("Methodology", dark_blue)
 
-    narrative(
-        "Monthly Lift: Current month pet fee revenue minus pre-launch baseline. "
-        "Pre-launch baseline = average of up to 6 months before launch date. "
-        "The portfolio-level lift is the sum across all comparable properties."
-    )
-
-    narrative(
-        "Average Monthly Lift: Property-by-property comparison of post-launch average "
-        "vs pre-launch average. Accounts for properties added or removed since launch."
-    )
+    # Describe the methodology actually used in this report
+    if use_avg_lift:
+        narrative(
+            "Monthly Lift: Property-by-property comparison of post-launch average "
+            "vs pre-launch average (up to 6 months before launch). Accounts for "
+            "properties added or removed since launch."
+        )
+    else:
+        narrative(
+            "Monthly Lift: Most recently completed month's pet fee revenue minus "
+            "the pre-launch baseline (average of up to 6 months before launch). "
+            "The portfolio-level lift is the sum across all comparable properties."
+        )
 
     narrative(
         "Pet Revenue Found: Tenants with active PetScreening profiles and household pets "
@@ -4081,13 +4097,14 @@ def generate_tranche_pdf(
     )
 
     narrative(
-        "Suspected Undisclosed Pets: Tenants who started a profile but abandoned it, "
-        "have unresolved assistance requests, or declared 'no pet' after starting an "
-        "assistance profile. Directional signals for follow-up, not billing."
+        "Asset Value Impact: Annual lift divided by a 5% capitalization rate."
     )
 
+    # Charge codes used
     narrative(
-        "Asset Value Impact: Annual lift divided by a 5% capitalization rate."
+        "Charge Types: Revenue figures are based on the pet-related charge codes selected "
+        "during data configuration. Only properties with at least one matching charge are "
+        "included in the analysis."
     )
 
     # Return bytes
@@ -9071,6 +9088,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             comparable_current_rev=_comp_current_rev_latest,
                             pmc_system=st.session_state.get("pmc_system", "yardi"),
                             use_avg_lift=_use_avg_lift,
+                            monthly_by_prop=_monthly_by_prop,
+                            latest_month=_latest_month,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
