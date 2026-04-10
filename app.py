@@ -3717,21 +3717,26 @@ def generate_tranche_pdf(
                     f" At 100% {adopt_type_label.lower()} adoption, projected pet fee revenue would be "
                     f"${total_projected:,.0f}/mo -- an additional ${_additional_at_100:,.0f}/mo opportunity."
                 )
+        # Append suspected undisclosed definition directly to avoid page overflow
+        if su_total_profiles and su_total_profiles > 0:
+            _ph_narrative += (
+                f" 'Suspected Undisclosed' ({su_total_profiles:,} tenants) refers to residents who "
+                f"started screening but abandoned it, have unresolved assistance requests, or declared "
+                f"no pet after starting an assistance profile -- directional signals for follow-up, not billing."
+            )
         narrative(_ph_narrative)
     else:
-        narrative(
+        _ph_fallback = (
             f"{n_with_launch} of {n_props_total} properties have an established PetScreening "
             f"launch date. Adoption data will populate once screening activity is available."
         )
-
-    # ── Suspected Undisclosed explainer (inline with Portfolio Health) ──
-    if su_total_profiles and su_total_profiles > 0:
-        narrative(
-            "Suspected Undisclosed Pets are tenants who started a PetScreening profile but "
-            "never completed it, have an unresolved assistance animal request, or declared "
-            "'no pet' after starting an assistance profile. These are not confirmed pet owners "
-            "-- they are directional signals for follow-up, not billing."
-        )
+        if su_total_profiles and su_total_profiles > 0:
+            _ph_fallback += (
+                f" 'Suspected Undisclosed' ({su_total_profiles:,} tenants) refers to residents who "
+                f"started screening but abandoned it, have unresolved assistance requests, or declared "
+                f"no pet after starting an assistance profile -- directional signals for follow-up, not billing."
+            )
+        narrative(_ph_fallback)
 
     # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
