@@ -3858,7 +3858,8 @@ def generate_tranche_pdf(
 
         # Table header — streamlined columns
         _col_widths = [48, 14, 26, 26, 26, 22, 18]  # total = 180
-        _col_headers = ['Property', 'Units', 'Pre Avg', 'Current', 'Lift/mo', 'Lift/Unit', '%']
+        _rev_col_label = 'Post Avg' if use_avg_lift else 'Current'
+        _col_headers = ['Property', 'Units', 'Pre Avg', _rev_col_label, 'Lift/mo', 'Lift/Unit', '%']
         pdf.set_fill_color(249, 244, 230)
         pdf.set_draw_color(*card_border)
         pdf.set_font('Helvetica', 'B', 7)
@@ -3931,8 +3932,11 @@ def generate_tranche_pdf(
             _units_str = str(_prop_units) if _prop_units > 0 else "--"
             pdf.cell(_col_widths[1], 5, f' {_units_str}', border='LR', fill=True)
 
+            # Show post avg or current month depending on toggle
+            _rev_display = _post if use_avg_lift else _current_mo_rev
+
             pdf.cell(_col_widths[2], 5, f' ${_pre:,.0f}', border='LR', fill=True)
-            pdf.cell(_col_widths[3], 5, f' ${_current_mo_rev:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[3], 5, f' ${_rev_display:,.0f}', border='LR', fill=True)
 
             # Color-code lift
             pdf.set_text_color(*lift_color(_prop_lift))
@@ -3949,7 +3953,7 @@ def generate_tranche_pdf(
                 pdf.cell(_col_widths[5], 5, ' --', border='LR', fill=True)
 
             # Lift %
-            _lift_pct = ((_current_mo_rev - _pre) / _pre * 100) if _pre > 0 else 0
+            _lift_pct = ((_rev_display - _pre) / _pre * 100) if _pre > 0 else 0
             pdf.set_text_color(*lift_color(_lift_pct))
             _pct_sign = "+" if _lift_pct > 0 else ""
             pdf.cell(_col_widths[6], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
