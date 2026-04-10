@@ -3404,11 +3404,14 @@ def generate_tranche_pdf(
         pdf.ln(2)
         _extrapolated_noncomp_lift = _lift_per_unit * _noncomp_units
         _total_portfolio_lift = _active_lift + _extrapolated_noncomp_lift
-        show_work(
+        pdf.set_font('Helvetica', 'I', 7.5)
+        pdf.set_text_color(120, 120, 120)
+        pdf.multi_cell(USABLE_W, 3.5,
             f"If we apply the same per-unit lift across the {_noncomp_count} additional properties "
             f"we don't yet have pre-launch data for, the estimated total monthly lift across your "
             f"full portfolio would be ~${_total_portfolio_lift:,.0f}/mo."
         )
+        pdf.ln(1)
 
     # ═══════════════════════════════════════════════════════════
     #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION (same page)
@@ -3719,22 +3722,21 @@ def generate_tranche_pdf(
 
     # ── Suspected Undisclosed explainer ──
     if su_total_profiles and su_total_profiles > 0:
+        # Visual separator
         pdf.ln(1)
-        divider()  # Visual separator before definition
-        pdf.set_font('Helvetica', 'I', 7.5)
+        pdf.set_draw_color(*card_border)
+        _sep_y = pdf.get_y()
+        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
+        pdf.ln(3)
+        pdf.set_font('Helvetica', 'I', 7)
         pdf.set_text_color(*light_gray)
-        pdf.multi_cell(0, 4,
-            "What are Suspected Undisclosed Pets?  These are tenants who began their "
-            "PetScreening profile but never completed it (abandoned household screening), "
-            "have an unresolved assistance animal request (draft, non-responsive, declined, "
-            "not recommended, or returned), or declared 'no pet' after starting an assistance "
-            "profile.  They are NOT confirmed pet owners -- they are residents whose screening "
-            "behavior suggests a pet may be present but undisclosed.  This number is directional "
-            "and should be used for follow-up, not billing."
+        pdf.multi_cell(USABLE_W, 3.5,
+            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
+            "but never completed it, have an unresolved assistance animal request, or declared "
+            "'no pet' after starting an assistance profile.  These are NOT confirmed pet owners "
+            "-- they are directional signals for follow-up, not billing."
         )
-        pdf.ln(2)
-
-    divider()
+        pdf.ln(1)
 
     # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
@@ -3758,15 +3760,12 @@ def generate_tranche_pdf(
     metrics = []
     metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo", None))
     metrics.append(("Current Monthly Pet-Related Revenue", f"${current_monthly_rev:,.0f}/mo", None))
-    if comparable_count > 0 and t1_mo != 0:
-        _t1_sign_m = "+" if t1_mo > 0 else ""
-        _simple_chg = current_monthly_rev - pre_baseline
-        _simple_chg_sign = "+" if _simple_chg > 0 else ""
-        metrics.append(("Simple Revenue Change", f"{_simple_chg_sign}${_simple_chg:,.0f}/mo", lift_color(_simple_chg)))
-        metrics.append(("Average Monthly Lift", f"{_t1_sign_m}${t1_mo:,.0f}/mo", lift_color(t1_mo)))
-        metrics.append(("Cumulative Revenue Impact", f"${t1_total:,.0f}", lift_color(t1_total)))
-        # Use methodology-appropriate lift for annualized calculations (same as page 1)
+    if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
+        # Only show the methodology being used — less noise, fewer questions
         _active_lift_m = _adjusted_lift if use_avg_lift else _monthly_lift
+        _active_lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+        _active_sign = "+" if _active_lift_m > 0 else ""
+        metrics.append((_active_lift_label, f"{_active_sign}${_active_lift_m:,.0f}/mo", lift_color(_active_lift_m)))
         _annual_lift_m = _active_lift_m * 12
         metrics.append(("Annualized Lift", f"${_annual_lift_m:,.0f}/yr", lift_color(_annual_lift_m)))
         if _annual_lift_m > 0:
@@ -3866,8 +3865,11 @@ def generate_tranche_pdf(
             pdf.cell(_col_widths[ci], 6, f' {hdr}', border=1, fill=True)
         pdf.ln()
 
-        # Sort by adjusted lift descending
-        _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("diff_monthly", 0), reverse=True)
+        # Sort by methodology-appropriate lift descending
+        if use_avg_lift:
+            _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("diff_monthly", 0), reverse=True)
+        else:
+            _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("post_recent_avg", x[1].get("post_monthly_avg", 0)) - x[1].get("pre_avg", 0), reverse=True)
         pdf.set_font('Helvetica', '', 7)
         for ri, (prop_name, pdata) in enumerate(_sorted_props):
             # Page break check
@@ -3895,7 +3897,9 @@ def generate_tranche_pdf(
             _cum = pdata.get("diff_total", 0)
             _npost = pdata.get("n_post", 0)
             _prop_units = _doors_dict.get(prop_name, 0)
-            _lift_per_u = _adj / _prop_units if _prop_units > 0 else 0
+            # Use simple diff or adjusted lift depending on methodology
+            _prop_lift = _adj if use_avg_lift else _sdiff
+            _lift_per_u = _prop_lift / _prop_units if _prop_units > 0 else 0
 
             # Truncate property name
             _short_name = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
@@ -3912,10 +3916,10 @@ def generate_tranche_pdf(
             pdf.cell(_col_widths[2], 5, f' ${_pre:,.0f}', border='LR', fill=True)
             pdf.cell(_col_widths[3], 5, f' ${_post:,.0f}', border='LR', fill=True)
 
-            # Color-code lift
-            pdf.set_text_color(*lift_color(_adj))
-            _adj_sign = "+" if _adj > 0 else ""
-            pdf.cell(_col_widths[4], 5, f' {_adj_sign}${_adj:,.0f}', border='LR', fill=True)
+            # Color-code lift (uses methodology-appropriate value)
+            pdf.set_text_color(*lift_color(_prop_lift))
+            _prop_lift_sign = "+" if _prop_lift > 0 else ""
+            pdf.cell(_col_widths[4], 5, f' {_prop_lift_sign}${_prop_lift:,.0f}', border='LR', fill=True)
 
             # Lift per unit
             pdf.set_text_color(*lift_color(_lift_per_u))
@@ -4060,63 +4064,30 @@ def generate_tranche_pdf(
     section_heading("Methodology", dark_blue)
 
     narrative(
-        "Current Monthly Pet-Related Revenue: The total monthly revenue from the "
-        "selected pet-related charge codes (e.g. pet rent, pet deposits) as reported "
-        "in the property management system. This is the sum of active charges in the "
-        "most recent month of data."
+        "Monthly Lift: Current month pet fee revenue minus pre-launch baseline. "
+        "Pre-launch baseline = average of up to 6 months before launch date. "
+        "The portfolio-level lift is the sum across all comparable properties."
     )
 
     narrative(
-        "Pet Revenue Change Since PetScreening: For each property with a known launch "
-        "date, we compare the average monthly pet fee revenue in the post-launch period "
-        "to the pre-launch baseline. The pre-launch baseline uses up to 6 months of "
-        "charge data before the launch date. The post-launch average includes ALL "
-        "completed post-launch months (the current partial month is excluded). "
-        "Monthly lift = post-launch average minus pre-launch average. "
-        "Cumulative impact = total post-launch revenue minus (pre-launch average x "
-        "number of completed post-launch months). "
-        "The portfolio-level change is the sum of each comparable property's monthly lift."
+        "Average Monthly Lift: Property-by-property comparison of post-launch average "
+        "vs pre-launch average. Accounts for properties added or removed since launch."
     )
 
     narrative(
-        "Cumulative Pet Revenue Impact: The total observed post-launch pet fee revenue "
-        "minus the projected baseline (pre-launch average extended across the same number "
-        "of months). This represents the total incremental revenue attributable to the "
-        "PetScreening program across all comparable properties."
+        "Pet Revenue Found: Tenants with active PetScreening profiles and household pets "
+        "who are not being charged pet rent, plus suspected undisclosed pets. Revenue "
+        "estimates use each property's actual average fee from paying tenants."
     )
 
     narrative(
-        "Simple Difference vs. Average Monthly Lift: The 'simple difference' is the raw change "
-        "in monthly revenue (current total minus pre-launch total). The 'average monthly lift' "
-        "is calculated property-by-property, comparing each property's own pre-launch "
-        "average to its post-launch average. The average monthly figure accounts for properties "
-        "added or removed from the portfolio since launch."
+        "Suspected Undisclosed Pets: Tenants who started a profile but abandoned it, "
+        "have unresolved assistance requests, or declared 'no pet' after starting an "
+        "assistance profile. Directional signals for follow-up, not billing."
     )
 
     narrative(
-        "Revenue Opportunity - Missing Monthly Pet Rent: PetScreening profiles with "
-        "active household pets are matched against charge data. Tenants who have a "
-        "compliant profile with at least one active household pet but no matching pet "
-        "charge code are counted as 'missing.' The missing revenue estimate uses each "
-        "property's actual average fee from paying tenants -- not a flat portfolio-wide "
-        "number."
-    )
-
-    narrative(
-        "Property Scoping: Only properties that have at least one charge matching "
-        "the selected pet-related charge codes are included in the missing rent "
-        "analysis. Properties with PetScreening profiles but no pet charges in "
-        "the data are excluded to avoid false positives."
-    )
-
-    narrative(
-        "Suspected Undisclosed Pets: Tenants whose PetScreening behavior suggests "
-        "a pet may be present but has not been disclosed. This includes: (1) tenants "
-        "who started a household pet profile but never completed it (abandoned), "
-        "(2) tenants with unresolved assistance animal requests (draft, non-responsive, "
-        "declined, not recommended, or returned status), and (3) tenants who declared "
-        "'no pet' after starting an assistance profile. These are NOT confirmed pet "
-        "owners and should be used for follow-up outreach, not direct billing."
+        "Asset Value Impact: Annual lift divided by a 5% capitalization rate."
     )
 
     # Return bytes
@@ -8997,6 +8968,13 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         value=False,
                         key="include_pm_report",
                     )
+                    _use_avg_lift = st.checkbox(
+                        "Use Average Monthly Lift (for student housing / seasonal portfolios)",
+                        value=False,
+                        key="use_avg_lift_toggle",
+                        help="Default uses simple lift (current - pre). Check this for portfolios "
+                             "where current-month comparisons distort the story due to seasonality.",
+                    )
 
                 _exec_col1, _exec_col2, _exec_col3, _exec_col4 = st.columns(4)
 
@@ -9092,6 +9070,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             monthly_revenue_series=_pdf_monthly_series if _pdf_monthly_series else None,
                             comparable_current_rev=_comp_current_rev_latest,
                             pmc_system=st.session_state.get("pmc_system", "yardi"),
+                            use_avg_lift=_use_avg_lift,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
