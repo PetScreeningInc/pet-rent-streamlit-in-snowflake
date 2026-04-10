@@ -8968,13 +8968,13 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         value=False,
                         key="include_pm_report",
                     )
-                    _use_avg_lift = st.checkbox(
-                        "Use Average Monthly Lift (for student housing / seasonal portfolios)",
-                        value=False,
-                        key="use_avg_lift_toggle",
-                        help="Default uses simple lift (current - pre). Check this for portfolios "
-                             "where current-month comparisons distort the story due to seasonality.",
-                    )
+                _use_avg_lift = st.checkbox(
+                    "Use Average Monthly Lift (for student housing / seasonal portfolios)",
+                    value=False,
+                    key="use_avg_lift_toggle",
+                    help="Default uses simple lift (current - pre). Check this for portfolios "
+                         "where current-month comparisons distort the story due to seasonality.",
+                )
 
                 _exec_col1, _exec_col2, _exec_col3, _exec_col4 = st.columns(4)
 
