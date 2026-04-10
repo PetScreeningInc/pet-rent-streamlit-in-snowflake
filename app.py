@@ -2927,6 +2927,8 @@ def generate_tranche_pdf(
     monthly_revenue_series=None,
     comparable_current_rev=0,
     pmc_system="yardi",
+    use_avg_lift=False,
+    asset_class="conventional",
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -2935,6 +2937,10 @@ def generate_tranche_pdf(
 
     Returns PDF bytes ready for st.download_button.
     """
+    # Auto-set use_avg_lift for student_housing and seasonal asset classes
+    if asset_class in ("student_housing", "seasonal"):
+        use_avg_lift = True
+
     from fpdf import FPDF
 
     class PDF(FPDF):
@@ -3157,12 +3163,26 @@ def generate_tranche_pdf(
         _headline_units = total_units
         _headline_props = n_props_with_data
 
+    # Simple lift (current - pre)
     _monthly_lift = _headline_current - _headline_pre if _headline_pre > 0 else 0
     _simple_pct = (_monthly_lift / _headline_pre * 100) if _headline_pre > 0 and _monthly_lift else 0
-    _adjusted_lift = t1_mo if comparable_count > 0 else 0  # kept for Value Created section
-    _lift_per_unit = _monthly_lift / _headline_units if _headline_units and _headline_units > 0 and _monthly_lift else 0
-    _annual_lift = _monthly_lift * 12
-    _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
+
+    # Average monthly lift (property-by-property average)
+    _adjusted_lift = t1_mo if comparable_count > 0 else 0
+
+    # Choose methodology based on use_avg_lift toggle
+    if use_avg_lift:
+        # Use average monthly lift (t1_mo) for all calculations
+        _active_lift = _adjusted_lift
+        _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
+        _annual_lift = _active_lift * 12
+        _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
+    else:
+        # Use simple lift (current - pre) for all calculations
+        _active_lift = _monthly_lift
+        _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
+        _annual_lift = _active_lift * 12
+        _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
 
     # Full portfolio rev-per-unit (used if no comparable)
     _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
@@ -3188,7 +3208,7 @@ def generate_tranche_pdf(
         )
         _glance_parts.append(
             f" Today those same properties generate ${_headline_current:,.0f}/mo -- "
-            f"a ${_monthly_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
+            f"a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
             f"${_lift_per_unit:,.2f} per unit per month."
         )
         if _asset_value_impact > 0:
@@ -3199,7 +3219,7 @@ def generate_tranche_pdf(
         _glance_parts.append(
             f"Across {comparable_count} comparable properties, pet revenue was "
             f"${_headline_pre:,.0f}/mo before PetScreening and is now "
-            f"${_headline_current:,.0f}/mo -- a ${_monthly_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
+            f"${_headline_current:,.0f}/mo -- a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
         )
     else:
         _glance_parts.append(
@@ -3251,20 +3271,22 @@ def generate_tranche_pdf(
 
     # ── KPI cards -- row 2: lift + per-unit + cap rate ──
     _glance_row2 = []
-    if _monthly_lift != 0:
-        _lift_sign = "+" if _monthly_lift > 0 else ""
+    if _active_lift != 0:
+        _lift_sign = "+" if _active_lift > 0 else ""
+        _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+        _lift_sub = f"Property-by-property average" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
         _glance_row2.append({
-            "value": f"{_lift_sign}${_monthly_lift:,.0f}/mo",
-            "label": "Monthly Lift",
-            "sub": f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)",
-            "color": light_blue if _monthly_lift > 0 else orange,
+            "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
+            "label": _lift_label,
+            "sub": _lift_sub,
+            "color": light_blue if _active_lift > 0 else orange,
         })
     if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
         _lpu_sign = "+" if _lift_per_unit > 0 else ""
         _glance_row2.append({
             "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
             "label": "Lift per Unit",
-            "sub": f"${_monthly_lift:,.0f} / {_headline_units:,} units",
+            "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
             "color": light_blue if _lift_per_unit > 0 else orange,
         })
     elif total_units and total_units > 0 and _rev_per_unit > 0:
@@ -3279,7 +3301,7 @@ def generate_tranche_pdf(
         _glance_row2.append({
             "value": _avi_str,
             "label": "Est. Asset Value Impact",
-            "sub": f"${_monthly_lift:,.0f}/mo x 12 / 5% cap rate",
+            "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate",
             "color": light_blue,
         })
 
@@ -3301,14 +3323,14 @@ def generate_tranche_pdf(
 
     pdf.ln(1)
 
-    # ── KPI cards -- row 3: Leakage ──
-    # Leakage = confirmed missing rent + suspected undisclosed pets
+    # ── KPI cards -- row 3: Pet Revenue Found (formerly Leakage) ──
+    # Found = confirmed missing rent + suspected undisclosed pets
     _leakage_mo = _opp_recurring_mo + (su_current_mo or 0)
     _leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
     _units_for_per_unit = _headline_units if _headline_units and _headline_units > 0 else total_units
     _leakage_per_unit = _leakage_mo / _units_for_per_unit if _units_for_per_unit and _units_for_per_unit > 0 and _leakage_mo > 0 else 0
-    _cumulative_lift_per_unit = _lift_per_unit + _leakage_per_unit  # actuals + leakage
-    _total_combined_mo = _monthly_lift + _leakage_mo  # actuals lift + leakage
+    _cumulative_lift_per_unit = _lift_per_unit + _leakage_per_unit  # actuals + found
+    _total_combined_mo = _active_lift + _leakage_mo  # actuals lift + found
     _projected_annual_combined = _total_combined_mo * 12
     _combined_asset_value = _projected_annual_combined / _cap_rate if _projected_annual_combined > 0 else 0
 
@@ -3319,20 +3341,20 @@ def generate_tranche_pdf(
         _glance_row3 = []
         _glance_row3.append({
             "value": f"${_leakage_mo:,.0f}/mo",
-            "label": "Revenue Leakage",
+            "label": "Pet Revenue Found",
             "sub": f"{_leakage_tenants:,} residents not paying pet fees",
             "color": orange,
         })
         if _units_for_per_unit and _units_for_per_unit > 0:
             _glance_row3.append({
                 "value": f"${_leakage_per_unit:,.2f}/unit/mo",
-                "label": "Leakage per Unit",
+                "label": "Found per Unit",
                 "sub": f"${_leakage_mo:,.0f} / {_units_for_per_unit:,} units  |  Combined: ${_cumulative_lift_per_unit:,.2f}/unit/mo",
                 "color": orange,
             })
         _glance_row3.append({
             "value": _format_large_currency(_leakage_asset_value),
-            "label": "Est. Value Impact (Leakage)",
+            "label": "Est. Value Impact (Found)",
             "sub": f"${_leakage_mo:,.0f}/mo x 12 / 5% cap rate",
             "color": orange,
         })
@@ -3343,19 +3365,19 @@ def generate_tranche_pdf(
         draw_card_row(_glance_row3)
         pdf.ln(1)
 
-        # ── KPI cards -- row 4: Combined (Actuals + Leakage) ──
+        # ── KPI cards -- row 4: Combined (Actuals + Found) ──
         _glance_row4 = []
         _glance_row4.append({
             "value": f"${_total_combined_mo:,.0f}/mo",
             "label": "Total Opportunity",
-            "sub": f"Actuals ${_monthly_lift:,.0f} + Leakage ${_leakage_mo:,.0f}",
+            "sub": f"Actuals ${_active_lift:,.0f} + Found ${_leakage_mo:,.0f}",
             "color": green,
         })
         if _units_for_per_unit and _units_for_per_unit > 0:
             _glance_row4.append({
                 "value": f"${_cumulative_lift_per_unit:,.2f}/unit/mo",
                 "label": "Combined Lift per Unit",
-                "sub": f"${_lift_per_unit:,.2f} actual + ${_leakage_per_unit:,.2f} leakage",
+                "sub": f"${_lift_per_unit:,.2f} actual + ${_leakage_per_unit:,.2f} found",
                 "color": green,
             })
         _glance_row4.append({
@@ -3370,17 +3392,28 @@ def generate_tranche_pdf(
         draw_card_row(_glance_row4)
 
     elif _asset_value_impact > 0:
-        # No leakage — show cap rate callout instead
+        # No found revenue — show cap rate callout instead
         pdf.ln(1)
         callout_box(
             f"Estimated Asset Value Impact: ${_asset_value_impact:,.0f} "
-            f"(${_monthly_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
+            f"(${_active_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
+        )
+
+    # ── Portfolio extrapolation callout (if non-comparable properties exist) ──
+    if _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
+        pdf.ln(2)
+        _extrapolated_noncomp_lift = _lift_per_unit * _noncomp_units
+        _total_portfolio_lift = _active_lift + _extrapolated_noncomp_lift
+        show_work(
+            f"If we apply the same per-unit lift across the {_noncomp_count} additional properties "
+            f"we don't yet have pre-launch data for, the estimated total monthly lift across your "
+            f"full portfolio would be ~${_total_portfolio_lift:,.0f}/mo."
         )
 
     # ═══════════════════════════════════════════════════════════
     #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION (same page)
     # ═══════════════════════════════════════════════════════════
-    # Use combined lift per unit (actuals + leakage) for scaling
+    # Use combined lift per unit (actuals + found) for scaling
     _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
     if total_portfolio_units and total_portfolio_units > 0 and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0:
         pdf.ln(2)
@@ -3390,7 +3423,7 @@ def generate_tranche_pdf(
         _proj_annual = _proj_monthly * 12
         _proj_asset_value = _proj_annual / _cap_rate
 
-        _lift_source = "combined lift + leakage" if _leakage_mo > 0 else "lift"
+        _lift_source = "combined lift + found" if _leakage_mo > 0 else "lift"
         _scale_text = (
             f"If {label} were to roll PetScreening across their full portfolio of "
             f"~{total_portfolio_units:,} units, the ${_scale_lift_per_unit:,.2f}/unit/mo {_lift_source} "
@@ -3434,13 +3467,26 @@ def generate_tranche_pdf(
     # ═══════════════════════════════════════════════════════════
     section_heading("Value Created", green)
 
-    _sign_t1 = "+" if t1_mo > 0 else ""
-    _t1_color = green if t1_mo >= 0 else orange
-    _cum_str = f"${t1_total:,.0f}" if comparable_count > 0 and t1_total != 0 else "--"
-
     # Use comparable or full portfolio for Value Created cards
     _vc_current = _headline_current if _has_comparable else current_monthly_rev
     _vc_props_label = f"{comparable_count} comparable properties" if _has_comparable else f"{n_props_with_data} properties"
+
+    # Choose lift based on methodology toggle (same as page 1)
+    if use_avg_lift:
+        _vc_lift = _adjusted_lift
+        _vc_lift_label = "Average Monthly Lift"
+        _vc_lift_sub = "Property-by-property average" if comparable_count > 0 and _vc_lift != 0 else None
+    else:
+        _vc_lift = _monthly_lift
+        _vc_lift_label = "Monthly Lift"
+        _vc_lift_sub = f"{_simple_pct:+.1f}% vs baseline" if _has_comparable and _vc_lift != 0 else None
+
+    _sign_vc = "+" if _vc_lift > 0 else ""
+    _vc_color = green if _vc_lift >= 0 else orange
+
+    # Calculate asset value impact from chosen methodology
+    _vc_annual_lift = _vc_lift * 12
+    _vc_asset_value = _vc_annual_lift / _cap_rate if _vc_annual_lift > 0 else 0
 
     draw_card_row([
         {
@@ -3450,45 +3496,34 @@ def generate_tranche_pdf(
             "color": dark_blue,
         },
         {
-            "value": f"{_sign_t1}${t1_mo:,.0f}/mo" if comparable_count > 0 and t1_mo != 0 else "--",
-            "label": "Adjusted Revenue Lift",
-            "sub": f"{t1_pct:+.1f}% vs baseline" if comparable_count > 0 and t1_pct != 0 else None,
-            "color": _t1_color,
+            "value": f"{_sign_vc}${_vc_lift:,.0f}/mo" if _vc_lift != 0 else "--",
+            "label": _vc_lift_label,
+            "sub": _vc_lift_sub,
+            "color": _vc_color,
         },
         {
-            "value": _cum_str,
-            "label": "Cumulative Revenue Impact",
-            "sub": f"Over {t1_months} post-launch months" if comparable_count > 0 and t1_months > 0 else None,
-            "color": green if t1_total > 0 else dark_blue,
+            "value": _format_large_currency(_vc_asset_value) if _vc_asset_value > 0 else "--",
+            "label": "Est. Asset Value Impact",
+            "sub": f"${_vc_lift:,.0f}/mo x 12 / 5% cap" if _vc_asset_value > 0 else None,
+            "color": green if _vc_asset_value > 0 else dark_blue,
         },
     ])
 
     # Show your work
     show_work(f"Current revenue: sum of pet fee charges across {_vc_props_label} for the latest month of data.")
-    if comparable_count > 0 and t1_mo != 0:
-        show_work(
-            f"Adjusted lift: ${t1_mo:,.0f}/mo across {comparable_count} comparable properties "
-            f"(property-by-property pre vs post average)."
-        )
 
-    if comparable_count > 0 and t1_mo != 0:
-        if t1_mo > 0:
-            pct_note = f", a {t1_pct:.1f}% increase" if t1_pct > 0 else ""
+    if _vc_lift != 0 and (_has_comparable or _vc_current > 0):
+        if _vc_lift > 0:
             narrative(
-                f"Across {comparable_count} comparable properties, pet revenue grew from "
-                f"${_headline_pre:,.0f}/mo to ${_vc_current:,.0f}/mo. "
-                f"After adjusting for property-by-property pre/post averages, "
-                f"the net adjusted lift is ${t1_mo:,.0f}/mo{pct_note}. "
-                f"Over {t1_months} months, this totals ${t1_total:,.0f} in cumulative "
-                f"incremental revenue."
+                f"Across {_vc_props_label}, pet revenue is ${_vc_current:,.0f}/mo, "
+                f"representing a ${_vc_lift:,.0f}/mo lift from the pre-launch baseline. "
+                f"At a 5% cap rate, this represents ~${_vc_asset_value:,.0f} in added asset value."
             )
         else:
             # Negative lift — acknowledge and pivot to opportunity
-            _neg_mo = abs(t1_mo)
-            _neg_total = abs(t1_total)
+            _neg_mo = abs(_vc_lift)
             _pivot_parts = [
-                f"Pet fee revenue is currently ${_neg_mo:,.0f}/mo below the pre-launch baseline "
-                f"of ${pre_baseline:,.0f}/mo (${_neg_total:,.0f} cumulative over {t1_months} months). "
+                f"Pet fee revenue is currently ${_neg_mo:,.0f}/mo below the pre-launch baseline. "
             ]
             # Pivot to opportunity
             if t2_tenants > 0 and _opp_recurring_mo > 0:
@@ -3685,6 +3720,7 @@ def generate_tranche_pdf(
     # ── Suspected Undisclosed explainer ──
     if su_total_profiles and su_total_profiles > 0:
         pdf.ln(1)
+        divider()  # Visual separator before definition
         pdf.set_font('Helvetica', 'I', 7.5)
         pdf.set_text_color(*light_gray)
         pdf.multi_cell(0, 4,
@@ -3727,9 +3763,11 @@ def generate_tranche_pdf(
         _simple_chg = current_monthly_rev - pre_baseline
         _simple_chg_sign = "+" if _simple_chg > 0 else ""
         metrics.append(("Simple Revenue Change", f"{_simple_chg_sign}${_simple_chg:,.0f}/mo", lift_color(_simple_chg)))
-        metrics.append(("Adjusted Monthly Lift", f"{_t1_sign_m}${t1_mo:,.0f}/mo", lift_color(t1_mo)))
+        metrics.append(("Average Monthly Lift", f"{_t1_sign_m}${t1_mo:,.0f}/mo", lift_color(t1_mo)))
         metrics.append(("Cumulative Revenue Impact", f"${t1_total:,.0f}", lift_color(t1_total)))
-        _annual_lift_m = t1_mo * 12
+        # Use methodology-appropriate lift for annualized calculations (same as page 1)
+        _active_lift_m = _adjusted_lift if use_avg_lift else _monthly_lift
+        _annual_lift_m = _active_lift_m * 12
         metrics.append(("Annualized Lift", f"${_annual_lift_m:,.0f}/yr", lift_color(_annual_lift_m)))
         if _annual_lift_m > 0:
             _avi_m = _annual_lift_m / 0.05
@@ -3742,8 +3780,11 @@ def generate_tranche_pdf(
         metrics.append(("Suspected Undisclosed Revenue", f"~${su_current_mo:,.0f}/mo", orange))
     if t3_adoption is not None:
         metrics.append((f"{adopt_type_label} Adoption", f"{t3_adoption:.1f}%", green if t3_adoption >= 50 else orange))
-    if t3_additional > 0:
-        metrics.append(("Additional Opportunity at 100%", f"+${t3_additional:,.0f}/mo", green))
+    # Use consistent calculation for Additional Opportunity at 100%
+    if total_projected and total_projected > 0:
+        _additional_at_100_km = total_projected - (current_monthly_rev or 0)
+        if _additional_at_100_km > 0:
+            metrics.append(("Additional Opportunity at 100%", f"+${_additional_at_100_km:,.0f}/mo", green))
     if total_projected and total_projected > 0:
         metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo", None))
     if total_units and total_units > 0:
@@ -4045,10 +4086,10 @@ def generate_tranche_pdf(
     )
 
     narrative(
-        "Simple Difference vs. Adjusted Lift: The 'simple difference' is the raw change "
-        "in monthly revenue (current total minus pre-launch total). The 'adjusted lift' "
+        "Simple Difference vs. Average Monthly Lift: The 'simple difference' is the raw change "
+        "in monthly revenue (current total minus pre-launch total). The 'average monthly lift' "
         "is calculated property-by-property, comparing each property's own pre-launch "
-        "average to its post-launch average. The adjusted figure accounts for properties "
+        "average to its post-launch average. The average monthly figure accounts for properties "
         "added or removed from the portfolio since launch."
     )
 
