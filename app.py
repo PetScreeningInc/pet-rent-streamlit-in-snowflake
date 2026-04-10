@@ -3028,7 +3028,7 @@ def generate_tranche_pdf(
                 pdf.set_xy(x + 2, start_y + 15)
                 pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
 
-        pdf.set_y(start_y + CARD_H + 3)
+        pdf.set_y(start_y + CARD_H + 2)
 
     # ── Helper: highlighted callout box (for cap rate) ──
     def callout_box(text, color=orange):
@@ -3057,30 +3057,30 @@ def generate_tranche_pdf(
         # Check for page break
         if pdf.get_y() + min_space > pdf.h - pdf.b_margin:
             pdf.add_page()
-        pdf.set_font('Helvetica', 'B', 12)
+        pdf.set_font('Helvetica', 'B', 11)
         pdf.set_text_color(*color)
-        pdf.cell(0, 7, title, ln=True)
+        pdf.cell(0, 6, title, ln=True)
         # Colored underline
         y = pdf.get_y()
         pdf.set_draw_color(*color)
         pdf.set_line_width(0.6)
         pdf.line(PAGE_L, y, PAGE_L + 50, y)
         pdf.set_line_width(0.2)
-        pdf.ln(3)
+        pdf.ln(2)
 
     # ── Helper: narrative text ──
     def narrative(text):
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.set_text_color(*body_gray)
-        pdf.multi_cell(0, 4.5, text)
-        pdf.ln(2)
+        pdf.multi_cell(0, 4, text)
+        pdf.ln(1)
 
     # ── Helper: divider ──
     def divider():
         pdf.set_draw_color(*card_border)
         y = pdf.get_y()
         pdf.line(PAGE_L, y, PAGE_R, y)
-        pdf.ln(5)
+        pdf.ln(3)
 
     # ── Pre-compute recurring vs one-time (used by both sections) ──
     _opp_recurring_mo = 0
@@ -3717,26 +3717,27 @@ def generate_tranche_pdf(
                     f" At 100% {adopt_type_label.lower()} adoption, projected pet fee revenue would be "
                     f"${total_projected:,.0f}/mo -- an additional ${_additional_at_100:,.0f}/mo opportunity."
                 )
-        # Append suspected undisclosed definition directly to avoid page overflow
-        if su_total_profiles and su_total_profiles > 0:
-            _ph_narrative += (
-                f" 'Suspected Undisclosed' ({su_total_profiles:,} tenants) refers to residents who "
-                f"started screening but abandoned it, have unresolved assistance requests, or declared "
-                f"no pet after starting an assistance profile -- directional signals for follow-up, not billing."
-            )
         narrative(_ph_narrative)
     else:
-        _ph_fallback = (
+        narrative(
             f"{n_with_launch} of {n_props_total} properties have an established PetScreening "
             f"launch date. Adoption data will populate once screening activity is available."
         )
-        if su_total_profiles and su_total_profiles > 0:
-            _ph_fallback += (
-                f" 'Suspected Undisclosed' ({su_total_profiles:,} tenants) refers to residents who "
-                f"started screening but abandoned it, have unresolved assistance requests, or declared "
-                f"no pet after starting an assistance profile -- directional signals for follow-up, not billing."
-            )
-        narrative(_ph_fallback)
+
+    # ── Suspected Undisclosed explainer (separate block with divider) ──
+    if su_total_profiles and su_total_profiles > 0:
+        pdf.set_draw_color(*card_border)
+        _sep_y = pdf.get_y()
+        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'I', 6.5)
+        pdf.set_text_color(*light_gray)
+        pdf.multi_cell(USABLE_W, 3,
+            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
+            "but never completed it, have an unresolved assistance animal request, or declared "
+            "'no pet' after starting an assistance profile.  Not confirmed pet owners "
+            "-- directional signals for follow-up, not billing."
+        )
 
     # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
