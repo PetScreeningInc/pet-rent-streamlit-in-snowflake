@@ -2213,6 +2213,7 @@ def generate_html_report(
     label, fig_individual, fig_snapshot, launch_analysis, monthly_by_prop, months,
     launch_dates, projected_100=None, overlay_mode_label=None,
     missing_rent_data=None, show_missing_rent=False, total_properties_fetched=0,
+    use_avg_lift=False,
 ):
     """Generate a self-contained interactive HTML report for client sharing.
 
@@ -2236,7 +2237,23 @@ def generate_html_report(
     n_props_total = total_properties_fetched if total_properties_fetched else len(monthly_by_prop)
     n_comparable = len(comparable)
 
-    sign_mo = "+" if agg_diff_mo >= 0 else ""
+    # Simple lift: current month - pre baseline (across comparable)
+    _html_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
+    _html_latest = months[-1] if months else None
+    _html_current_rev = sum(monthly_by_prop[p].get(_html_latest, 0) for p in comparable.keys()) if comparable and _html_latest else 0
+    _html_simple_lift = _html_current_rev - _html_pre_baseline if _html_pre_baseline > 0 else 0
+
+    # Post avg
+    _html_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in comparable.values()) if comparable else 0
+
+    # Display based on toggle
+    _html_display_lift = agg_diff_mo if use_avg_lift else _html_simple_lift
+    _html_lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+    _html_lift_caption = f"Property-by-property post avg vs pre avg across {n_comparable} properties" if use_avg_lift else f"Current month minus pre-PS baseline across {n_comparable} properties"
+    _html_rev_val = _html_post_avg if (use_avg_lift and _html_post_avg > 0) else _html_current_rev
+    _html_rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Pet Revenue"
+
+    sign_mo = "+" if _html_display_lift >= 0 else ""
     sign_t = "+" if agg_diff >= 0 else ""
 
     # ── Impact table rows ─────────────────────────────────────────────
@@ -2813,14 +2830,14 @@ def generate_html_report(
     <h2>PetScreening Revenue Impact</h2>
     <div class="kpi-row">
       <div class="kpi-card">
-        <div class="kpi-label">Cumulative Pet Revenue Impact</div>
-        <div class="kpi-value">{sign_t}${agg_diff:,.0f}</div>
-        <div class="kpi-caption">Cumulative pet fee impact since launch</div>
+        <div class="kpi-label">{_html_rev_label}</div>
+        <div class="kpi-value">${_html_rev_val:,.0f}/mo</div>
+        <div class="kpi-caption">Across {n_comparable} comparable properties</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Monthly Pet Revenue Change</div>
-        <div class="kpi-value">{sign_mo}${agg_diff_mo:,.0f}/mo</div>
-        <div class="kpi-caption">Average monthly pet fee uplift since launch across {n_comparable} properties</div>
+        <div class="kpi-label">{_html_lift_label}</div>
+        <div class="kpi-value">{sign_mo}${_html_display_lift:,.0f}/mo</div>
+        <div class="kpi-caption">{_html_lift_caption}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Properties with Launch Date</div>
@@ -2833,12 +2850,11 @@ def generate_html_report(
   <!-- Methodology -->
   <div class="methodology">
     <h3>How We Calculate PetScreening Impact</h3>
-    <p>For each property, we compare average monthly pet fee revenue <b>before</b> vs <b>after</b> PetScreening launch:</p>
+    {"<p>This report uses <b>Average Monthly Lift</b>. For seasonal portfolios, comparing a single month can be misleading. Instead, each property's post-launch average is compared to its pre-launch baseline.</p>" if use_avg_lift else "<p>For each property, we compare the most recently completed month's pet fee revenue to the pre-launch baseline:</p>"}
     <ul>
-      <li><b>Before PetScreening (avg/mo)</b> — Average of up to 6 months before launch (uses whatever pre-launch data is available)</li>
-      <li><b>After PetScreening (avg/mo)</b> — Average of all completed post-launch months (excludes current partial month)</li>
-      <li><b>Monthly Change</b> = Cumulative impact ÷ completed post months (average monthly uplift since launch)</li>
-      <li><b>Total Change</b> = Total post-launch revenue − (Pre avg × post months) — actual observed cumulative impact</li>
+      <li><b>Before PetScreening (avg/mo)</b> -- Average of up to 6 months before launch</li>
+      {"<li><b>After PetScreening (avg/mo)</b> -- Average of all completed post-launch months</li>" if use_avg_lift else "<li><b>Current Revenue</b> -- Most recently completed month's pet fee charges</li>"}
+      <li><b>{_html_lift_label}</b> = {"Post-launch average minus pre-launch average (property by property)" if use_avg_lift else "Current month revenue minus pre-launch baseline"}</li>
     </ul>
   </div>
 
@@ -7832,6 +7848,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             missing_rent_data=_missing_rent_data if show_missing_rent else None,
                             show_missing_rent=show_missing_rent,
                             total_properties_fetched=len(st.session_state.get("property_ids", [])),
+                            use_avg_lift=_fc_use_avg,
                         )
                         st.session_state["export_html"] = report_html
                         st.session_state["export_label"] = label
