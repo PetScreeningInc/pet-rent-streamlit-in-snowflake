@@ -3217,8 +3217,15 @@ def generate_tranche_pdf(
 
     # ── Helper: color for a lift value ──
     def lift_color(val):
+        """Color for lift/actuals metrics — teal for positive, orange for negative."""
         if val is None:
             return (160, 160, 160)  # gray for N/A
+        return _teal_blue if val >= 0 else orange
+
+    def combined_color(val):
+        """Color for combined/total metrics — green for positive."""
+        if val is None:
+            return (160, 160, 160)
         return green if val >= 0 else orange
 
     # ── Helper: format large currency values with K/M suffixes ──
@@ -3643,7 +3650,7 @@ def generate_tranche_pdf(
         _vc_lift_sub = f"{_simple_pct:+.1f}% vs baseline" if _has_comparable and _vc_lift != 0 else None
 
     _sign_vc = "+" if _vc_lift > 0 else ""
-    _vc_color = green if _vc_lift >= 0 else orange
+    _vc_color = _teal_blue if _vc_lift >= 0 else orange  # teal for actuals, matches At a Glance
 
     # Calculate asset value impact from chosen methodology
     _vc_annual_lift = _vc_lift * 12
@@ -3951,7 +3958,7 @@ def generate_tranche_pdf(
         metrics.append(("Annualized Lift", f"${_annual_lift_m:,.0f}/yr", lift_color(_annual_lift_m)))
         if _annual_lift_m > 0:
             _avi_m = _annual_lift_m / 0.05
-            metrics.append(("Est. Asset Value Impact (5% Cap)", _format_large_currency(_avi_m), green))
+            metrics.append(("Est. Asset Value Impact (5% Cap)", _format_large_currency(_avi_m), _teal_blue))
     if t2_tenants > 0:
         metrics.append(("Tenants Not Paying Pet Rent", f"{t2_tenants:,}", orange))
         metrics.append(("Uncollected Revenue", f"${_opp_recurring_mo:,.0f}/mo", orange))
@@ -3978,7 +3985,7 @@ def generate_tranche_pdf(
             _km_found_per_unit = _km_found_mo / _km_units if _km_found_mo > 0 else 0
             _km_combined_lpu = _km_lift_per_unit + _km_found_per_unit
             _km_combined_sign = "+" if _km_combined_lpu > 0 else ""
-            metrics.append(("Combined Lift per Unit", f"{_km_combined_sign}${_km_combined_lpu:,.2f}/unit/mo", lift_color(_km_combined_lpu)))
+            metrics.append(("Combined Lift per Unit", f"{_km_combined_sign}${_km_combined_lpu:,.2f}/unit/mo", combined_color(_km_combined_lpu)))
             if _km_found_per_unit > 0:
                 _km_lpu_sign = "+" if _km_lift_per_unit > 0 else ""
                 metrics.append(("", f"  Actual: {_km_lpu_sign}${_km_lift_per_unit:,.2f}  |  Found: +${_km_found_per_unit:,.2f}", None))
