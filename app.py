@@ -3067,12 +3067,9 @@ def generate_tranche_pdf(
             card_bg = card.get("bg", card_fill)
             text_color = card.get("color", dark_blue)
 
-            # Special handling for 'total' row style
-            if row_style == "total" and i == 0:
-                card_bg = dark_blue
-                text_color = (255, 255, 255)  # white text
-            elif row_style == "total":
-                card_bg = _sage_green_bg  # light sage/green
+            # Special handling for 'total' row style — all cards get sage green bg
+            if row_style == "total":
+                card_bg = _sage_green_bg  # light sage/green for all total row cards
                 text_color = green
 
             # Card background with rounded corners
@@ -3088,10 +3085,7 @@ def generate_tranche_pdf(
 
             # Label
             pdf.set_font('Helvetica', '', 6.5)
-            if row_style == "total" and i == 0:
-                pdf.set_text_color(200, 200, 200)  # light gray on dark bg
-            else:
-                pdf.set_text_color(*light_gray)
+            pdf.set_text_color(*light_gray)
             pdf.set_xy(x + 2, start_y + 10)
             pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
 
@@ -3106,40 +3100,37 @@ def generate_tranche_pdf(
                 plus_w = 6
                 total_w = actuals_w + plus_w + found_w
                 start_x = x + (CARD_W - total_w) / 2
-                # Actuals pill (green bg)
-                draw_pill_label(start_x, pill_y, actuals_text, (200, 230, 200), green)
+                # Actuals pill (teal/blue bg to match row 2)
+                draw_pill_label(start_x, pill_y, actuals_text, _actuals_pill_bg, _teal_blue)
                 # Plus sign
                 pdf.set_font('Helvetica', 'B', 6)
-                pdf.set_text_color(255, 255, 255)
+                pdf.set_text_color(*green)
                 pdf.set_xy(start_x + actuals_w + 1, pill_y + 0.5)
                 pdf.cell(4, 3, "+", align='C')
                 # Found pill (orange bg)
-                draw_pill_label(start_x + actuals_w + plus_w, pill_y, found_text, (255, 220, 200), orange)
+                draw_pill_label(start_x + actuals_w + plus_w, pill_y, found_text, _opportunity_pill_bg, orange)
             elif card.get("sub"):
                 pdf.set_font('Helvetica', '', 5.5)
-                if row_style == "total" and i == 0:
-                    pdf.set_text_color(180, 180, 180)
-                else:
-                    pdf.set_text_color(150, 150, 150)
+                pdf.set_text_color(150, 150, 150)
                 pdf.set_xy(x + 2, start_y + 15)
                 pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
 
         pdf.set_y(start_y + CARD_H + 2)
 
     def draw_separator_text(text):
-        """Draw a small centered separator text in a pill."""
-        pdf.set_font('Helvetica', '', 5)
-        text_w = pdf.get_string_width(text) + 8
+        """Draw a small centered separator text in a sage green pill with green text."""
+        pdf.set_font('Helvetica', 'B', 5)
+        text_w = pdf.get_string_width(text) + 10
         pill_x = PAGE_L + (USABLE_W - text_w) / 2
-        pdf.set_fill_color(240, 240, 235)
+        pdf.set_fill_color(*_sage_green_bg)  # same sage green as total row
         try:
-            pdf.rounded_rect(pill_x, pdf.get_y(), text_w, 4, 1, style='F')
+            pdf.rounded_rect(pill_x, pdf.get_y(), text_w, 5, 1.5, style='F')
         except AttributeError:
-            pdf.rect(pill_x, pdf.get_y(), text_w, 4, 'F')
-        pdf.set_text_color(*light_gray)
-        pdf.set_xy(pill_x, pdf.get_y() + 0.5)
+            pdf.rect(pill_x, pdf.get_y(), text_w, 5, 'F')
+        pdf.set_text_color(*green)  # green text
+        pdf.set_xy(pill_x, pdf.get_y() + 1)
         pdf.cell(text_w, 3, text.upper(), align='C')
-        pdf.ln(5)
+        pdf.ln(6)
 
     # ── Helper: highlighted callout box (for cap rate) ──
     def callout_box(text, color=orange):
