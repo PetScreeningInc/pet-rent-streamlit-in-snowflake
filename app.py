@@ -3673,7 +3673,7 @@ def generate_tranche_pdf(
             "value": _format_large_currency(_vc_asset_value) if _vc_asset_value > 0 else "--",
             "label": "Est. Asset Value Impact",
             "sub": f"${_vc_lift:,.0f}/mo x 12 / 5% cap" if _vc_asset_value > 0 else None,
-            "color": green if _vc_asset_value > 0 else dark_blue,
+            "color": _teal_blue if _vc_asset_value > 0 else dark_blue,
         },
     ])
 
