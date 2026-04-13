@@ -3624,7 +3624,7 @@ def generate_tranche_pdf(
             if _active_lift_dt > 0:
                 _dt_lines.append(
                     f"Across {comparable_count} comparable properties, post-launch pet revenue averages "
-                    f"${_comp_post_avg:,.0f}/mo — an estimated +${_active_lift_dt:,.0f}/mo increase "
+                    f"${_comp_post_avg:,.0f}/mo -- an estimated +${_active_lift_dt:,.0f}/mo increase "
                     f"({(_active_lift_dt / pre_baseline * 100):.1f}%) compared to the pre-launch baseline of ${pre_baseline:,.0f}/mo."
                 )
         elif _noncomp_count > 0:
