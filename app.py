@@ -3580,7 +3580,8 @@ def generate_tranche_pdf(
                     f"more than close this gap. "
                 )
             if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
-                _additional_at_100 = total_projected - (current_monthly_rev or 0)
+                _base_rev_for_100 = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+                _additional_at_100 = total_projected - _base_rev_for_100
                 if _additional_at_100 > 0:
                     _pivot_parts.append(
                         f"Combined with closing the adoption gap from {t3_adoption:.1f}% to 100% "
@@ -3597,6 +3598,16 @@ def generate_tranche_pdf(
     # ── DATA TRANSPARENCY ──
     _pmc_label = pmc_system.capitalize() if pmc_system else "PMS"
     _dt_lines = []
+
+    # Methodology note when using average lift
+    if use_avg_lift:
+        _dt_lines.append(
+            "This report uses Average Monthly Lift methodology. For portfolios with "
+            "seasonal fluctuation (student housing, vacation properties), comparing any "
+            "single month to pre-launch can be misleading. Instead, we compare each "
+            "property's post-launch average to its pre-launch baseline for a more "
+            "stable view of PetScreening's impact."
+        )
 
     # PMC scope disclaimer
     _dt_lines.append(
@@ -3703,7 +3714,8 @@ def generate_tranche_pdf(
             "All screened tenants are currently being charged pet rent -- no billing gaps identified."
         )
         if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
-            _additional_at_100 = total_projected - current_monthly_rev if current_monthly_rev else 0
+            _opp_base_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+            _additional_at_100 = total_projected - _opp_base_rev
             if _additional_at_100 > 0:
                 _opportunity_note += (
                     f" However, your portfolio is currently at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
@@ -3751,7 +3763,8 @@ def generate_tranche_pdf(
             f"and {n_props_with_data} have sufficient charge data for analysis."
         )
         if total_projected and total_projected > 0:
-            _additional_at_100 = total_projected - (current_monthly_rev or 0)
+            _ph_base_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+            _additional_at_100 = total_projected - _ph_base_rev
             if _additional_at_100 > 0:
                 _ph_narrative += (
                     f" At 100% {adopt_type_label.lower()} adoption, projected pet fee revenue would be "
@@ -3799,8 +3812,11 @@ def generate_tranche_pdf(
 
     # metrics: list of (label, value_str, color_override_or_None)
     metrics = []
+    # Revenue metric label/value based on toggle
+    _km_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else current_monthly_rev
+    _km_rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Monthly Pet-Related Revenue"
     metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo", None))
-    metrics.append(("Current Monthly Pet-Related Revenue", f"${current_monthly_rev:,.0f}/mo", None))
+    metrics.append((_km_rev_label, f"${_km_rev:,.0f}/mo", None))
     if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
         # Only show the methodology being used — less noise, fewer questions
         _active_lift_m = _adjusted_lift if use_avg_lift else _monthly_lift
@@ -3820,18 +3836,19 @@ def generate_tranche_pdf(
         metrics.append(("Suspected Undisclosed Revenue", f"~${su_current_mo:,.0f}/mo", orange))
     if t3_adoption is not None:
         metrics.append((f"{adopt_type_label} Adoption", f"{t3_adoption:.1f}%", green if t3_adoption >= 50 else orange))
-    # Use consistent calculation for Additional Opportunity at 100%
+    # Use methodology-appropriate revenue for Additional Opportunity at 100%
     if total_projected and total_projected > 0:
-        _additional_at_100_km = total_projected - (current_monthly_rev or 0)
+        _additional_at_100_km = total_projected - _km_rev
         if _additional_at_100_km > 0:
             metrics.append(("Additional Opportunity at 100%", f"+${_additional_at_100_km:,.0f}/mo", green))
     if total_projected and total_projected > 0:
         metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo", None))
     if total_units and total_units > 0:
         metrics.append(("Total Units", f"{total_units:,}", None))
-        if current_monthly_rev and total_units > 0:
-            _rev_per_unit_m = current_monthly_rev / total_units
-            metrics.append(("Pet Revenue per Unit", f"${_rev_per_unit_m:,.2f}/unit/mo", None))
+        if _km_rev and total_units > 0:
+            _rev_per_unit_m = _km_rev / total_units
+            _rpu_label = "Pet Revenue per Unit (Post-Avg)" if use_avg_lift else "Pet Revenue per Unit"
+            metrics.append((_rpu_label, f"${_rev_per_unit_m:,.2f}/unit/mo", None))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
 
