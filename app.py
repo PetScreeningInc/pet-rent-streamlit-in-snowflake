@@ -7169,16 +7169,23 @@ if st.session_state.all_charges_df is not None:
                                   if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
                     n_no_pre = len(launch_analysis) - len(comparable)
 
-                    if comparable:
-                        agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values())
-                        agg_diff = sum(a["diff_total"] for a in comparable.values())
-                        sign_mo = "+" if agg_diff_mo >= 0 else ""
-                        sign_t = "+" if agg_diff >= 0 else ""
-                    else:
-                        agg_diff = 0
-                        agg_diff_mo = 0
-                        sign_mo = ""
-                        sign_t = ""
+                    # Read toggle state (same as Summary tab)
+                    _fc_use_avg = st.session_state.get("use_avg_lift_toggle", False)
+
+                    # Avg lift (property-by-property average)
+                    agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
+                    agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
+
+                    # Simple lift (current month - pre baseline)
+                    _fc_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
+                    _fc_current_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0
+                    _fc_simple_lift = _fc_current_rev - _fc_pre_baseline if _fc_pre_baseline > 0 else 0
+
+                    # Display based on toggle
+                    _fc_display_lift = agg_diff_mo if _fc_use_avg else _fc_simple_lift
+                    _fc_lift_label = "Average Monthly Lift" if _fc_use_avg else "Monthly Lift"
+                    sign_mo = "+" if _fc_display_lift >= 0 else ""
+                    sign_t = "+" if agg_diff >= 0 else ""
 
                     # Only count launch dates for properties that actually have charge data
                     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -7189,17 +7196,24 @@ if st.session_state.all_charges_df is not None:
                     n_no_launch = max(0, len(monthly_by_prop) - n_with_launch)
 
                     lcol1, lcol2, lcol3 = st.columns(3)
-                    lcol1.metric(
-                        "Cumulative Pet Revenue Impact",
-                        f"{sign_t}${agg_diff:,.0f}",
-                        help="Sum of each comparable property's (Monthly Change × post months). "
-                             "Matches the Total Change column in the table below."
-                    )
+                    # Show current rev or post avg based on toggle
+                    if _fc_use_avg:
+                        _fc_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in comparable.values()) if comparable else 0
+                        lcol1.metric(
+                            "Post-PS Avg Pet Revenue",
+                            f"${_fc_post_avg:,.0f}/mo",
+                            help="Sum of each comparable property's post-launch average revenue."
+                        )
+                    else:
+                        lcol1.metric(
+                            "Current Pet Revenue",
+                            f"${_fc_current_rev:,.0f}/mo",
+                            help=f"Sum of pet fee charges for comparable properties in {latest_month.strftime('%b %Y')}."
+                        )
                     lcol2.metric(
-                        "Monthly Pet Revenue Change",
-                        f"{sign_mo}${agg_diff_mo:,.0f}/mo",
-                        help="Sum of each comparable property's Monthly Change. "
-                             "You can verify: add up the Monthly Change column in the table below."
+                        _fc_lift_label,
+                        f"{sign_mo}${_fc_display_lift:,.0f}/mo",
+                        help="Average monthly lift (property averages)" if _fc_use_avg else f"Current month ({latest_month.strftime('%b %Y')}) minus pre-PS baseline."
                     )
 
                     launch_detail = f"{n_comparable} comparable (pre & post data)"
@@ -8903,19 +8917,17 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 # ── Detailed metrics (collapsed) ──
                 _quick_rows = []
                 _quick_rows.append({"Metric": "Pre-PS Baseline", "Value": f"${_pre_baseline_total:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                if _use_avg_lift:
+                if _use_avg:
                     _qr_comp_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in _comparable.values()) if _comparable else 0
                     _quick_rows.append({"Metric": "Post-PS Avg Pet Revenue", "Value": f"${_qr_comp_post_avg:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
                 else:
                     _quick_rows.append({"Metric": "Current Monthly Pet Fee Revenue", "Value": f"${_current_monthly_rev:,.0f}", "Period": _latest_str})
                 if _comparable:
                     _qr_simple_lift = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
-                    _qr_lift = _t1_mo if _use_avg_lift else _qr_simple_lift
-                    _qr_lift_label = "Average Monthly Lift" if _use_avg_lift else "Monthly Lift"
+                    _qr_lift = _t1_mo if _use_avg else _qr_simple_lift
+                    _qr_lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
                     _qr_sign = "+" if _qr_lift > 0 else ""
                     _quick_rows.append({"Metric": _qr_lift_label, "Value": f"{_qr_sign}${_qr_lift:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                    if not _use_avg_lift:
-                        _quick_rows.append({"Metric": "Cumulative Revenue Impact", "Value": f"${_t1_total:,.0f}", "Period": f"over {_t1_months} months"})
                 if _t2_tenants > 0:
                     _quick_rows.append({"Metric": "Tenants Not Paying", "Value": f"{_t2_tenants:,}", "Period": f"across {_t2_props} properties"})
                     _quick_rows.append({"Metric": "Uncollected Revenue", "Value": f"${_t2_mo:,.0f}/mo", "Period": _latest_str})
