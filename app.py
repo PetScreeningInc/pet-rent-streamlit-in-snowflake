@@ -3853,17 +3853,31 @@ def generate_tranche_pdf(
             metrics.append(("Additional Opportunity at 100%", f"+${_additional_at_100_km:,.0f}/mo", green))
     if total_projected and total_projected > 0:
         metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo", None))
-    if total_units and total_units > 0:
-        metrics.append(("Total Units", f"{total_units:,}", None))
-        # Use lift per unit (consistent with At a Glance)
+    # Use same units as At a Glance (comparable units when available)
+    _km_units = _comp_units if (_has_comparable and _comp_units > 0) else total_units
+    if _km_units and _km_units > 0:
+        metrics.append(("Units (in analysis)", f"{_km_units:,}", None))
+        # Combined lift per unit = actual lift + found, consistent with At a Glance row 4
         if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
-            _lift_per_unit_m = _active_lift_m / total_units if total_units > 0 else 0
-            _lpu_sign = "+" if _lift_per_unit_m > 0 else ""
-            metrics.append(("Lift per Unit", f"{_lpu_sign}${_lift_per_unit_m:,.2f}/unit/mo", lift_color(_lift_per_unit_m)))
+            _km_lift_per_unit = _active_lift_m / _km_units
+            _km_found_mo = _opp_recurring_mo + (su_current_mo or 0)
+            _km_found_per_unit = _km_found_mo / _km_units if _km_found_mo > 0 else 0
+            _km_combined_lpu = _km_lift_per_unit + _km_found_per_unit
+            _km_combined_sign = "+" if _km_combined_lpu > 0 else ""
+            metrics.append(("Combined Lift per Unit", f"{_km_combined_sign}${_km_combined_lpu:,.2f}/unit/mo", lift_color(_km_combined_lpu)))
+            if _km_found_per_unit > 0:
+                _km_lpu_sign = "+" if _km_lift_per_unit > 0 else ""
+                metrics.append(("", f"  Actual: {_km_lpu_sign}${_km_lift_per_unit:,.2f}  |  Found: +${_km_found_per_unit:,.2f}", None))
+    # ── Analysis scope ──
     if comparable_count > 0:
         metrics.append(("Comparable Properties (in analysis)", f"{comparable_count} of {n_props_with_data}", None))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
+
+    # ── Portfolio totals (context, not used in lift) ──
+    if total_units and total_units > 0:
+        metrics.append(("Total Portfolio Units", f"{total_units:,}", None))
+    metrics.append(("Total Properties in Portfolio", f"{n_props_total}", None))
 
     pdf.set_font('Helvetica', '', 9)
     for i, (label_m, value_m, val_color) in enumerate(metrics):
@@ -4233,9 +4247,9 @@ def generate_tranche_pdf(
         )
     if _opp_onetime_total > 0:
         _uncollected_parts.append(
-            f" One-time fees (${_opp_onetime_total:,.0f} total) represent non-recurring charges "
-            f"(e.g., pet deposits, DNA kits) that tenants owe but have not been billed. "
-            f"These are calculated using each property's average one-time charge amount."
+            f" One-time fees (${_opp_onetime_total:,.0f} total) are charges classified as "
+            f"non-recurring in the selected charge codes. The amount per tenant is based on "
+            f"each property's average one-time charge to paying tenants."
         )
     narrative("".join(_uncollected_parts))
 
