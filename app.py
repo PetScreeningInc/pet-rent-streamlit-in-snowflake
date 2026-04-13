@@ -3011,9 +3011,12 @@ def generate_tranche_pdf(
     CARD_H = 24          # compact cards to fit 4 rows + How This Scales on page 1
 
     # ── Helper: draw a row of 3 KPI cards ──
-    def draw_card_row(cards):
+    def draw_card_row(cards, row_label=None, row_label_color=None, row_style=None):
         """Draw 3 cards side-by-side. Each card is a dict:
-        {value: str, label: str, sub: str|None, color: tuple}
+        {value: str, label: str, sub: str|None, color: tuple, bg: tuple|None, accent: tuple|None}
+        row_label: optional label above first card (e.g., 'ACTUALS')
+        row_label_color: color for the row label
+        row_style: 'total' for dark background combined row
         """
         start_y = pdf.get_y()
         # Check if we need a page break (card row + narrative below ~50mm)
@@ -3021,30 +3024,69 @@ def generate_tranche_pdf(
             pdf.add_page()
             start_y = pdf.get_y()
 
+        # Row label above first card
+        if row_label:
+            pdf.set_font('Helvetica', 'B', 6)
+            pdf.set_text_color(*(row_label_color or dark_blue))
+            pdf.set_xy(PAGE_L + 2, start_y - 3)
+            pdf.cell(30, 3, row_label.upper(), align='L')
+
         for i, card in enumerate(cards):
             x = PAGE_L + i * (CARD_W + CARD_GAP)
+            # Determine card background
+            card_bg = card.get("bg", card_fill)
+            card_accent = card.get("accent")  # left border accent color
+            text_color = card.get("color", dark_blue)
+
+            # Special handling for 'total' row style
+            if row_style == "total" and i == 0:
+                card_bg = dark_blue
+                text_color = (255, 255, 255)  # white text
+            elif row_style == "total":
+                card_bg = (240, 244, 248)  # light gray-blue
+                text_color = green
+
             # Card background
-            pdf.set_fill_color(*card_fill)
+            pdf.set_fill_color(*card_bg)
             pdf.set_draw_color(*card_border)
             pdf.rect(x, start_y, CARD_W, CARD_H, 'DF')
+
+            # Left accent bar (if specified)
+            if card_accent:
+                pdf.set_fill_color(*card_accent)
+                pdf.rect(x, start_y, 1.5, CARD_H, 'F')
+
             # Big number
             pdf.set_font('Helvetica', 'B', 16)
-            pdf.set_text_color(*card.get("color", dark_blue))
+            pdf.set_text_color(*text_color)
             pdf.set_xy(x + 2, start_y + 2)
             pdf.cell(CARD_W - 4, 7, card["value"], align='C')
             # Label
             pdf.set_font('Helvetica', '', 6.5)
-            pdf.set_text_color(*light_gray)
+            if row_style == "total" and i == 0:
+                pdf.set_text_color(200, 200, 200)  # light gray on dark bg
+            else:
+                pdf.set_text_color(*light_gray)
             pdf.set_xy(x + 2, start_y + 10)
             pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
             # Sub-label (optional)
             if card.get("sub"):
                 pdf.set_font('Helvetica', '', 5.5)
-                pdf.set_text_color(150, 150, 150)
+                if row_style == "total" and i == 0:
+                    pdf.set_text_color(180, 180, 180)
+                else:
+                    pdf.set_text_color(150, 150, 150)
                 pdf.set_xy(x + 2, start_y + 15)
                 pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
 
         pdf.set_y(start_y + CARD_H + 2)
+
+    def draw_separator_text(text):
+        """Draw a small centered separator text between card rows."""
+        pdf.set_font('Helvetica', '', 5)
+        pdf.set_text_color(*light_gray)
+        pdf.cell(0, 3, text.upper(), align='C', ln=True)
+        pdf.ln(1)
 
     # ── Helper: highlighted callout box (for cap rate) ──
     def callout_box(text, color=orange):
@@ -3372,7 +3414,8 @@ def generate_tranche_pdf(
         break
 
     if _glance_row2:
-        draw_card_row(_glance_row2)
+        pdf.ln(2)  # space for label
+        draw_card_row(_glance_row2, row_label="Actuals", row_label_color=light_blue)
 
     pdf.ln(1)
 
@@ -3415,8 +3458,12 @@ def generate_tranche_pdf(
         while len(_glance_row3) < 3:
             _glance_row3.append({"value": "", "label": "", "sub": None, "color": dark_blue})
 
-        draw_card_row(_glance_row3)
+        pdf.ln(2)  # space for label
+        draw_card_row(_glance_row3, row_label="Opportunity", row_label_color=orange)
         pdf.ln(1)
+
+        # Separator text
+        draw_separator_text("Total = Monthly Lift (Actuals) + Pet Revenue Found (Opportunity)")
 
         # ── KPI cards -- row 4: Combined (Actuals + Found) ──
         _glance_row4 = []
@@ -3442,7 +3489,7 @@ def generate_tranche_pdf(
         while len(_glance_row4) < 3:
             _glance_row4.append({"value": "", "label": "", "sub": None, "color": dark_blue})
 
-        draw_card_row(_glance_row4)
+        draw_card_row(_glance_row4, row_label="Total Opportunity", row_label_color=green, row_style="total")
 
     elif _asset_value_impact > 0:
         # No found revenue — show cap rate callout instead
