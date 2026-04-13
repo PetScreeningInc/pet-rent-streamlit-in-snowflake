@@ -3010,6 +3010,13 @@ def generate_tranche_pdf(
     CARD_W = (USABLE_W - 2 * CARD_GAP) / 3  # ~57.3mm
     CARD_H = 24          # compact cards to fit 4 rows + How This Scales on page 1
 
+    # ── Helper: sanitize text for fpdf (replace unicode dashes) ──
+    def _pdf_safe(text):
+        """Replace unicode dashes with ASCII equivalents for fpdf compatibility."""
+        if text is None:
+            return ""
+        return str(text).replace("\u2013", "-").replace("\u2014", "--").replace("\u2019", "'").replace("\u2018", "'")
+
     # ── Helper: draw a row of 3 KPI cards ──
     # Colors for styled rows
     _sage_green_bg = (235, 243, 235)  # light sage/green for total row cards 2&3
@@ -4042,7 +4049,7 @@ def generate_tranche_pdf(
         pdf.set_text_color(*body_gray)
         for pname in sorted(_pm_by_prop.keys()):
             emails = sorted(_pm_by_prop[pname])
-            pdf.cell(90, 5, pname[:45], border='LR')
+            pdf.cell(90, 5, _pdf_safe(pname[:45]), border='LR')
             pdf.cell(90, 5, ", ".join(emails)[:80], border='LR', ln=True)
         # Close table bottom
         pdf.cell(180, 0, '', border='T', ln=True)
@@ -4126,7 +4133,7 @@ def generate_tranche_pdf(
 
             # Truncate property name
             _short_name = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
-            _short_name = _short_name[:28]
+            _short_name = _pdf_safe(_short_name[:28])
 
             pdf.set_text_color(*body_gray)
             pdf.cell(_col_widths[0], 5, f' {_short_name}', border='LR', fill=True)
@@ -4215,7 +4222,7 @@ def generate_tranche_pdf(
                         pdf.set_fill_color(250, 250, 248)
 
                     _short_ep = ep_name.split(" - ", 1)[-1] if " - " in ep_name else ep_name
-                    _short_ep = _short_ep[:45]
+                    _short_ep = _pdf_safe(_short_ep[:45])
                     pdf.set_text_color(*body_gray)
                     pdf.cell(_ex_widths[0], 5, f' {_short_ep}', border='LR', fill=True)
                     pdf.set_text_color(*dark_blue)
@@ -4267,7 +4274,7 @@ def generate_tranche_pdf(
                 continue
             _avg_fee = pdata.get("avg_recurring", 0)
             _short_prop = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
-            _short_prop = _short_prop[:28]
+            _short_prop = _pdf_safe(_short_prop[:28])
             for tenant in tenants:
                 # Page break check
                 if pdf.get_y() + 5 > pdf.h - pdf.b_margin:
