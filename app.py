@@ -3617,20 +3617,30 @@ def generate_tranche_pdf(
     )
 
     # Comparable vs non-comparable breakdown
-    if _has_comparable and _noncomp_count > 0:
-        _nc_detail = f"{_noncomp_count} additional properties"
-        if _noncomp_units > 0:
-            _nc_detail += f" ({_noncomp_units:,} units)"
-        _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison, so are excluded from the lift analysis."
-        _dt_lines.append(_nc_detail)
-        _dt_lines.append(
-            f"Total portfolio pet revenue across all {n_props_with_data} {_pmc_label} properties: "
-            f"${current_monthly_rev:,.0f}/mo."
-        )
-    elif _has_comparable:
-        _dt_lines.append(
-            f"All {n_props_with_data} properties with charge data have pre-launch baselines."
-        )
+    if _has_comparable:
+        if use_avg_lift:
+            # When using avg lift, emphasize the post-avg increase
+            _active_lift_dt = _adjusted_lift if _adjusted_lift else 0
+            if _active_lift_dt > 0:
+                _dt_lines.append(
+                    f"Across {comparable_count} comparable properties, post-launch pet revenue averages "
+                    f"${_comp_post_avg:,.0f}/mo — an estimated +${_active_lift_dt:,.0f}/mo increase "
+                    f"({(_active_lift_dt / pre_baseline * 100):.1f}%) compared to the pre-launch baseline of ${pre_baseline:,.0f}/mo."
+                )
+        elif _noncomp_count > 0:
+            _nc_detail = f"{_noncomp_count} additional properties"
+            if _noncomp_units > 0:
+                _nc_detail += f" ({_noncomp_units:,} units)"
+            _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison, so are excluded from the lift analysis."
+            _dt_lines.append(_nc_detail)
+            _dt_lines.append(
+                f"Total portfolio pet revenue across all {n_props_with_data} {_pmc_label} properties: "
+                f"${current_monthly_rev:,.0f}/mo."
+            )
+        else:
+            _dt_lines.append(
+                f"All {n_props_with_data} properties with charge data have pre-launch baselines."
+            )
 
     if _dt_lines:
         pdf.ln(1)
@@ -3845,10 +3855,11 @@ def generate_tranche_pdf(
         metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo", None))
     if total_units and total_units > 0:
         metrics.append(("Total Units", f"{total_units:,}", None))
-        if _km_rev and total_units > 0:
-            _rev_per_unit_m = _km_rev / total_units
-            _rpu_label = "Pet Revenue per Unit (Post-Avg)" if use_avg_lift else "Pet Revenue per Unit"
-            metrics.append((_rpu_label, f"${_rev_per_unit_m:,.2f}/unit/mo", None))
+        # Use lift per unit (consistent with At a Glance)
+        if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
+            _lift_per_unit_m = _active_lift_m / total_units if total_units > 0 else 0
+            _lpu_sign = "+" if _lift_per_unit_m > 0 else ""
+            metrics.append(("Lift per Unit", f"{_lpu_sign}${_lift_per_unit_m:,.2f}/unit/mo", lift_color(_lift_per_unit_m)))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
 
