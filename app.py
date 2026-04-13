@@ -3011,12 +3011,44 @@ def generate_tranche_pdf(
     CARD_H = 24          # compact cards to fit 4 rows + How This Scales on page 1
 
     # ── Helper: draw a row of 3 KPI cards ──
+    # Colors for styled rows
+    _sage_green_bg = (235, 243, 235)  # light sage/green for total row cards 2&3
+    _teal_blue = (58, 134, 155)  # teal/blue for actuals values
+    _actuals_pill_bg = (230, 242, 245)  # light blue pill background
+    _opportunity_pill_bg = (255, 240, 230)  # light orange pill background
+
+    def draw_rounded_rect(x, y, w, h, r, style='DF'):
+        """Draw a rectangle with rounded corners using arcs."""
+        # fpdf2 supports rounded_rect; fallback to regular rect if not available
+        try:
+            pdf.set_line_width(0.3)
+            pdf.rounded_rect(x, y, w, h, r, style=style)
+        except AttributeError:
+            pdf.rect(x, y, w, h, style)
+
+    def draw_pill_label(x, y, text, bg_color, text_color):
+        """Draw a small pill/badge with text."""
+        pdf.set_font('Helvetica', 'B', 5.5)
+        text_w = pdf.get_string_width(text) + 4
+        pill_h = 4
+        # Pill background
+        pdf.set_fill_color(*bg_color)
+        try:
+            pdf.rounded_rect(x, y, text_w, pill_h, 1, style='F')
+        except AttributeError:
+            pdf.rect(x, y, text_w, pill_h, 'F')
+        # Pill text
+        pdf.set_text_color(*text_color)
+        pdf.set_xy(x + 2, y + 0.5)
+        pdf.cell(text_w - 4, pill_h - 1, text, align='C')
+        return text_w
+
     def draw_card_row(cards, row_label=None, row_label_color=None, row_style=None):
         """Draw 3 cards side-by-side. Each card is a dict:
-        {value: str, label: str, sub: str|None, color: tuple, bg: tuple|None, accent: tuple|None}
-        row_label: optional label above first card (e.g., 'ACTUALS')
-        row_label_color: color for the row label
-        row_style: 'total' for dark background combined row
+        {value: str, label: str, sub: str|None, color: tuple, bg: tuple|None}
+        row_label: optional label in a pill above first card (e.g., 'ACTUALS')
+        row_label_color: color for the row label text
+        row_style: 'total' for combined row styling
         """
         start_y = pdf.get_y()
         # Check if we need a page break (card row + narrative below ~50mm)
@@ -3024,18 +3056,15 @@ def generate_tranche_pdf(
             pdf.add_page()
             start_y = pdf.get_y()
 
-        # Row label above first card
-        if row_label:
-            pdf.set_font('Helvetica', 'B', 6)
-            pdf.set_text_color(*(row_label_color or dark_blue))
-            pdf.set_xy(PAGE_L + 2, start_y - 3)
-            pdf.cell(30, 3, row_label.upper(), align='L')
+        # Row label pill above first card
+        if row_label and row_style != "total":
+            pill_bg = _actuals_pill_bg if row_label_color == _teal_blue else _opportunity_pill_bg
+            draw_pill_label(PAGE_L + 2, start_y - 4, row_label.upper(), pill_bg, row_label_color or dark_blue)
 
         for i, card in enumerate(cards):
             x = PAGE_L + i * (CARD_W + CARD_GAP)
-            # Determine card background
+            # Determine card background and text color
             card_bg = card.get("bg", card_fill)
-            card_accent = card.get("accent")  # left border accent color
             text_color = card.get("color", dark_blue)
 
             # Special handling for 'total' row style
@@ -3043,24 +3072,20 @@ def generate_tranche_pdf(
                 card_bg = dark_blue
                 text_color = (255, 255, 255)  # white text
             elif row_style == "total":
-                card_bg = (240, 244, 248)  # light gray-blue
+                card_bg = _sage_green_bg  # light sage/green
                 text_color = green
 
-            # Card background
+            # Card background with rounded corners
             pdf.set_fill_color(*card_bg)
             pdf.set_draw_color(*card_border)
-            pdf.rect(x, start_y, CARD_W, CARD_H, 'DF')
-
-            # Left accent bar (if specified)
-            if card_accent:
-                pdf.set_fill_color(*card_accent)
-                pdf.rect(x, start_y, 1.5, CARD_H, 'F')
+            draw_rounded_rect(x, start_y, CARD_W, CARD_H, 2, 'DF')
 
             # Big number
             pdf.set_font('Helvetica', 'B', 16)
             pdf.set_text_color(*text_color)
             pdf.set_xy(x + 2, start_y + 2)
             pdf.cell(CARD_W - 4, 7, card["value"], align='C')
+
             # Label
             pdf.set_font('Helvetica', '', 6.5)
             if row_style == "total" and i == 0:
@@ -3069,8 +3094,28 @@ def generate_tranche_pdf(
                 pdf.set_text_color(*light_gray)
             pdf.set_xy(x + 2, start_y + 10)
             pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
-            # Sub-label (optional)
-            if card.get("sub"):
+
+            # Sub-label OR pills for total row first card
+            if row_style == "total" and i == 0 and card.get("actuals_val") and card.get("found_val"):
+                # Draw colored pills: "$X actuals" + "+" + "$Y found"
+                pill_y = start_y + 14.5
+                actuals_text = f"${card['actuals_val']:,.0f} actuals"
+                found_text = f"${card['found_val']:,.0f} found"
+                actuals_w = pdf.get_string_width(actuals_text) + 6
+                found_w = pdf.get_string_width(found_text) + 6
+                plus_w = 6
+                total_w = actuals_w + plus_w + found_w
+                start_x = x + (CARD_W - total_w) / 2
+                # Actuals pill (green bg)
+                draw_pill_label(start_x, pill_y, actuals_text, (200, 230, 200), green)
+                # Plus sign
+                pdf.set_font('Helvetica', 'B', 6)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_xy(start_x + actuals_w + 1, pill_y + 0.5)
+                pdf.cell(4, 3, "+", align='C')
+                # Found pill (orange bg)
+                draw_pill_label(start_x + actuals_w + plus_w, pill_y, found_text, (255, 220, 200), orange)
+            elif card.get("sub"):
                 pdf.set_font('Helvetica', '', 5.5)
                 if row_style == "total" and i == 0:
                     pdf.set_text_color(180, 180, 180)
@@ -3082,11 +3127,19 @@ def generate_tranche_pdf(
         pdf.set_y(start_y + CARD_H + 2)
 
     def draw_separator_text(text):
-        """Draw a small centered separator text between card rows."""
+        """Draw a small centered separator text in a pill."""
         pdf.set_font('Helvetica', '', 5)
+        text_w = pdf.get_string_width(text) + 8
+        pill_x = PAGE_L + (USABLE_W - text_w) / 2
+        pdf.set_fill_color(240, 240, 235)
+        try:
+            pdf.rounded_rect(pill_x, pdf.get_y(), text_w, 4, 1, style='F')
+        except AttributeError:
+            pdf.rect(pill_x, pdf.get_y(), text_w, 4, 'F')
         pdf.set_text_color(*light_gray)
-        pdf.cell(0, 3, text.upper(), align='C', ln=True)
-        pdf.ln(1)
+        pdf.set_xy(pill_x, pdf.get_y() + 0.5)
+        pdf.cell(text_w, 3, text.upper(), align='C')
+        pdf.ln(5)
 
     # ── Helper: highlighted callout box (for cap rate) ──
     def callout_box(text, color=orange):
@@ -3374,7 +3427,7 @@ def generate_tranche_pdf(
             "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
             "label": _lift_label,
             "sub": _lift_sub,
-            "color": light_blue if _active_lift > 0 else orange,
+            "color": _teal_blue if _active_lift > 0 else orange,
         })
     if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
         _lpu_sign = "+" if _lift_per_unit > 0 else ""
@@ -3382,14 +3435,14 @@ def generate_tranche_pdf(
             "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
             "label": "Lift per Unit",
             "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
-            "color": light_blue if _lift_per_unit > 0 else orange,
+            "color": _teal_blue if _lift_per_unit > 0 else orange,
         })
     elif total_units and total_units > 0 and _rev_per_unit > 0:
         _glance_row2.append({
             "value": f"${_rev_per_unit:,.2f}/unit/mo",
             "label": "Revenue per Unit",
             "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
-            "color": light_blue,
+            "color": _teal_blue,
         })
     if _asset_value_impact > 0:
         _avi_str = _format_large_currency(_asset_value_impact)
@@ -3397,7 +3450,7 @@ def generate_tranche_pdf(
             "value": _avi_str,
             "label": "Est. Asset Value Impact",
             "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate",
-            "color": light_blue,
+            "color": _teal_blue,
         })
 
     # Pad row 2 to 3 cards
@@ -3414,8 +3467,8 @@ def generate_tranche_pdf(
         break
 
     if _glance_row2:
-        pdf.ln(2)  # space for label
-        draw_card_row(_glance_row2, row_label="Actuals", row_label_color=light_blue)
+        pdf.ln(3)  # space for label pill
+        draw_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
 
     pdf.ln(1)
 
@@ -3470,8 +3523,10 @@ def generate_tranche_pdf(
         _glance_row4.append({
             "value": f"${_total_combined_mo:,.0f}/mo",
             "label": "Total Opportunity",
-            "sub": f"Actuals ${_active_lift:,.0f} + Found ${_leakage_mo:,.0f}",
+            "sub": "Monthly Lift + Pet Revenue Found",
             "color": green,
+            "actuals_val": _active_lift,
+            "found_val": _leakage_mo,
         })
         if _units_for_per_unit and _units_for_per_unit > 0:
             _glance_row4.append({
