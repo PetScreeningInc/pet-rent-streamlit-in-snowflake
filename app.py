@@ -3120,17 +3120,22 @@ def generate_tranche_pdf(
     def draw_separator_text(text):
         """Draw a small centered separator text in a sage green pill with green text."""
         pdf.set_font('Helvetica', 'B', 5)
-        text_w = pdf.get_string_width(text) + 10
-        pill_x = PAGE_L + (USABLE_W - text_w) / 2
+        # Measure text width AFTER setting font
+        text_upper = text.upper()
+        measured_w = pdf.get_string_width(text_upper)
+        pill_w = measured_w + 12  # generous padding
+        pill_h = 6
+        pill_x = PAGE_L + (USABLE_W - pill_w) / 2
+        start_y = pdf.get_y()
         pdf.set_fill_color(*_sage_green_bg)  # same sage green as total row
         try:
-            pdf.rounded_rect(pill_x, pdf.get_y(), text_w, 5, 1.5, style='F')
+            pdf.rounded_rect(pill_x, start_y, pill_w, pill_h, 1.5, style='F')
         except AttributeError:
-            pdf.rect(pill_x, pdf.get_y(), text_w, 5, 'F')
+            pdf.rect(pill_x, start_y, pill_w, pill_h, 'F')
         pdf.set_text_color(*green)  # green text
-        pdf.set_xy(pill_x, pdf.get_y() + 1)
-        pdf.cell(text_w, 3, text.upper(), align='C')
-        pdf.ln(6)
+        pdf.set_xy(pill_x + 6, start_y + 1.5)
+        pdf.cell(measured_w, 3, text_upper, align='C')
+        pdf.set_y(start_y + pill_h + 2)
 
     # ── Helper: highlighted callout box (for cap rate) ──
     def callout_box(text, color=orange):
