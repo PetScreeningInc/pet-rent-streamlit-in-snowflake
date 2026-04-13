@@ -3860,6 +3860,8 @@ def generate_tranche_pdf(
             _lift_per_unit_m = _active_lift_m / total_units if total_units > 0 else 0
             _lpu_sign = "+" if _lift_per_unit_m > 0 else ""
             metrics.append(("Lift per Unit", f"{_lpu_sign}${_lift_per_unit_m:,.2f}/unit/mo", lift_color(_lift_per_unit_m)))
+    if comparable_count > 0:
+        metrics.append(("Comparable Properties (in analysis)", f"{comparable_count} of {n_props_with_data}", None))
     metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
     metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
 
@@ -4216,11 +4218,26 @@ def generate_tranche_pdf(
             "The portfolio-level lift is the sum across all comparable properties."
         )
 
-    narrative(
+    # Uncollected / missing rent methodology
+    _uncollected_parts = [
         "Pet Revenue Found: Tenants with active PetScreening profiles and household pets "
-        "who are not being charged pet rent, plus suspected undisclosed pets. Revenue "
-        "estimates use each property's actual average fee from paying tenants."
-    )
+        "who are not being charged pet rent, plus suspected undisclosed pets."
+    ]
+    if t2_tenants > 0 and _opp_recurring_mo > 0:
+        _avg_fee_meth = _opp_recurring_mo / t2_tenants
+        _uncollected_parts.append(
+            f" Recurring uncollected revenue is estimated at ${_opp_recurring_mo:,.0f}/mo: "
+            f"{t2_tenants:,} tenants x ${_avg_fee_meth:,.0f}/mo average fee. "
+            f"The average fee is derived from each property's actual charges to paying tenants "
+            f"with the same pet type."
+        )
+    if _opp_onetime_total > 0:
+        _uncollected_parts.append(
+            f" One-time fees (${_opp_onetime_total:,.0f} total) represent non-recurring charges "
+            f"(e.g., pet deposits, DNA kits) that tenants owe but have not been billed. "
+            f"These are calculated using each property's average one-time charge amount."
+        )
+    narrative("".join(_uncollected_parts))
 
     narrative(
         "Asset Value Impact: Annual lift divided by a 5% capitalization rate."
