@@ -3509,7 +3509,13 @@ def generate_tranche_pdf(
     section_heading("Value Created", green)
 
     # Use comparable or full portfolio for Value Created cards
-    _vc_current = _headline_current if _has_comparable else current_monthly_rev
+    # When avg lift toggled, show post avg instead of current
+    if use_avg_lift and _comp_post_avg > 0:
+        _vc_current = _comp_post_avg
+        _vc_current_label = "Post-PS Avg Pet Revenue"
+    else:
+        _vc_current = _headline_current if _has_comparable else current_monthly_rev
+        _vc_current_label = "Current Monthly Pet-Related Revenue"
     _vc_props_label = f"{comparable_count} comparable properties" if _has_comparable else f"{n_props_with_data} properties"
 
     # Choose lift based on methodology toggle (same as page 1)
@@ -3532,7 +3538,7 @@ def generate_tranche_pdf(
     draw_card_row([
         {
             "value": f"${_vc_current:,.0f}/mo",
-            "label": "Current Monthly Pet-Related Revenue",
+            "label": _vc_current_label,
             "sub": f"Across {_vc_props_label}",
             "color": dark_blue,
         },
@@ -4219,6 +4225,7 @@ def generate_exec_summary_html(
     current_monthly_rev, n_props_total, n_with_launch,
     quick_rows, pm_rows=None, email_subject="", email_body="",
     su_total_profiles=0, su_current_mo=0,
+    use_avg_lift=False, display_rev=None,
 ):
     """Generate a self-contained HTML executive summary for VP-level sharing.
 
@@ -4229,8 +4236,12 @@ def generate_exec_summary_html(
     _logo_white = _PS_LOGO_WHITE_URI
     _logo_dark = _PS_LOGO_DARK_URI
 
+    # Use display_rev if provided (post avg when toggled), otherwise current
+    _html_rev = display_rev if display_rev is not None else current_monthly_rev
+    _rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Monthly Pet Revenue"
     sign = "+" if rev_change_mo >= 0 else ""
     color_rev = "#677848" if rev_change_mo >= 0 else "#CF5A3F"
+    _lift_label = "Average Monthly Lift" if use_avg_lift else "Pet Revenue Change"
     adopt_str = f"{avg_adoption:.1f}%" if avg_adoption is not None else "—"
     proj_str = f"${total_projected:,.0f}/mo" if total_projected > 0 else "—"
     addl_str = f"+${total_additional:,.0f}/mo" if total_additional > 0 else ""
@@ -4284,8 +4295,9 @@ def generate_exec_summary_html(
             f"Additionally, <b>{su_total_profiles}</b> tenants show signals of having undisclosed pets."
         )
     if total_projected > 0 and avg_adoption is not None:
+        _collecting_label = "Post-launch average" if use_avg_lift else "Currently collecting"
         story_parts.append(
-            f"Currently collecting <b>${current_monthly_rev:,.0f}/mo</b> in pet fees. "
+            f"{_collecting_label} <b>${_html_rev:,.0f}/mo</b> in pet fees. "
             f"At <b>100% {adopt_type_label.lower()} adoption</b> (currently {avg_adoption:.1f}%), "
             f"projected total pet fee revenue could reach <b>${total_projected:,.0f}/mo</b> — "
             f"an additional <b>${total_additional:,.0f}/mo</b> across <b>{n_proj_props}</b> properties with data."
@@ -8492,6 +8504,21 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     )
 
                 _latest_str = _latest_month.strftime("%b %Y") if _latest_month else "N/A"
+                _use_avg = st.session_state.get("use_avg_lift_toggle", False)
+
+                # Compute post-launch average across comparable properties
+                _comp_post_avg_sum = sum(
+                    a.get("post_recent_avg", a.get("post_monthly_avg", 0))
+                    for a in _comparable.values()
+                ) if _comparable else 0
+
+                # Methodology-appropriate values
+                _simple_lift_mo = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
+                _display_rev = _comp_post_avg_sum if (_use_avg and _comp_post_avg_sum > 0) else _current_monthly_rev
+                _display_rev_label = "Post-PS Avg Pet Revenue" if _use_avg else "Current Monthly Pet-Related Revenue"
+                _display_rev_sub = f"Avg across {len(_comparable)} properties" if _use_avg else _latest_str
+                _display_lift = _t1_mo if _use_avg else _simple_lift_mo
+                _display_lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
 
                 st.markdown(
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
@@ -8502,50 +8529,74 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _vc1, _vc2, _vc3 = st.columns(3)
                 with _vc1:
                     st.markdown(_summary_card(
-                        f"${_current_monthly_rev:,.0f}",
-                        "Current Monthly Pet-Related Revenue",
-                        _latest_str,
+                        f"${_display_rev:,.0f}",
+                        _display_rev_label,
+                        _display_rev_sub,
                         color="#677848",
                     ), unsafe_allow_html=True)
                 with _vc2:
-                    if _comparable and _t1_mo != 0:
-                        _sign = "+" if _t1_mo > 0 else ""
+                    if _comparable and _display_lift != 0:
+                        _sign = "+" if _display_lift > 0 else ""
                         st.markdown(_summary_card(
-                            f"{_sign}${_t1_mo:,.0f}/mo",
-                            "Pet Revenue Change Since PS",
+                            f"{_sign}${_display_lift:,.0f}/mo",
+                            _display_lift_label,
                             f"Across {len(_comparable)} comparable properties",
-                            color="#677848" if _t1_mo > 0 else "#DD7B45",
+                            color="#677848" if _display_lift > 0 else "#DD7B45",
                         ), unsafe_allow_html=True)
                     else:
                         st.markdown(_summary_card(
                             "N/A",
-                            "Pet Revenue Change Since PS",
+                            _display_lift_label,
                             "Requires launch dates and pre-launch data",
                             color="#636569",
                         ), unsafe_allow_html=True)
                 with _vc3:
-                    if _comparable and _t1_total != 0:
-                        _sign = "+" if _t1_total > 0 else ""
-                        st.markdown(_summary_card(
-                            f"{_sign}${_t1_total:,.0f}",
-                            "Cumulative Pet Revenue Impact",
-                            f"Over {_t1_months} months",
-                            color="#677848" if _t1_total > 0 else "#DD7B45",
-                        ), unsafe_allow_html=True)
+                    # Show asset value impact instead of cumulative when using avg lift
+                    if _use_avg:
+                        _annual = _display_lift * 12
+                        _avi = _annual / 0.05 if _annual > 0 else 0
+                        if _avi > 0:
+                            if _avi >= 1_000_000:
+                                _avi_str = f"${_avi / 1_000_000:,.1f}M"
+                            else:
+                                _avi_str = f"${_avi:,.0f}"
+                            st.markdown(_summary_card(
+                                _avi_str,
+                                "Est. Asset Value Impact",
+                                "At 5% cap rate",
+                                color="#677848",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "N/A",
+                                "Est. Asset Value Impact",
+                                "Requires positive lift",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
                     else:
-                        st.markdown(_summary_card(
-                            "N/A",
-                            "Cumulative Pet Revenue Impact",
-                            "Requires launch dates and pre-launch data",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
+                        if _comparable and _t1_total != 0:
+                            _sign = "+" if _t1_total > 0 else ""
+                            st.markdown(_summary_card(
+                                f"{_sign}${_t1_total:,.0f}",
+                                "Cumulative Pet Revenue Impact",
+                                f"Over {_t1_months} months",
+                                color="#677848" if _t1_total > 0 else "#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "N/A",
+                                "Cumulative Pet Revenue Impact",
+                                "Requires launch dates and pre-launch data",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
 
-                if _comparable and _t1_mo != 0 and _pre_baseline_total > 0:
+                if _comparable and _display_lift != 0 and _pre_baseline_total > 0:
+                    _lift_pct = (_display_lift / _pre_baseline_total * 100)
                     st.markdown(
                         f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
                         f'text-align:center;margin:8px 0 28px 0">'
                         f'Pre-PS baseline was ${_pre_baseline_total:,.0f}/mo across {len(_comparable)} properties'
-                        f'{f" -- a {_t1_pct:.1f}% increase" if _t1_pct > 0 else ""}.</p>',
+                        f'{f" -- a {_lift_pct:.1f}% increase" if _lift_pct > 0 else ""}.</p>',
                         unsafe_allow_html=True,
                     )
                 else:
@@ -8852,10 +8903,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 # ── Detailed metrics (collapsed) ──
                 _quick_rows = []
                 _quick_rows.append({"Metric": "Pre-PS Baseline", "Value": f"${_pre_baseline_total:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                _quick_rows.append({"Metric": "Current Monthly Pet Fee Revenue", "Value": f"${_current_monthly_rev:,.0f}", "Period": _latest_str})
+                if _use_avg_lift:
+                    _qr_comp_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in _comparable.values()) if _comparable else 0
+                    _quick_rows.append({"Metric": "Post-PS Avg Pet Revenue", "Value": f"${_qr_comp_post_avg:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
+                else:
+                    _quick_rows.append({"Metric": "Current Monthly Pet Fee Revenue", "Value": f"${_current_monthly_rev:,.0f}", "Period": _latest_str})
                 if _comparable:
-                    _quick_rows.append({"Metric": "Monthly Revenue Lift", "Value": f"+${_t1_mo:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                    _quick_rows.append({"Metric": "Cumulative Revenue Impact", "Value": f"${_t1_total:,.0f}", "Period": f"over {_t1_months} months"})
+                    _qr_simple_lift = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
+                    _qr_lift = _t1_mo if _use_avg_lift else _qr_simple_lift
+                    _qr_lift_label = "Average Monthly Lift" if _use_avg_lift else "Monthly Lift"
+                    _qr_sign = "+" if _qr_lift > 0 else ""
+                    _quick_rows.append({"Metric": _qr_lift_label, "Value": f"{_qr_sign}${_qr_lift:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
+                    if not _use_avg_lift:
+                        _quick_rows.append({"Metric": "Cumulative Revenue Impact", "Value": f"${_t1_total:,.0f}", "Period": f"over {_t1_months} months"})
                 if _t2_tenants > 0:
                     _quick_rows.append({"Metric": "Tenants Not Paying", "Value": f"{_t2_tenants:,}", "Period": f"across {_t2_props} properties"})
                     _quick_rows.append({"Metric": "Uncollected Revenue", "Value": f"${_t2_mo:,.0f}/mo", "Period": _latest_str})
@@ -9209,8 +9269,17 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         _exec_email_body_parts += ["", "Please ensure your teams are following up with all new and renewing residents.", "", "Thank you!"]
                         _exec_email_body = "\n".join(_exec_email_body_parts)
 
+                        # Compute toggle-aware values for HTML
+                        _html_simple_lift = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
+                        _html_lift = _agg_diff_mo if _use_avg_lift else _html_simple_lift
+                        _html_comp_post_avg = sum(
+                            a.get("post_recent_avg", a.get("post_monthly_avg", 0))
+                            for a in _comparable.values()
+                        ) if _comparable else 0
+                        _html_display_rev = _html_comp_post_avg if (_use_avg_lift and _html_comp_post_avg > 0) else _current_monthly_rev
+
                         exec_html = generate_exec_summary_html(
-                            label=_label, rev_change_mo=_agg_diff_mo, rev_change_total=_agg_diff,
+                            label=_label, rev_change_mo=_html_lift, rev_change_total=_agg_diff,
                             avg_adoption=_avg_adoption, adopt_type_label=_adopt_type_label,
                             total_projected=_total_projected, total_additional=_total_additional,
                             n_proj_props=_n_proj_props, mr_total_profiles=_mr_total_profiles,
@@ -9220,6 +9289,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             pm_rows=_pm_for_report,
                             email_subject=_exec_email_subject, email_body=_exec_email_body,
                             su_total_profiles=_su_total_profiles, su_current_mo=_su_current_mo,
+                            use_avg_lift=_use_avg_lift, display_rev=_html_display_rev,
                         )
                         st.session_state["exec_html"] = exec_html
                         st.session_state["exec_label"] = _label
