@@ -210,11 +210,10 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         df = pd.DataFrame(all_charges)
         
         # Get launch dates from the properties we already loaded
-        pids_str = ",".join(str(p) for p in property_ids)
         launch_dates = {}
         for prop in properties:
             pname = prop.get("PROPERTY_NAME")
-            ldate = prop.get("PROPERTY_LAUNCH_DATE") or prop.get("PS_LIVE_DATE")
+            ldate = prop.get("PROPERTY_LAUNCH_DATE") or prop.get("launch_date")
             if pname and ldate:
                 try:
                     if isinstance(ldate, str):
@@ -229,6 +228,9 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         window_start = datetime(today.year - 5, today.month, 1)
         months = [m.to_pydatetime() for m in pd.date_range(start=window_start, end=window_end, freq='MS')]
         
+        # Import parse_date from app
+        parse_date = app_imports["parse_date"]
+        
         # Filter for pet-related charge codes (same as app)
         if "charge_code" not in df.columns:
             result["status"] = "failed"
@@ -237,89 +239,97 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         
         # Filter to pet charges only
         pet_mask = df["charge_code"].str.lower().str.contains("pet", na=False)
-        pet_df = df[pet_mask].copy()
+        filtered = df[pet_mask].copy()
         
-        if pet_df.empty:
+        if filtered.empty:
             result["status"] = "failed"
             result["error"] = "No pet-related charges found"
             return result
         
-        print(f"    Found {len(pet_df):,} pet charges")
+        print(f"    Found {len(filtered):,} pet charges")
         
-        selected_codes = pet_df["charge_code"].unique().tolist()
+        selected_codes = filtered["charge_code"].unique().tolist()
         
-        # Parse dates - the API returns charge_amount, charge_from_date, charge_to_date
-        def parse_date(d):
-            if pd.isna(d) or not d or str(d).strip() == "":
+        # Normalize dates & amounts (same as app lines ~6993-7019)
+        filtered["from_date"] = filtered["charge_from_date"].apply(parse_date)
+        filtered["_raw_to_date"] = filtered["charge_to_date"].apply(parse_date)
+        filtered["_move_out_dt"] = filtered["move_out"].apply(parse_date) if "move_out" in filtered.columns else None
+        filtered["_lease_to_dt"] = filtered["lease_to"].apply(parse_date) if "lease_to" in filtered.columns else None
+        filtered["amount"] = pd.to_numeric(filtered["charge_amount"], errors="coerce").fillna(0)
+        
+        # Effective to_date: coalesce(charge_to_date, move_out, lease_to)
+        def _effective_to_date(row):
+            charge_end = row.get("_raw_to_date")
+            if charge_end is not None and not pd.isna(charge_end):
+                return charge_end
+            status = str(row.get("tenant_status", "")).strip().lower()
+            if status == "current":
                 return None
-            if isinstance(d, datetime):
-                return d
-            for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%Y/%m/%d"]:
-                try:
-                    return datetime.strptime(str(d).strip()[:10], fmt)
-                except ValueError:
-                    continue
+            move_out_dt = row.get("_move_out_dt")
+            if move_out_dt is not None and not pd.isna(move_out_dt):
+                return move_out_dt
+            lease_to_dt = row.get("_lease_to_dt")
+            if lease_to_dt is not None and not pd.isna(lease_to_dt):
+                return lease_to_dt
             return None
+        filtered["to_date"] = filtered.apply(_effective_to_date, axis=1)
         
-        def parse_amount(a):
-            if pd.isna(a):
-                return 0
-            if isinstance(a, (int, float)):
-                return float(a)
-            try:
-                return float(str(a).replace(",", "").replace("$", "").strip())
-            except:
-                return 0
+        # Convert to parsed_charges list (same structure as app)
+        charge_cols = ["property_id", "property_name", "from_date", "to_date", "amount", 
+                       "charge_code", "tenant_code", "unit_code", "tenant_status"]
+        available_cols = [c for c in charge_cols if c in filtered.columns]
+        parsed_charges = filtered[available_cols].to_dict("records")
         
         # Classify charge codes (same logic as app)
-        charge_classification = {}
-        for (pname, cc), grp in pet_df.groupby(["property_name", "charge_code"]):
+        _code_class = {}
+        _by_prop_code = defaultdict(list)
+        for rec in parsed_charges:
+            key = (rec.get("property_name"), rec.get("charge_code"))
+            _by_prop_code[key].append(rec)
+        
+        for (pname, code), recs in _by_prop_code.items():
             spans = []
-            for _, row in grp.iterrows():
-                f = parse_date(row.get("charge_from_date"))
-                t = parse_date(row.get("charge_to_date"))
-                if f and t:
+            for r in recs:
+                f, t = r.get("from_date"), r.get("to_date")
+                if f and t and not pd.isna(f) and not pd.isna(t):
                     try:
                         spans.append((t - f).days)
-                    except:
+                    except (TypeError, AttributeError):
                         pass
             median_span = float(np.median(spans)) if spans else None
             if median_span is None:
-                charge_classification[(pname, cc)] = "recurring"
+                _code_class[(pname, code)] = "recurring"
             else:
-                charge_classification[(pname, cc)] = "recurring" if median_span > 60 else "onetime"
+                _code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
         
+        # Aggregate charges into monthly buckets (same as app)
         monthly_by_prop = defaultdict(lambda: defaultdict(float))
         
-        for _, row in pet_df.iterrows():
-            pname = row.get("property_name")
-            amt = parse_amount(row.get("charge_amount"))
-            from_dt = parse_date(row.get("charge_from_date"))
-            to_dt = parse_date(row.get("charge_to_date"))
-            cc = row.get("charge_code")
+        for rec in parsed_charges:
+            prop = rec.get("property_name")
+            amt = rec.get("amount", 0)
+            from_dt = rec.get("from_date")
+            to_dt = rec.get("to_date")
             
-            if pname is None or from_dt is None or amt <= 0:
+            if from_dt is None or pd.isna(from_dt) or amt <= 0:
                 continue
             
             try:
-                cs = datetime(from_dt.year, from_dt.month, 1)
+                charge_start = datetime(int(from_dt.year), int(from_dt.month), 1)
             except:
                 continue
             
-            ct = charge_classification.get((pname, cc), "recurring")
-            if ct == "onetime":
-                ce = cs
-            elif to_dt:
-                try:
-                    ce = datetime(to_dt.year, to_dt.month, 1)
-                except:
-                    ce = window_end
+            charge_type = _code_class.get((prop, rec.get("charge_code")), "recurring")
+            if charge_type == "onetime":
+                charge_end = charge_start
+            elif to_dt is not None and not pd.isna(to_dt) and isinstance(to_dt, datetime):
+                charge_end = datetime(int(to_dt.year), int(to_dt.month), 1)
             else:
-                ce = window_end
+                charge_end = window_end
             
             for month in months:
-                if cs <= month <= ce:
-                    monthly_by_prop[pname][month] += amt
+                if charge_start <= month <= charge_end:
+                    monthly_by_prop[prop][month] += amt
         
         monthly_by_prop = {p: dict(v) for p, v in monthly_by_prop.items()}
         result["properties_with_data"] = len(monthly_by_prop)
@@ -555,6 +565,7 @@ def main():
         _build_property_id_lookup,
         fetch_rentroll_for_properties,
         fetch_entrata_for_properties,
+        parse_date,
     )
     
     app_imports = {
@@ -569,6 +580,7 @@ def main():
         "_build_property_id_lookup": _build_property_id_lookup,
         "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
         "fetch_entrata_for_properties": fetch_entrata_for_properties,
+        "parse_date": parse_date,
     }
     
     # Get a connection
