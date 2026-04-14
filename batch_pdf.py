@@ -229,39 +229,76 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         window_start = datetime(today.year - 5, today.month, 1)
         months = [m.to_pydatetime() for m in pd.date_range(start=window_start, end=window_end, freq='MS')]
         
-        # Get unique charge codes for selection
-        selected_codes = df["charge_code"].unique().tolist() if "charge_code" in df.columns else []
+        # Filter for pet-related charge codes (same as app)
+        if "charge_code" not in df.columns:
+            result["status"] = "failed"
+            result["error"] = "No charge_code column in data"
+            return result
+        
+        # Filter to pet charges only
+        pet_mask = df["charge_code"].str.lower().str.contains("pet", na=False)
+        pet_df = df[pet_mask].copy()
+        
+        if pet_df.empty:
+            result["status"] = "failed"
+            result["error"] = "No pet-related charges found"
+            return result
+        
+        print(f"    Found {len(pet_df):,} pet charges")
+        
+        selected_codes = pet_df["charge_code"].unique().tolist()
+        
+        # Parse dates - the API returns charge_amount, charge_from_date, charge_to_date
+        def parse_date(d):
+            if pd.isna(d) or not d or str(d).strip() == "":
+                return None
+            if isinstance(d, datetime):
+                return d
+            for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%Y/%m/%d"]:
+                try:
+                    return datetime.strptime(str(d).strip()[:10], fmt)
+                except ValueError:
+                    continue
+            return None
+        
+        def parse_amount(a):
+            if pd.isna(a):
+                return 0
+            if isinstance(a, (int, float)):
+                return float(a)
+            try:
+                return float(str(a).replace(",", "").replace("$", "").strip())
+            except:
+                return 0
         
         # Classify charge codes (same logic as app)
         charge_classification = {}
-        if "charge_code" in df.columns and "property_name" in df.columns:
-            for (pname, cc), grp in df.groupby(["property_name", "charge_code"]):
-                # Simple heuristic: check date spans
-                spans = []
-                for _, row in grp.iterrows():
-                    f = row.get("from_date")
-                    t = row.get("to_date")
-                    if pd.notna(f) and pd.notna(t):
-                        try:
-                            spans.append((t - f).days)
-                        except:
-                            pass
-                median_span = float(np.median(spans)) if spans else None
-                if median_span is None:
-                    charge_classification[(pname, cc)] = "recurring"
-                else:
-                    charge_classification[(pname, cc)] = "recurring" if median_span > 60 else "onetime"
+        for (pname, cc), grp in pet_df.groupby(["property_name", "charge_code"]):
+            spans = []
+            for _, row in grp.iterrows():
+                f = parse_date(row.get("charge_from_date"))
+                t = parse_date(row.get("charge_to_date"))
+                if f and t:
+                    try:
+                        spans.append((t - f).days)
+                    except:
+                        pass
+            median_span = float(np.median(spans)) if spans else None
+            if median_span is None:
+                charge_classification[(pname, cc)] = "recurring"
+            else:
+                charge_classification[(pname, cc)] = "recurring" if median_span > 60 else "onetime"
         
         monthly_by_prop = defaultdict(lambda: defaultdict(float))
         
-        for _, row in df.iterrows():
+        for _, row in pet_df.iterrows():
             pname = row.get("property_name")
-            amt = row.get("amount", 0)
-            from_dt = row.get("from_date")
-            to_dt = row.get("to_date")
+            amt = parse_amount(row.get("charge_amount"))
+            from_dt = parse_date(row.get("charge_from_date"))
+            to_dt = parse_date(row.get("charge_to_date"))
             cc = row.get("charge_code")
             
-            if pname is None or pd.isna(from_dt) or amt <= 0:
+            if pname is None or from_dt is None or amt <= 0:
                 continue
             
             try:
@@ -272,7 +309,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             ct = charge_classification.get((pname, cc), "recurring")
             if ct == "onetime":
                 ce = cs
-            elif pd.notna(to_dt):
+            elif to_dt:
                 try:
                     ce = datetime(to_dt.year, to_dt.month, 1)
                 except:
