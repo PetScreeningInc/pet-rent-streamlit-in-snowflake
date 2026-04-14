@@ -189,7 +189,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             result["status"] = "failed"
             result["error"] = f"Unexpected properties type: {type(props_df)}"
             return result
-        property_ids = [p["PROPERTY_ID"] for p in properties]
+        property_ids = [p.get("PROPERTY_ID") or p.get("property_id") for p in properties]
         result["properties_found"] = len(property_ids)
         
         print(f"    Fetching charges via {pmc_system.upper()} API...")
@@ -210,10 +210,15 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         df = pd.DataFrame(all_charges)
         
         # Get launch dates from the properties we already loaded
+        # Note: Snowflake returns lowercase keys from DictCursor
         launch_dates = {}
         for prop in properties:
-            pname = prop.get("PROPERTY_NAME")
-            ldate = prop.get("PROPERTY_LAUNCH_DATE") or prop.get("launch_date")
+            # Try both cases for property name
+            pname = prop.get("PROPERTY_NAME") or prop.get("property_name")
+            # Try multiple key variations for launch date
+            ldate = (prop.get("PROPERTY_LAUNCH_DATE") or 
+                     prop.get("property_launch_date") or 
+                     prop.get("launch_date"))
             if pname and ldate:
                 try:
                     if isinstance(ldate, str):
@@ -221,6 +226,8 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
                     launch_dates[pname] = datetime(ldate.year, ldate.month, 1)
                 except:
                     pass
+        
+        print(f"    Launch dates found for {len(launch_dates)}/{len(properties)} properties")
         
         # Build monthly_by_prop
         today = datetime.now()
@@ -421,28 +428,77 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         t3_total_impact = t1_mo + t2_mo + t3_additional
         t3_pct = (t3_total_impact / pre_baseline * 100) if pre_baseline > 0 else 0
         
-        # Get total units
+        # Get total units — same logic as app: QBR table first, then D_PROPERTIES fallback
         total_units = 0
-        property_doors = {}
-        try:
-            cur2 = conn.cursor()
-            cur2.execute(f"""
-                SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS
-                FROM PROD.COMMON.D_PROPERTIES
-                WHERE PROPERTY_ID IN ({pids_str})
-                  AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
-            """)
-            for r in cur2.fetchall():
-                property_doors[r[0]] = r[1]
-            total_units = sum(property_doors.values())
-            cur2.close()
-        except:
-            pass
+        property_doors = {}  # {PROPERTY_ID: door_count}
+        property_doors_by_name = {}  # {PROPERTY_NAME: door_count}
+        _units_from_doors = False
         
-        property_doors_by_name = {}
-        for pname, pid in pid_lookup.items():
-            if pid in property_doors:
-                property_doors_by_name[pname] = property_doors[pid]
+        try:
+            import snowflake.connector
+            _prop_names_for_doors = list(monthly_by_prop.keys())
+            _pids_str = ",".join(str(p) for p in property_ids)
+            
+            if _prop_names_for_doors:
+                _doors_cur = conn.cursor(snowflake.connector.DictCursor)
+                _name_placeholders = ", ".join(["%s"] * len(_prop_names_for_doors))
+                _doors_cur.execute(f"""
+                    SELECT PROPERTY_NAME, PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
+                    FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
+                    WHERE PROPERTY_NAME IN ({_name_placeholders})
+                      AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
+                      AND PROPERTY_NUMBER_OF_DOORS > 0
+                    QUALIFY ROW_NUMBER() OVER (
+                        PARTITION BY PROPERTY_NAME
+                        ORDER BY PROPERTY_NUMBER_OF_DOORS DESC
+                    ) = 1
+                """, _prop_names_for_doors)
+                _doors_rows = _doors_cur.fetchall()
+                if _doors_rows:
+                    for r in _doors_rows:
+                        _pid = int(r["PROPERTY_ID"]) if r.get("PROPERTY_ID") else None
+                        _num = int(r["NUM_DOORS"])
+                        _pn = r.get("PROPERTY_NAME", "")
+                        if _pid:
+                            property_doors[_pid] = _num
+                        if _pn:
+                            property_doors_by_name[_pn] = _num
+                    total_units = sum(property_doors_by_name.values())
+                    _units_from_doors = True
+                _doors_cur.close()
+            
+            # Fallback: D_PROPERTIES by property_id
+            if not _units_from_doors and property_ids:
+                _doors_cur2 = conn.cursor(snowflake.connector.DictCursor)
+                _doors_cur2.execute(f"""
+                    SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
+                    FROM PROD.COMMON.D_PROPERTIES
+                    WHERE PROPERTY_ID IN ({_pids_str})
+                      AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
+                      AND PROPERTY_NUMBER_OF_DOORS > 0
+                """)
+                _doors_rows2 = _doors_cur2.fetchall()
+                if _doors_rows2:
+                    for r in _doors_rows2:
+                        property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
+                    total_units = sum(property_doors.values())
+                    _units_from_doors = True
+                _doors_cur2.close()
+        except Exception as e:
+            if args.verbose:
+                print(f"    Warning: Could not fetch unit counts: {e}")
+        
+        # Build property_name -> door count mapping from pid-based data
+        if not property_doors_by_name:
+            for pname, pid_val in pid_lookup.items():
+                if pid_val in property_doors:
+                    property_doors_by_name[pname] = property_doors[pid_val]
+        
+        # Last resort: unique unit_codes from charges
+        if not _units_from_doors and "unit_code" in df.columns:
+            _unit_df = df[df["property_name"].isin(monthly_by_prop.keys())]
+            _unit_df = _unit_df[_unit_df["unit_code"].notna() & (_unit_df["unit_code"] != "")]
+            total_units = _unit_df.drop_duplicates(subset=["property_name", "unit_code"]).shape[0]
         
         # Generate PDF
         print("    Generating PDF...")
