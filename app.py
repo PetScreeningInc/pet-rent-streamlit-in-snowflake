@@ -4232,10 +4232,106 @@ def generate_tranche_pdf(
                 pdf.cell(sum(_ex_widths), 0, '', border='T', ln=True)
 
     # ═══════════════════════════════════════════════════════════
-    #  MONTHLY REVENUE TREND CHART (compact, same page if space)
+    #  MONTHLY REVENUE TREND CHART (for single-property PDFs)
     # ═══════════════════════════════════════════════════════════
-    # (Bar chart removed — buggy with large property counts)
-    # ═══════════════════════════════════════════════════════════
+    # Show bar chart only for single-property lookups (n_props_total == 1)
+    if n_props_total == 1 and monthly_by_prop and len(monthly_by_prop) == 1 and latest_month:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-GUI backend
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            
+            # Get the single property's monthly data
+            _chart_prop_name = list(monthly_by_prop.keys())[0]
+            _chart_data = monthly_by_prop[_chart_prop_name]
+            
+            # Filter to last 24 months and sort
+            _chart_months = sorted([m for m in _chart_data.keys() if _chart_data.get(m, 0) > 0])[-24:]
+            _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
+            
+            if _chart_months and len(_chart_months) >= 2:
+                # Get launch date for this property
+                _chart_launch_date = None
+                for ld_name, ld_val in (comparable_data or {}).items():
+                    if ld_name == _chart_prop_name:
+                        # Get launch from launch_analysis if available
+                        break
+                
+                # Create figure
+                fig, ax = plt.subplots(figsize=(7, 2.8), dpi=150)
+                
+                # Bar colors: green for post-launch, red/orange for pre-launch
+                _bar_colors = []
+                _launch_month = None
+                if comparable_data and _chart_prop_name in comparable_data:
+                    _comp_entry = comparable_data[_chart_prop_name]
+                    _n_pre = _comp_entry.get("n_pre", 0)
+                    _n_post = _comp_entry.get("n_post", 0)
+                    if _n_pre > 0 and _n_post > 0:
+                        # Calculate launch month: len(months) - n_post months ago
+                        _total_chart_months = len(_chart_months)
+                        _launch_idx = _total_chart_months - _n_post
+                        for i, m in enumerate(_chart_months):
+                            if i < _launch_idx:
+                                _bar_colors.append('#CF5A3F')  # Red/orange for pre-launch
+                            else:
+                                _bar_colors.append('#677848')  # Green for post-launch
+                            if i == _launch_idx:
+                                _launch_month = m
+                
+                # Default to all green if no launch data
+                if not _bar_colors:
+                    _bar_colors = ['#677848'] * len(_chart_months)
+                
+                # Plot bars
+                ax.bar(_chart_months, _chart_values, color=_bar_colors, width=20, edgecolor='white', linewidth=0.5)
+                
+                # Add launch line if we found one
+                if _launch_month:
+                    ax.axvline(x=_launch_month, color='#CF5A3F', linestyle='--', linewidth=1.5, label='PS Launch')
+                
+                # Style the chart
+                ax.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_color('#CCCCCC')
+                ax.spines['bottom'].set_color('#CCCCCC')
+                ax.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                plt.xticks(rotation=45, ha='right')
+                
+                # Title and labels
+                _short_name = _chart_prop_name.split(" - ", 1)[-1] if " - " in _chart_prop_name else _chart_prop_name
+                ax.set_title(f'Monthly Pet Fee Revenue: {_short_name[:40]}', fontsize=10, color='#1F2257', fontweight='bold', pad=10)
+                ax.set_ylabel('Revenue', fontsize=9, color='#4F5155')
+                
+                plt.tight_layout()
+                
+                # Save to bytes
+                _chart_buf = io.BytesIO()
+                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _chart_buf.seek(0)
+                plt.close(fig)
+                
+                # Add to PDF - check if we need a new page
+                if pdf.get_y() + 60 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                else:
+                    pdf.ln(6)
+                
+                section_heading("Monthly Revenue Trend", dark_blue)
+                
+                # Embed image
+                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(58)  # Space after chart
+                
+        except Exception as _chart_err:
+            # Silently skip chart if matplotlib fails
+            pass
 
     # ═══════════════════════════════════════════════════════════
     #  MISSING RENT APPENDIX — TENANT LIST
