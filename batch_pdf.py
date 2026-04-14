@@ -27,8 +27,15 @@ import argparse
 import csv
 import os
 import sys
+import logging
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Suppress streamlit warnings when running as script
+warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
+warnings.filterwarnings("ignore", message=".*Session state does not function.*")
+logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 # Add the app directory to path so we can import from app.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,58 +45,77 @@ import numpy as np
 from collections import defaultdict
 
 
-def detect_pmc_for_id(conn, id_val, id_type="property"):
+def detect_pmc_for_id(conn, id_val, id_type="property", available_schemas=None):
     """
     Auto-detect which PMC system has this ID.
     Returns: (pmc_system, prop_count, label) or (None, 0, None) if not found.
     For parent IDs, picks the PMC with more properties.
     """
+    if available_schemas is None:
+        available_schemas = ["yardi"]  # default to yardi only
+    
     cur = conn.cursor()
     results = {}
     
     if id_type == "property":
-        # Check Yardi
-        cur.execute("""
-            SELECT PROPERTY_NAME, 1 as cnt
-            FROM PROD.COMMON.D_PROPERTIES
-            WHERE PROPERTY_ID = %s
-        """, (id_val,))
-        row = cur.fetchone()
-        if row:
-            results["yardi"] = (1, row[0])
+        # Check Yardi (via COMMON.D_PROPERTIES which has all)
+        if "yardi" in available_schemas:
+            try:
+                cur.execute("""
+                    SELECT PROPERTY_NAME, 1 as cnt
+                    FROM PROD.COMMON.D_PROPERTIES
+                    WHERE PROPERTY_ID = %s
+                """, (id_val,))
+                row = cur.fetchone()
+                if row:
+                    results["yardi"] = (1, row[0])
+            except Exception:
+                pass
         
         # Check Entrata
-        cur.execute("""
-            SELECT PROPERTY_NAME, 1 as cnt
-            FROM PROD.ENTRATA.D_PROPERTIES
-            WHERE PROPERTY_ID = %s
-        """, (id_val,))
-        row = cur.fetchone()
-        if row:
-            results["entrata"] = (1, row[0])
+        if "entrata" in available_schemas:
+            try:
+                cur.execute("""
+                    SELECT PROPERTY_NAME, 1 as cnt
+                    FROM PROD.ENTRATA.D_PROPERTIES
+                    WHERE PROPERTY_ID = %s
+                """, (id_val,))
+                row = cur.fetchone()
+                if row:
+                    results["entrata"] = (1, row[0])
+            except Exception:
+                pass
     
     else:  # parent
         # Check Yardi
-        cur.execute("""
-            SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
-            FROM PROD.YARDI.YARDI_PROPERTIES
-            WHERE PARENT_COMPANY_ID = %s
-            GROUP BY PARENT_COMPANY_NAME
-        """, (id_val,))
-        row = cur.fetchone()
-        if row:
-            results["yardi"] = (row[1], row[0])
+        if "yardi" in available_schemas:
+            try:
+                cur.execute("""
+                    SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
+                    FROM PROD.YARDI.YARDI_PROPERTIES
+                    WHERE PARENT_COMPANY_ID = %s
+                    GROUP BY PARENT_COMPANY_NAME
+                """, (id_val,))
+                row = cur.fetchone()
+                if row:
+                    results["yardi"] = (row[1], row[0])
+            except Exception:
+                pass
         
         # Check Entrata
-        cur.execute("""
-            SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
-            FROM PROD.ENTRATA.D_PROPERTIES
-            WHERE PARENT_COMPANY_ID = %s
-            GROUP BY PARENT_COMPANY_NAME
-        """, (id_val,))
-        row = cur.fetchone()
-        if row:
-            results["entrata"] = (row[1], row[0])
+        if "entrata" in available_schemas:
+            try:
+                cur.execute("""
+                    SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
+                    FROM PROD.ENTRATA.D_PROPERTIES
+                    WHERE PARENT_COMPANY_ID = %s
+                    GROUP BY PARENT_COMPANY_NAME
+                """, (id_val,))
+                row = cur.fetchone()
+                if row:
+                    results["entrata"] = (row[1], row[0])
+            except Exception:
+                pass
     
     cur.close()
     
@@ -99,6 +125,29 @@ def detect_pmc_for_id(conn, id_val, id_type="property"):
     # Pick the one with more properties (or just the one found)
     best_pmc = max(results.keys(), key=lambda k: results[k][0])
     return best_pmc, results[best_pmc][0], results[best_pmc][1]
+
+
+def detect_available_schemas(conn):
+    """Check which PMC schemas are accessible."""
+    available = []
+    cur = conn.cursor()
+    
+    # Check Yardi
+    try:
+        cur.execute("SELECT 1 FROM PROD.YARDI.YARDI_PROPERTIES LIMIT 1")
+        available.append("yardi")
+    except Exception:
+        pass
+    
+    # Check Entrata
+    try:
+        cur.execute("SELECT 1 FROM PROD.ENTRATA.D_PROPERTIES LIMIT 1")
+        available.append("entrata")
+    except Exception:
+        pass
+    
+    cur.close()
+    return available
 
 
 def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app_imports):
@@ -497,6 +546,15 @@ def main():
     # Get a connection for PMC detection
     conn = get_snowflake_connection()
     
+    # Detect which schemas are available
+    available_schemas = detect_available_schemas(conn)
+    print(f"Available PMC schemas: {', '.join(available_schemas) if available_schemas else 'none detected'}")
+    print("-" * 60)
+    
+    if not available_schemas:
+        print("Error: No PMC schemas accessible. Check Snowflake permissions.")
+        sys.exit(1)
+    
     results = []
     success_count = 0
     error_count = 0
@@ -505,7 +563,7 @@ def main():
         print(f"\n[{idx}/{len(ids)}] Processing {args.type} ID: {id_val}")
         
         # Auto-detect PMC
-        pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type)
+        pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type, available_schemas)
         
         if pmc_system is None:
             print(f"  ✗ Not found in Yardi or Entrata")
