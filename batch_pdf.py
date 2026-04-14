@@ -2,7 +2,7 @@
 """
 Batch PDF Generator for PetScreening Value Reports
 
-Auto-detects PMC system (Yardi/Entrata) for each ID.
+Auto-detects PMC system (Yardi/Entrata) for each ID and calls the appropriate API.
 
 Usage:
     python batch_pdf.py --ids 123,456,789
@@ -29,12 +29,14 @@ import os
 import sys
 import logging
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # Suppress streamlit warnings when running as script
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
 warnings.filterwarnings("ignore", message=".*missing ScriptRunContext.*")
 warnings.filterwarnings("ignore", message=".*Session state does not function.*")
+warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 # Add the app directory to path so we can import from app.py
@@ -42,115 +44,88 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 import numpy as np
+import requests
 from collections import defaultdict
 
 
-def detect_pmc_for_id(conn, id_val, id_type="property", available_schemas=None):
-    """
-    Auto-detect which PMC system has this ID.
-    Returns: (pmc_system, prop_count, label) or (None, 0, None) if not found.
-    For parent IDs, picks the PMC with more properties.
-    """
-    if available_schemas is None:
-        available_schemas = ["yardi"]  # default to yardi only
+class FakeProgressBar:
+    """Dummy progress bar for batch mode."""
+    def progress(self, val):
+        pass
+
+
+class FakeStatusText:
+    """Dummy status text for batch mode."""
+    def __init__(self, verbose=True):
+        self.verbose = verbose
     
+    def text(self, msg):
+        if self.verbose:
+            print(f"    {msg}")
+
+
+def detect_pmc_for_id(conn, id_val, id_type="property"):
+    """
+    Auto-detect which PMC system has this ID using PROD.COMMON.D_PROPERTIES.
+    Returns: (pmc_system, prop_count, label) or (None, 0, None) if not found.
+    """
     cur = conn.cursor()
-    results = {}
     
     if id_type == "property":
-        # Check Yardi (via COMMON.D_PROPERTIES which has all)
-        if "yardi" in available_schemas:
-            try:
-                cur.execute("""
-                    SELECT PROPERTY_NAME, 1 as cnt
-                    FROM PROD.COMMON.D_PROPERTIES
-                    WHERE PROPERTY_ID = %s
-                """, (id_val,))
-                row = cur.fetchone()
-                if row:
-                    results["yardi"] = (1, row[0])
-            except Exception:
-                pass
+        cur.execute("""
+            SELECT PROPERTY_NAME, PROPERTY_SOURCE_NAME
+            FROM PROD.COMMON.D_PROPERTIES
+            WHERE PROPERTY_ID = %s
+        """, (id_val,))
+        row = cur.fetchone()
+        cur.close()
         
-        # Check Entrata
-        if "entrata" in available_schemas:
-            try:
-                cur.execute("""
-                    SELECT PROPERTY_NAME, 1 as cnt
-                    FROM PROD.ENTRATA.D_PROPERTIES
-                    WHERE PROPERTY_ID = %s
-                """, (id_val,))
-                row = cur.fetchone()
-                if row:
-                    results["entrata"] = (1, row[0])
-            except Exception:
-                pass
-    
-    else:  # parent
-        # Check Yardi
-        if "yardi" in available_schemas:
-            try:
-                cur.execute("""
-                    SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
-                    FROM PROD.YARDI.YARDI_PROPERTIES
-                    WHERE PARENT_COMPANY_ID = %s
-                    GROUP BY PARENT_COMPANY_NAME
-                """, (id_val,))
-                row = cur.fetchone()
-                if row:
-                    results["yardi"] = (row[1], row[0])
-            except Exception:
-                pass
-        
-        # Check Entrata
-        if "entrata" in available_schemas:
-            try:
-                cur.execute("""
-                    SELECT PARENT_COMPANY_NAME, COUNT(DISTINCT PROPERTY_ID) as cnt
-                    FROM PROD.ENTRATA.D_PROPERTIES
-                    WHERE PARENT_COMPANY_ID = %s
-                    GROUP BY PARENT_COMPANY_NAME
-                """, (id_val,))
-                row = cur.fetchone()
-                if row:
-                    results["entrata"] = (row[1], row[0])
-            except Exception:
-                pass
-    
-    cur.close()
-    
-    if not results:
+        if row:
+            pname, source = row
+            pmc = (source or "unknown").lower().strip()
+            return pmc, 1, pname
         return None, 0, None
     
-    # Pick the one with more properties (or just the one found)
-    best_pmc = max(results.keys(), key=lambda k: results[k][0])
-    return best_pmc, results[best_pmc][0], results[best_pmc][1]
+    else:  # parent
+        cur.execute("""
+            SELECT 
+                PARENT_COMPANY_NAME,
+                PROPERTY_SOURCE_NAME,
+                COUNT(DISTINCT PROPERTY_ID) as cnt
+            FROM PROD.COMMON.D_PROPERTIES
+            WHERE PARENT_COMPANY_ID = %s
+            GROUP BY PARENT_COMPANY_NAME, PROPERTY_SOURCE_NAME
+            ORDER BY cnt DESC
+        """, (id_val,))
+        rows = cur.fetchall()
+        cur.close()
+        
+        if rows:
+            best_row = rows[0]
+            pname, source, cnt = best_row
+            pmc = (source or "unknown").lower().strip()
+            return pmc, cnt, pname
+        return None, 0, None
 
 
-def detect_available_schemas(conn):
-    """Check which PMC schemas are accessible."""
-    available = []
-    cur = conn.cursor()
+def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=True):
+    """
+    Fetch charges via API for a list of properties.
+    Returns: (all_charges_list, results_log)
+    """
+    progress_bar = FakeProgressBar()
+    status_text = FakeStatusText(verbose=verbose)
     
-    # Check Yardi
-    try:
-        cur.execute("SELECT 1 FROM PROD.YARDI.YARDI_PROPERTIES LIMIT 1")
-        available.append("yardi")
-    except Exception:
-        pass
+    if pmc_system == "entrata":
+        fetch_fn = app_imports["fetch_entrata_for_properties"]
+    else:
+        fetch_fn = app_imports["fetch_rentroll_for_properties"]
     
-    # Check Entrata
-    try:
-        cur.execute("SELECT 1 FROM PROD.ENTRATA.D_PROPERTIES LIMIT 1")
-        available.append("entrata")
-    except Exception:
-        pass
-    
-    cur.close()
-    return available
+    all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
+    return all_charges, results_log
 
 
-def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app_imports):
+def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app_imports, conn):
     """Process a single ID and generate PDF. Returns dict with results."""
     
     get_snowflake_connection = app_imports["get_snowflake_connection"]
@@ -186,7 +161,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
                 props_df = load_entrata_properties_for_selection(parent_company_name=label)
             else:
                 props_df = load_entrata_properties_for_selection(property_id=id_val)
-        else:  # yardi
+        else:  # yardi or unknown — try yardi
             if id_type == "parent":
                 props_df = load_properties_for_selection(parent_company_name=label)
             else:
@@ -194,19 +169,33 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         
         if props_df is None or props_df.empty:
             result["status"] = "failed"
-            result["error"] = "No properties found"
+            result["error"] = "No properties found in selection"
             return result
         
-        property_ids = props_df["PROPERTY_ID"].tolist()
+        properties = props_df.to_dict('records')
+        property_ids = [p["PROPERTY_ID"] for p in properties]
         result["properties_found"] = len(property_ids)
         
-        # Fetch charges
-        conn = get_snowflake_connection()
-        cur = conn.cursor()
+        print(f"    Fetching charges via {pmc_system.upper()} API...")
         
-        pids_str = ",".join(str(p) for p in property_ids)
+        # Fetch charges via API
+        all_charges, fetch_log = fetch_charges_for_properties(
+            properties, pmc_system, app_imports, verbose=False
+        )
+        
+        if not all_charges:
+            result["status"] = "failed"
+            result["error"] = "No charges returned from API"
+            return result
+        
+        print(f"    Got {len(all_charges):,} charge records")
+        
+        # Build DataFrame
+        df = pd.DataFrame(all_charges)
         
         # Get launch dates
+        cur = conn.cursor()
+        pids_str = ",".join(str(p) for p in property_ids)
         cur.execute(f"""
             SELECT PROPERTY_ID, PROPERTY_NAME, PS_LIVE_DATE
             FROM PROD.COMMON.D_PROPERTIES
@@ -214,59 +203,11 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         """)
         launch_rows = cur.fetchall()
         launch_dates = {}
-        prop_names = {}
         for r in launch_rows:
             pid, pname, ldate = r
-            prop_names[pid] = pname
             if ldate:
                 launch_dates[pname] = datetime(ldate.year, ldate.month, 1)
-        
-        # Get charges
-        if pmc_system == "entrata":
-            charge_query = f"""
-                SELECT 
-                    p.PROPERTY_ID,
-                    p.PROPERTY_NAME,
-                    c.CHARGE_CODE,
-                    c.AMOUNT,
-                    c.FROM_DATE,
-                    c.TO_DATE,
-                    c.UNIT_CODE
-                FROM PROD.ENTRATA.F_LEASE_CHARGES c
-                JOIN PROD.ENTRATA.D_PROPERTIES p ON c.PROPERTY_ID = p.PROPERTY_ID
-                WHERE c.PROPERTY_ID IN ({pids_str})
-                  AND c.AMOUNT > 0
-                  AND c.FROM_DATE IS NOT NULL
-                  AND LOWER(c.CHARGE_CODE) LIKE '%pet%'
-                ORDER BY p.PROPERTY_NAME, c.FROM_DATE
-            """
-        else:
-            charge_query = f"""
-                SELECT 
-                    p.PROPERTY_ID,
-                    p.PROPERTY_NAME,
-                    c.CHARGE_CODE,
-                    c.AMOUNT,
-                    c.FROM_DATE,
-                    c.TO_DATE,
-                    c.UNIT_CODE
-                FROM PROD.YARDI.F_LEASE_CHARGES c
-                JOIN PROD.COMMON.D_PROPERTIES p ON c.PROPERTY_ID = p.PROPERTY_ID
-                WHERE c.PROPERTY_ID IN ({pids_str})
-                  AND c.AMOUNT > 0
-                  AND c.FROM_DATE IS NOT NULL
-                  AND LOWER(c.CHARGE_CODE) LIKE '%pet%'
-                ORDER BY p.PROPERTY_NAME, c.FROM_DATE
-            """
-        
-        cur.execute(charge_query)
-        charge_rows = cur.fetchall()
         cur.close()
-        
-        if not charge_rows:
-            result["status"] = "failed"
-            result["error"] = "No pet charges found"
-            return result
         
         # Build monthly_by_prop
         today = datetime.now()
@@ -274,37 +215,67 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         window_start = datetime(today.year - 5, today.month, 1)
         months = [m.to_pydatetime() for m in pd.date_range(start=window_start, end=window_end, freq='MS')]
         
-        monthly_by_prop = defaultdict(lambda: defaultdict(float))
-        parsed_charges = []
+        # Get unique charge codes for selection
+        selected_codes = df["charge_code"].unique().tolist() if "charge_code" in df.columns else []
         
-        for row in charge_rows:
-            pid, pname, cc, amt, from_dt, to_dt, unit = row
-            if from_dt is None or amt <= 0:
+        # Classify charge codes (same logic as app)
+        charge_classification = {}
+        if "charge_code" in df.columns and "property_name" in df.columns:
+            for (pname, cc), grp in df.groupby(["property_name", "charge_code"]):
+                # Simple heuristic: check date spans
+                spans = []
+                for _, row in grp.iterrows():
+                    f = row.get("from_date")
+                    t = row.get("to_date")
+                    if pd.notna(f) and pd.notna(t):
+                        try:
+                            spans.append((t - f).days)
+                        except:
+                            pass
+                median_span = float(np.median(spans)) if spans else None
+                if median_span is None:
+                    charge_classification[(pname, cc)] = "recurring"
+                else:
+                    charge_classification[(pname, cc)] = "recurring" if median_span > 60 else "onetime"
+        
+        monthly_by_prop = defaultdict(lambda: defaultdict(float))
+        
+        for _, row in df.iterrows():
+            pname = row.get("property_name")
+            amt = row.get("amount", 0)
+            from_dt = row.get("from_date")
+            to_dt = row.get("to_date")
+            cc = row.get("charge_code")
+            
+            if pname is None or pd.isna(from_dt) or amt <= 0:
                 continue
             
-            cs = datetime(from_dt.year, from_dt.month, 1)
-            ce = datetime(to_dt.year, to_dt.month, 1) if to_dt else window_end
+            try:
+                cs = datetime(from_dt.year, from_dt.month, 1)
+            except:
+                continue
+            
+            ct = charge_classification.get((pname, cc), "recurring")
+            if ct == "onetime":
+                ce = cs
+            elif pd.notna(to_dt):
+                try:
+                    ce = datetime(to_dt.year, to_dt.month, 1)
+                except:
+                    ce = window_end
+            else:
+                ce = window_end
             
             for month in months:
                 if cs <= month <= ce:
                     monthly_by_prop[pname][month] += amt
-            
-            parsed_charges.append({
-                "property_id": pid,
-                "property_name": pname,
-                "charge_code": cc,
-                "amount": amt,
-                "from_date": from_dt,
-                "to_date": to_dt,
-                "unit_code": unit,
-            })
         
         monthly_by_prop = {p: dict(v) for p, v in monthly_by_prop.items()}
         result["properties_with_data"] = len(monthly_by_prop)
         
         if not monthly_by_prop:
             result["status"] = "failed"
-            result["error"] = "No monthly revenue data"
+            result["error"] = "No monthly revenue data computed"
             return result
         
         # Compute launch analysis
@@ -317,7 +288,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
         t1_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
         t1_total = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
-        t1_months = max(a["n_post"] for a in comparable.values()) if comparable else 0
+        t1_months = max((a["n_post"] for a in comparable.values()), default=0)
         t1_pct = (t1_mo / pre_baseline * 100) if pre_baseline > 0 else 0
         
         latest_month = months[-1]
@@ -327,7 +298,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         result["monthly_lift"] = round(t1_mo, 2)
         
         # Fetch compliance data
-        pid_lookup = _build_property_id_lookup(parsed_charges)
+        pid_lookup = _build_property_id_lookup(all_charges)
         all_pids = list(set(pid_lookup.values()))
         comp_data = fetch_compliance_data(tuple(sorted(all_pids))) if all_pids else {}
         
@@ -360,9 +331,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         avg_adoption = (sum(p["current_adoption"] for p in projected_100.values()) / len(projected_100)) if projected_100 else None
         
         # Fetch missing pet rent
-        df = pd.DataFrame(parsed_charges)
-        selected_codes = df["charge_code"].unique().tolist() if "charge_code" in df.columns else []
-        
+        print("    Fetching missing pet rent data...")
         missing_rent_data = fetch_missing_pet_rent_by_property(
             df, selected_codes, property_ids, launch_dates, months
         ) if selected_codes else {}
@@ -374,6 +343,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         result["uncollected_tenants"] = t2_tenants
         
         # Fetch suspected undisclosed
+        print("    Fetching suspected undisclosed data...")
         suspected_data = fetch_suspected_undisclosed_by_property(
             df, selected_codes, property_ids, launch_dates, months
         ) if selected_codes else {}
@@ -394,8 +364,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         total_units = 0
         property_doors = {}
         try:
-            conn2 = get_snowflake_connection()
-            cur2 = conn2.cursor()
+            cur2 = conn.cursor()
             cur2.execute(f"""
                 SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS
                 FROM PROD.COMMON.D_PROPERTIES
@@ -415,6 +384,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
                 property_doors_by_name[pname] = property_doors[pid]
         
         # Generate PDF
+        print("    Generating PDF...")
         today_str = datetime.now().strftime("%B %d, %Y")
         
         pdf_bytes = generate_tranche_pdf(
@@ -472,8 +442,11 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         result["pdf_filename"] = filename
         
     except Exception as e:
+        import traceback
         result["status"] = "failed"
         result["error"] = str(e)
+        if args.verbose if hasattr(args, 'verbose') else False:
+            traceback.print_exc()
     
     return result
 
@@ -489,6 +462,7 @@ def main():
     parser.add_argument("--output", type=str, default="./batch_pdfs", help="Output folder")
     parser.add_argument("--avg-lift", action="store_true", help="Use average monthly lift methodology")
     parser.add_argument("--include-pm", action="store_true", help="Include property manager appendix")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed error traces")
     
     args = parser.parse_args()
     
@@ -511,7 +485,6 @@ def main():
     print(f"Adoption metric: {args.adoption}")
     print(f"Methodology: {'Average Monthly Lift' if args.avg_lift else 'Simple Lift (Current - Pre)'}")
     print(f"Output folder: {args.output}")
-    print("PMC detection: Auto")
     print("-" * 60)
     
     # Create output folder
@@ -529,6 +502,8 @@ def main():
         fetch_suspected_undisclosed_by_property,
         generate_tranche_pdf,
         _build_property_id_lookup,
+        fetch_rentroll_for_properties,
+        fetch_entrata_for_properties,
     )
     
     app_imports = {
@@ -541,19 +516,12 @@ def main():
         "fetch_suspected_undisclosed_by_property": fetch_suspected_undisclosed_by_property,
         "generate_tranche_pdf": generate_tranche_pdf,
         "_build_property_id_lookup": _build_property_id_lookup,
+        "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
+        "fetch_entrata_for_properties": fetch_entrata_for_properties,
     }
     
-    # Get a connection for PMC detection
+    # Get a connection
     conn = get_snowflake_connection()
-    
-    # Detect which schemas are available
-    available_schemas = detect_available_schemas(conn)
-    print(f"Available PMC schemas: {', '.join(available_schemas) if available_schemas else 'none detected'}")
-    print("-" * 60)
-    
-    if not available_schemas:
-        print("Error: No PMC schemas accessible. Check Snowflake permissions.")
-        sys.exit(1)
     
     results = []
     success_count = 0
@@ -562,11 +530,11 @@ def main():
     for idx, id_val in enumerate(ids, 1):
         print(f"\n[{idx}/{len(ids)}] Processing {args.type} ID: {id_val}")
         
-        # Auto-detect PMC
-        pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type, available_schemas)
+        # Auto-detect PMC from PROPERTY_SOURCE_NAME
+        pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type)
         
         if pmc_system is None:
-            print(f"  ✗ Not found in Yardi or Entrata")
+            print(f"  ✗ Not found in database")
             results.append({
                 "id": id_val,
                 "type": args.type,
@@ -580,15 +548,15 @@ def main():
                 "uncollected_tenants": 0,
                 "suspected_undisclosed": 0,
                 "pdf_filename": "",
-                "error": "ID not found in any PMC system",
+                "error": "ID not found in PROD.COMMON.D_PROPERTIES",
             })
             error_count += 1
             continue
         
-        print(f"  Found in {pmc_system.upper()}: {label} ({prop_count} properties)")
+        print(f"  Found: {label} ({pmc_system.upper()}, {prop_count} properties)")
         
         # Process the ID
-        result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports)
+        result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports, conn)
         results.append(result)
         
         if result["status"] == "success":
