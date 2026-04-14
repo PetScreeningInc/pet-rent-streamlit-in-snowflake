@@ -167,12 +167,28 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             else:
                 props_df = load_properties_for_selection(property_id=id_val)
         
-        if props_df is None or props_df.empty:
+        # Handle both DataFrame and list returns
+        if props_df is None:
             result["status"] = "failed"
             result["error"] = "No properties found in selection"
             return result
         
-        properties = props_df.to_dict('records')
+        if isinstance(props_df, pd.DataFrame):
+            if props_df.empty:
+                result["status"] = "failed"
+                result["error"] = "No properties found in selection"
+                return result
+            properties = props_df.to_dict('records')
+        elif isinstance(props_df, list):
+            if len(props_df) == 0:
+                result["status"] = "failed"
+                result["error"] = "No properties found in selection"
+                return result
+            properties = props_df
+        else:
+            result["status"] = "failed"
+            result["error"] = f"Unexpected properties type: {type(props_df)}"
+            return result
         property_ids = [p["PROPERTY_ID"] for p in properties]
         result["properties_found"] = len(property_ids)
         
@@ -554,6 +570,27 @@ def main():
             continue
         
         print(f"  Found: {label} ({pmc_system.upper()}, {prop_count} properties)")
+        
+        # Check if PMC is supported
+        if pmc_system not in ("yardi", "entrata"):
+            print(f"  ✗ Unsupported PMC: {pmc_system.upper()} (only Yardi/Entrata supported)")
+            results.append({
+                "id": id_val,
+                "type": args.type,
+                "pmc": pmc_system,
+                "label": label,
+                "status": "skipped",
+                "properties_found": prop_count,
+                "properties_with_data": 0,
+                "comparable_count": 0,
+                "monthly_lift": 0,
+                "uncollected_tenants": 0,
+                "suspected_undisclosed": 0,
+                "pdf_filename": "",
+                "error": f"Unsupported PMC: {pmc_system}",
+            })
+            error_count += 1
+            continue
         
         # Process the ID
         result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports, conn)
