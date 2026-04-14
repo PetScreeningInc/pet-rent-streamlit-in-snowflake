@@ -209,21 +209,19 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         # Build DataFrame
         df = pd.DataFrame(all_charges)
         
-        # Get launch dates
-        cur = conn.cursor()
+        # Get launch dates from the properties we already loaded
         pids_str = ",".join(str(p) for p in property_ids)
-        cur.execute(f"""
-            SELECT PROPERTY_ID, PROPERTY_NAME, PS_LIVE_DATE
-            FROM PROD.COMMON.D_PROPERTIES
-            WHERE PROPERTY_ID IN ({pids_str})
-        """)
-        launch_rows = cur.fetchall()
         launch_dates = {}
-        for r in launch_rows:
-            pid, pname, ldate = r
-            if ldate:
-                launch_dates[pname] = datetime(ldate.year, ldate.month, 1)
-        cur.close()
+        for prop in properties:
+            pname = prop.get("PROPERTY_NAME")
+            ldate = prop.get("PROPERTY_LAUNCH_DATE") or prop.get("PS_LIVE_DATE")
+            if pname and ldate:
+                try:
+                    if isinstance(ldate, str):
+                        ldate = datetime.strptime(ldate[:10], "%Y-%m-%d")
+                    launch_dates[pname] = datetime(ldate.year, ldate.month, 1)
+                except:
+                    pass
         
         # Build monthly_by_prop
         today = datetime.now()
