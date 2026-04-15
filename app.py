@@ -4033,11 +4033,27 @@ def generate_tranche_pdf(
             if _km_found_per_unit > 0:
                 _km_lpu_sign = "+" if _km_lift_per_unit > 0 else ""
                 metrics.append(("", f"  Actual: {_km_lpu_sign}${_km_lift_per_unit:,.2f}  |  Found: +${_km_found_per_unit:,.2f}", None))
+    # ── Launch date (for single property) ──
+    if n_props_total == 1 and comparable_data and len(comparable_data) > 0:
+        _single_prop_name = list(comparable_data.keys())[0]
+        _single_comp = comparable_data[_single_prop_name]
+        _n_post = _single_comp.get("n_post", 0)
+        _n_pre = _single_comp.get("n_pre", 0)
+        if _n_post > 0 and latest_month:
+            # Calculate launch date from n_post months before latest_month
+            from dateutil.relativedelta import relativedelta
+            _launch_date_calc = latest_month - relativedelta(months=_n_post - 1)
+            metrics.append(("PetScreening Launch Date", _launch_date_calc.strftime("%B %Y"), dark_blue))
+            metrics.append(("Months Since Launch", f"{_n_post}", None))
+            if _n_pre > 0:
+                metrics.append(("Pre-Launch Months (baseline)", f"{_n_pre}", None))
+    
     # ── Analysis scope ──
-    if comparable_count > 0:
+    if comparable_count > 0 and n_props_total > 1:
         metrics.append(("Comparable Properties (in analysis)", f"{comparable_count} of {n_props_with_data}", None))
-    metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
-    metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
+    if n_props_total > 1:
+        metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
+        metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
 
     # ── Portfolio totals (context, not used in lift) ──
     if total_units and total_units > 0:
@@ -4290,16 +4306,13 @@ def generate_tranche_pdf(
             _chart_prop_name = list(monthly_by_prop.keys())[0]
             _chart_data = monthly_by_prop[_chart_prop_name]
             
-            # Get all months with data, sorted
-            _all_data_months = sorted([m for m in _chart_data.keys()])
-            # Filter to last 24 months
-            _chart_months = _all_data_months[-24:]
+            # Get all months with data, sorted (no cap - show full history)
+            _chart_months = sorted([m for m in _chart_data.keys()])
             _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
             
             if _chart_months and len(_chart_months) >= 2:
-                # Create figure with secondary y-axis for adoption
-                fig, ax1 = plt.subplots(figsize=(7, 2.8), dpi=150)
-                ax2 = ax1.twinx()  # Secondary axis for adoption %
+                # Create figure - taller to fill page space
+                fig, ax1 = plt.subplots(figsize=(7, 3.5), dpi=150)
                 
                 # Determine launch date and bar colors
                 _launch_dt = None
@@ -4361,15 +4374,8 @@ def generate_tranche_pdf(
                 ax1.set_ylabel('Monthly Revenue', fontsize=9, color='#4F5155')
                 plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
                 
-                # Style secondary axis (adoption) - hidden by default, shown if data exists
-                ax2.spines['top'].set_visible(False)
-                ax2.spines['left'].set_visible(False)
-                ax2.spines['bottom'].set_visible(False)
-                ax2.spines['right'].set_color((156/255, 39/255, 176/255, 0.5))
-                ax2.set_ylim(0, 110)
-                ax2.set_ylabel('Adoption %', fontsize=8, color=(156/255, 39/255, 176/255, 0.7))
-                ax2.tick_params(axis='y', colors=(156/255, 39/255, 176/255, 0.7), labelsize=7)
-                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.0f}%'))
+                # Secondary y-axis for adoption % would go here if compliance_data is passed
+                # For now, keep chart clean without adoption overlay
                 
                 # Add legend
                 _legend_handles = []
@@ -4406,14 +4412,14 @@ def generate_tranche_pdf(
                 plt.close(fig)
                 
                 # Check if we need a new page or can fit on current page
-                if pdf.get_y() + 60 > pdf.h - pdf.b_margin:
+                if pdf.get_y() + 75 > pdf.h - pdf.b_margin:
                     pdf.add_page()
                 else:
-                    pdf.ln(4)
+                    pdf.ln(10)  # More space between table and chart
                 
                 # Embed image (no title, just the chart)
                 pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
-                pdf.ln(55)
+                pdf.ln(65)
                 
         except Exception as _chart_err:
             # Log error for debugging
