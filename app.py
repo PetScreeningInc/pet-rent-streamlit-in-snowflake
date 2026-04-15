@@ -3303,7 +3303,16 @@ def generate_tranche_pdf(
     _adjusted_lift = t1_mo if comparable_count > 0 else 0
 
     # Choose methodology based on use_avg_lift toggle
-    if use_avg_lift:
+    # For single-property without pre-PS data, skip lift calculations entirely
+    _no_pre_data = not _has_comparable and pre_baseline <= 0
+    
+    if _no_pre_data:
+        # No pre-PS data — leave lift metrics blank, focus on opportunity
+        _active_lift = 0
+        _lift_per_unit = 0
+        _annual_lift = 0
+        _asset_value_impact = 0
+    elif use_avg_lift:
         # Use average monthly lift (t1_mo) for all calculations
         _active_lift = _adjusted_lift
         _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
@@ -3371,6 +3380,12 @@ def generate_tranche_pdf(
                 f"${_headline_pre:,.0f}/mo before PetScreening and is now "
                 f"${_display_rev:,.0f}/mo -- a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
             )
+    elif _no_pre_data:
+        # No pre-PS data available
+        _glance_parts.append(
+            f"This property generates ${current_monthly_rev:,.0f}/mo in pet fee revenue. "
+            f"No pre-PetScreening baseline is available for lift comparison -- see Opportunity section below for actionable revenue."
+        )
     else:
         _glance_parts.append(
             f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
@@ -3407,8 +3422,8 @@ def generate_tranche_pdf(
     _glance_row1.append({
         "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
         "label": "Pre-PS Revenue",
-        "sub": f"Avg baseline across {comparable_count} properties" if _has_comparable else None,
-        "color": dark_blue,
+        "sub": f"Avg baseline across {comparable_count} properties" if _has_comparable else ("No pre-launch data" if _no_pre_data else None),
+        "color": dark_blue if _headline_pre > 0 else (160, 160, 160),
     })
     if use_avg_lift and _comp_post_avg > 0:
         _glance_row1.append({
@@ -3429,7 +3444,21 @@ def generate_tranche_pdf(
 
     # ── KPI cards -- row 2: lift + per-unit + cap rate ──
     _glance_row2 = []
-    if _active_lift != 0:
+    if _no_pre_data:
+        # Show blank cards with explanation for no pre-PS data
+        _glance_row2.append({
+            "value": "--",
+            "label": "Monthly Lift",
+            "sub": "No pre-launch baseline",
+            "color": (160, 160, 160),
+        })
+        _glance_row2.append({
+            "value": "--",
+            "label": "Lift per Unit",
+            "sub": "No pre-launch baseline",
+            "color": (160, 160, 160),
+        })
+    elif _active_lift != 0:
         _lift_sign = "+" if _active_lift > 0 else ""
         _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
         _lift_sub = f"${_comp_post_avg:,.0f} avg - ${_headline_pre:,.0f} pre" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
@@ -3439,14 +3468,14 @@ def generate_tranche_pdf(
             "sub": _lift_sub,
             "color": _teal_blue if _active_lift > 0 else orange,
         })
-    if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
-        _lpu_sign = "+" if _lift_per_unit > 0 else ""
-        _glance_row2.append({
-            "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
-            "label": "Lift per Unit",
-            "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
-            "color": _teal_blue if _lift_per_unit > 0 else orange,
-        })
+        if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
+            _lpu_sign = "+" if _lift_per_unit > 0 else ""
+            _glance_row2.append({
+                "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
+                "label": "Lift per Unit",
+                "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
+                "color": _teal_blue if _lift_per_unit > 0 else orange,
+            })
     elif total_units and total_units > 0 and _rev_per_unit > 0:
         _glance_row2.append({
             "value": f"${_rev_per_unit:,.2f}/unit/mo",
@@ -4063,97 +4092,8 @@ def generate_tranche_pdf(
     _doors_dict = property_doors if property_doors else {}
     _is_single_property = (n_props_total == 1 and monthly_by_prop and len(monthly_by_prop) == 1)
     
-    # For single-property PDFs, show chart on same page as Impact by Property
-    if _is_single_property and monthly_by_prop and latest_month:
-        pdf.add_page()
-        section_heading("Fee Collection Analysis", dark_blue)
-        
-        # Draw the chart first
-        try:
-            import matplotlib
-            matplotlib.use('Agg')  # Non-GUI backend
-            import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
-            
-            # Get the single property's monthly data
-            _chart_prop_name = list(monthly_by_prop.keys())[0]
-            _chart_data = monthly_by_prop[_chart_prop_name]
-            
-            # Filter to last 24 months and sort
-            _chart_months = sorted([m for m in _chart_data.keys() if _chart_data.get(m, 0) > 0])[-24:]
-            _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
-            
-            if _chart_months and len(_chart_months) >= 2:
-                # Create figure
-                fig, ax = plt.subplots(figsize=(7, 2.5), dpi=150)
-                
-                # Bar colors: green for post-launch, red/orange for pre-launch
-                _bar_colors = []
-                _launch_month = None
-                if comparable_data and _chart_prop_name in comparable_data:
-                    _comp_entry = comparable_data[_chart_prop_name]
-                    _n_pre = _comp_entry.get("n_pre", 0)
-                    _n_post = _comp_entry.get("n_post", 0)
-                    if _n_pre > 0 and _n_post > 0:
-                        # Calculate launch month position
-                        _total_chart_months = len(_chart_months)
-                        _launch_idx = _total_chart_months - _n_post
-                        for i, m in enumerate(_chart_months):
-                            if i < _launch_idx:
-                                _bar_colors.append('#CF5A3F')  # Red/orange for pre-launch
-                            else:
-                                _bar_colors.append('#677848')  # Green for post-launch
-                            if i == _launch_idx:
-                                _launch_month = m
-                
-                # Default to all green if no launch data
-                if not _bar_colors:
-                    _bar_colors = ['#677848'] * len(_chart_months)
-                
-                # Plot bars
-                ax.bar(_chart_months, _chart_values, color=_bar_colors, width=20, edgecolor='white', linewidth=0.5)
-                
-                # Add launch line if we found one
-                if _launch_month:
-                    ax.axvline(x=_launch_month, color='#CF5A3F', linestyle='--', linewidth=1.5, label='PS Launch')
-                
-                # Style the chart
-                ax.set_facecolor('#FAFAF8')
-                fig.patch.set_facecolor('#FAFAF8')
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['left'].set_color('#CCCCCC')
-                ax.spines['bottom'].set_color('#CCCCCC')
-                ax.tick_params(axis='both', colors='#4F5155', labelsize=8)
-                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
-                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-                plt.xticks(rotation=45, ha='right')
-                
-                # Title
-                _short_name = _chart_prop_name.split(" - ", 1)[-1] if " - " in _chart_prop_name else _chart_prop_name
-                ax.set_title(f'Monthly Pet Fee Revenue', fontsize=10, color='#1F2257', fontweight='bold', pad=8)
-                ax.set_ylabel('Revenue', fontsize=9, color='#4F5155')
-                
-                plt.tight_layout()
-                
-                # Save to bytes
-                _chart_buf = io.BytesIO()
-                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
-                _chart_buf.seek(0)
-                plt.close(fig)
-                
-                # Embed image
-                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
-                pdf.ln(52)  # Space after chart
-                
-        except Exception as _chart_err:
-            # Silently skip chart if matplotlib fails
-            pass
-    
     if comparable_data and len(comparable_data) > 0:
-        if not _is_single_property:
-            pdf.add_page()
+        pdf.add_page()
         section_heading("Impact by Property", dark_blue)
         _impact_method = "average monthly lift" if use_avg_lift else "most recent completed month vs pre-launch average"
         narrative(
@@ -4324,6 +4264,94 @@ def generate_tranche_pdf(
                     pdf.cell(_ex_widths[2], 5, f' ${ep_rev:,.0f}/mo', border='LR', fill=True)
                     pdf.ln()
                 pdf.cell(sum(_ex_widths), 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  MONTHLY REVENUE CHART (single-property PDFs only)
+    # ═══════════════════════════════════════════════════════════
+    if _is_single_property and monthly_by_prop and latest_month:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-GUI backend
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            
+            # Get the single property's monthly data
+            _chart_prop_name = list(monthly_by_prop.keys())[0]
+            _chart_data = monthly_by_prop[_chart_prop_name]
+            
+            # Filter to last 24 months and sort
+            _chart_months = sorted([m for m in _chart_data.keys() if _chart_data.get(m, 0) > 0])[-24:]
+            _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
+            
+            if _chart_months and len(_chart_months) >= 2:
+                # Create figure
+                fig, ax = plt.subplots(figsize=(7, 2.5), dpi=150)
+                
+                # Bar colors: green for post-launch, red/orange for pre-launch
+                _bar_colors = []
+                _launch_month = None
+                if comparable_data and _chart_prop_name in comparable_data:
+                    _comp_entry = comparable_data[_chart_prop_name]
+                    _n_pre = _comp_entry.get("n_pre", 0)
+                    _n_post = _comp_entry.get("n_post", 0)
+                    if _n_pre > 0 and _n_post > 0:
+                        # Calculate launch month position
+                        _total_chart_months = len(_chart_months)
+                        _launch_idx = _total_chart_months - _n_post
+                        for i, m in enumerate(_chart_months):
+                            if i < _launch_idx:
+                                _bar_colors.append('#CF5A3F')  # Red/orange for pre-launch
+                            else:
+                                _bar_colors.append('#677848')  # Green for post-launch
+                            if i == _launch_idx:
+                                _launch_month = m
+                
+                # Default to all green if no launch data (post-launch only property)
+                if not _bar_colors:
+                    _bar_colors = ['#677848'] * len(_chart_months)
+                
+                # Plot bars
+                ax.bar(_chart_months, _chart_values, color=_bar_colors, width=20, edgecolor='white', linewidth=0.5)
+                
+                # Add launch line if we found one
+                if _launch_month:
+                    ax.axvline(x=_launch_month, color='#CF5A3F', linestyle='--', linewidth=1.5, label='PS Launch')
+                
+                # Style the chart to match Fee Collection in Streamlit
+                ax.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_color('#CCCCCC')
+                ax.spines['bottom'].set_color('#CCCCCC')
+                ax.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                plt.xticks(rotation=45, ha='right')
+                ax.set_ylabel('Revenue', fontsize=9, color='#4F5155')
+                
+                plt.tight_layout()
+                
+                # Save to bytes
+                _chart_buf = io.BytesIO()
+                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _chart_buf.seek(0)
+                plt.close(fig)
+                
+                # Check if we need a new page or can fit on current page
+                if pdf.get_y() + 55 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                else:
+                    pdf.ln(4)
+                
+                # Embed image (no title, just the chart)
+                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(50)
+                
+        except Exception as _chart_err:
+            # Silently skip chart if matplotlib fails
+            pass
 
     # ═══════════════════════════════════════════════════════════
     #  MISSING RENT APPENDIX — TENANT LIST
