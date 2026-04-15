@@ -4095,7 +4095,9 @@ def generate_tranche_pdf(
     #  PROPERTY-LEVEL IMPACT TABLE + CHART (for single-property PDFs)
     # ═══════════════════════════════════════════════════════════
     _doors_dict = property_doors if property_doors else {}
-    _is_single_property = (n_props_total == 1 and monthly_by_prop and len(monthly_by_prop) == 1)
+    # Single property = requested 1 property (n_props_total == 1)
+    # Don't require monthly_by_prop to have exactly 1 entry - it might have 0 or different names
+    _is_single_property = (n_props_total == 1)
     
     if comparable_data and len(comparable_data) > 0:
         pdf.add_page()
@@ -4275,7 +4277,8 @@ def generate_tranche_pdf(
     #  Matches Fee Collection chart: green post-launch, blue pre-launch,
     #  red dashed launch line, golden baseline, purple adoption overlay
     # ═══════════════════════════════════════════════════════════
-    if _is_single_property and monthly_by_prop and latest_month:
+    # Render chart for single-property PDFs
+    if _is_single_property and monthly_by_prop and len(monthly_by_prop) > 0 and latest_month:
         try:
             import matplotlib
             matplotlib.use('Agg')  # Non-GUI backend
@@ -4283,7 +4286,7 @@ def generate_tranche_pdf(
             import matplotlib.dates as mdates
             from matplotlib.ticker import FuncFormatter
             
-            # Get the single property's monthly data
+            # Get the first (or only) property's monthly data
             _chart_prop_name = list(monthly_by_prop.keys())[0]
             _chart_data = monthly_by_prop[_chart_prop_name]
             
@@ -4413,8 +4416,14 @@ def generate_tranche_pdf(
                 pdf.ln(55)
                 
         except Exception as _chart_err:
-            # Silently skip chart if matplotlib fails
-            pass
+            # Log error for debugging
+            import traceback
+            _tb = traceback.format_exc()
+            # Add error note to PDF
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Chart error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
 
     # ═══════════════════════════════════════════════════════════
     #  MISSING RENT APPENDIX — TENANT LIST
