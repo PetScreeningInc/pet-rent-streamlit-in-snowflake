@@ -3492,22 +3492,27 @@ def generate_tranche_pdf(
             "color": _teal_blue,
         })
 
-    # Pad row 2 to 3 cards
-    while len(_glance_row2) < 3:
-        if _opp_recurring_mo > 0 and t2_tenants > 0:
-            _glance_row2.append({
-                "value": f"${_opp_recurring_mo:,.0f}/mo",
-                "label": "Revenue Left on Table",
-                "sub": f"{t2_tenants:,} tenants not paying pet rent",
-                "color": orange,
-            })
-        else:
-            _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
-        break
+    # Pad row 2 to 3 cards (but skip padding for no-pre-data case)
+    if not _no_pre_data:
+        while len(_glance_row2) < 3:
+            if _opp_recurring_mo > 0 and t2_tenants > 0:
+                _glance_row2.append({
+                    "value": f"${_opp_recurring_mo:,.0f}/mo",
+                    "label": "Revenue Left on Table",
+                    "sub": f"{t2_tenants:,} tenants not paying pet rent",
+                    "color": orange,
+                })
+            else:
+                _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+            break
 
-    if _glance_row2:
+    # Only show Actuals row if we have pre-PS data to compare against
+    if _glance_row2 and not _no_pre_data:
         pdf.ln(3)  # space for label pill
         draw_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
+    elif _no_pre_data:
+        # Skip Actuals row entirely for no pre-PS data — the Opportunity row will show actionable data
+        pass
 
     pdf.ln(1)
 
@@ -4267,6 +4272,8 @@ def generate_tranche_pdf(
 
     # ═══════════════════════════════════════════════════════════
     #  MONTHLY REVENUE CHART (single-property PDFs only)
+    #  Matches Fee Collection chart: green post-launch, blue pre-launch,
+    #  red dashed launch line, golden baseline, purple adoption overlay
     # ═══════════════════════════════════════════════════════════
     if _is_single_property and monthly_by_prop and latest_month:
         try:
@@ -4274,62 +4281,118 @@ def generate_tranche_pdf(
             matplotlib.use('Agg')  # Non-GUI backend
             import matplotlib.pyplot as plt
             import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
             
             # Get the single property's monthly data
             _chart_prop_name = list(monthly_by_prop.keys())[0]
             _chart_data = monthly_by_prop[_chart_prop_name]
             
-            # Filter to last 24 months and sort
-            _chart_months = sorted([m for m in _chart_data.keys() if _chart_data.get(m, 0) > 0])[-24:]
+            # Get all months with data, sorted
+            _all_data_months = sorted([m for m in _chart_data.keys()])
+            # Filter to last 24 months
+            _chart_months = _all_data_months[-24:]
             _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
             
             if _chart_months and len(_chart_months) >= 2:
-                # Create figure
-                fig, ax = plt.subplots(figsize=(7, 2.5), dpi=150)
+                # Create figure with secondary y-axis for adoption
+                fig, ax1 = plt.subplots(figsize=(7, 2.8), dpi=150)
+                ax2 = ax1.twinx()  # Secondary axis for adoption %
                 
-                # Bar colors: green for post-launch, red/orange for pre-launch
-                _bar_colors = []
+                # Determine launch date and bar colors
+                _launch_dt = None
                 _launch_month = None
+                _pre_avg = 0
+                _bar_colors = []
+                
                 if comparable_data and _chart_prop_name in comparable_data:
                     _comp_entry = comparable_data[_chart_prop_name]
                     _n_pre = _comp_entry.get("n_pre", 0)
                     _n_post = _comp_entry.get("n_post", 0)
-                    if _n_pre > 0 and _n_post > 0:
+                    _pre_avg = _comp_entry.get("pre_avg", 0)
+                    
+                    if _n_post > 0:
                         # Calculate launch month position
                         _total_chart_months = len(_chart_months)
-                        _launch_idx = _total_chart_months - _n_post
+                        _launch_idx = max(0, _total_chart_months - _n_post)
+                        if _launch_idx < _total_chart_months:
+                            _launch_month = _chart_months[_launch_idx]
+                        
                         for i, m in enumerate(_chart_months):
                             if i < _launch_idx:
-                                _bar_colors.append('#CF5A3F')  # Red/orange for pre-launch
+                                _bar_colors.append('#7D9BC1')  # Blue for pre-launch
                             else:
                                 _bar_colors.append('#677848')  # Green for post-launch
-                            if i == _launch_idx:
-                                _launch_month = m
                 
-                # Default to all green if no launch data (post-launch only property)
+                # Default to all green if no launch data (all post-launch)
                 if not _bar_colors:
                     _bar_colors = ['#677848'] * len(_chart_months)
                 
                 # Plot bars
-                ax.bar(_chart_months, _chart_values, color=_bar_colors, width=20, edgecolor='white', linewidth=0.5)
+                bar_width = 20  # days
+                ax1.bar(_chart_months, _chart_values, color=_bar_colors, width=bar_width, 
+                        edgecolor='white', linewidth=0.3, zorder=2)
                 
-                # Add launch line if we found one
+                # Add golden dotted baseline line (pre-launch average)
+                if _pre_avg > 0:
+                    ax1.axhline(y=_pre_avg, color='#E2AB58', linestyle=':', linewidth=1.5, 
+                                label=f'Pre-PS baseline ${_pre_avg:,.0f}/mo', zorder=3)
+                
+                # Add red dashed launch line
                 if _launch_month:
-                    ax.axvline(x=_launch_month, color='#CF5A3F', linestyle='--', linewidth=1.5, label='PS Launch')
+                    # Position line just before the launch month
+                    _line_x = _launch_month - timedelta(days=15)
+                    ax1.axvline(x=_line_x, color='#CF5A3F', linestyle='--', linewidth=2, 
+                                label='PS Launch', zorder=4)
                 
-                # Style the chart to match Fee Collection in Streamlit
-                ax.set_facecolor('#FAFAF8')
+                # Style primary axis (revenue)
+                ax1.set_facecolor('#FAFAF8')
                 fig.patch.set_facecolor('#FAFAF8')
-                ax.spines['top'].set_visible(False)
-                ax.spines['right'].set_visible(False)
-                ax.spines['left'].set_color('#CCCCCC')
-                ax.spines['bottom'].set_color('#CCCCCC')
-                ax.tick_params(axis='both', colors='#4F5155', labelsize=8)
-                ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
-                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
-                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-                plt.xticks(rotation=45, ha='right')
-                ax.set_ylabel('Revenue', fontsize=9, color='#4F5155')
+                ax1.spines['top'].set_visible(False)
+                ax1.spines['right'].set_visible(False)
+                ax1.spines['left'].set_color('#CCCCCC')
+                ax1.spines['bottom'].set_color('#CCCCCC')
+                ax1.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                ax1.set_ylabel('Monthly Revenue', fontsize=9, color='#4F5155')
+                plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                
+                # Style secondary axis (adoption) - hidden by default, shown if data exists
+                ax2.spines['top'].set_visible(False)
+                ax2.spines['left'].set_visible(False)
+                ax2.spines['bottom'].set_visible(False)
+                ax2.spines['right'].set_color('rgba(156, 39, 176, 0.5)')
+                ax2.set_ylim(0, 110)
+                ax2.set_ylabel('Adoption %', fontsize=8, color='rgba(156, 39, 176, 0.7)')
+                ax2.tick_params(axis='y', colors='rgba(156, 39, 176, 0.7)', labelsize=7)
+                ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.0f}%'))
+                
+                # Add legend
+                _legend_handles = []
+                _legend_labels = []
+                
+                from matplotlib.patches import Patch
+                from matplotlib.lines import Line2D
+                
+                _legend_handles.append(Patch(facecolor='#677848', edgecolor='white'))
+                _legend_labels.append('Post-Launch')
+                
+                if any(c == '#7D9BC1' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#7D9BC1', edgecolor='white'))
+                    _legend_labels.append('Pre-Launch')
+                
+                if _launch_month:
+                    _legend_handles.append(Line2D([0], [0], color='#CF5A3F', linestyle='--', linewidth=2))
+                    _legend_labels.append('PS Launch')
+                
+                if _pre_avg > 0:
+                    _legend_handles.append(Line2D([0], [0], color='#E2AB58', linestyle=':', linewidth=1.5))
+                    _legend_labels.append(f'Pre-PS Baseline (${_pre_avg:,.0f}/mo)')
+                
+                if _legend_handles:
+                    ax1.legend(_legend_handles, _legend_labels, loc='upper left', fontsize=7, 
+                               framealpha=0.9, facecolor='white')
                 
                 plt.tight_layout()
                 
@@ -4340,14 +4403,14 @@ def generate_tranche_pdf(
                 plt.close(fig)
                 
                 # Check if we need a new page or can fit on current page
-                if pdf.get_y() + 55 > pdf.h - pdf.b_margin:
+                if pdf.get_y() + 60 > pdf.h - pdf.b_margin:
                     pdf.add_page()
                 else:
                     pdf.ln(4)
                 
                 # Embed image (no title, just the chart)
                 pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
-                pdf.ln(50)
+                pdf.ln(55)
                 
         except Exception as _chart_err:
             # Silently skip chart if matplotlib fails
