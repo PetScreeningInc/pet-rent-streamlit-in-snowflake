@@ -4365,10 +4365,10 @@ def generate_tranche_pdf(
                 ax2.spines['top'].set_visible(False)
                 ax2.spines['left'].set_visible(False)
                 ax2.spines['bottom'].set_visible(False)
-                ax2.spines['right'].set_color('rgba(156, 39, 176, 0.5)')
+                ax2.spines['right'].set_color((156/255, 39/255, 176/255, 0.5))
                 ax2.set_ylim(0, 110)
-                ax2.set_ylabel('Adoption %', fontsize=8, color='rgba(156, 39, 176, 0.7)')
-                ax2.tick_params(axis='y', colors='rgba(156, 39, 176, 0.7)', labelsize=7)
+                ax2.set_ylabel('Adoption %', fontsize=8, color=(156/255, 39/255, 176/255, 0.7))
+                ax2.tick_params(axis='y', colors=(156/255, 39/255, 176/255, 0.7), labelsize=7)
                 ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.0f}%'))
                 
                 # Add legend
