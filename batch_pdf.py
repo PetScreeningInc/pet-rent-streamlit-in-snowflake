@@ -354,16 +354,45 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         
         # Compute metrics
         pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
-        t1_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
+        t1_mo_avg = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0  # avg lift
         t1_total = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
         t1_months = max((a["n_post"] for a in comparable.values()), default=0)
-        t1_pct = (t1_mo / pre_baseline * 100) if pre_baseline > 0 else 0
         
         latest_month = months[-1]
         current_monthly_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in monthly_by_prop)
         
+        # Simple lift (current - pre)
+        t1_mo_simple = current_monthly_rev - pre_baseline if pre_baseline > 0 else 0
+        
+        # Auto-select methodology: use simple lift unless negative, then try avg lift, then use least negative
+        if args.avg_lift:
+            # User explicitly requested avg lift
+            use_avg_lift = True
+            t1_mo = t1_mo_avg
+        elif t1_mo_simple >= 0:
+            # Simple lift is positive - use it
+            use_avg_lift = False
+            t1_mo = t1_mo_simple
+        elif t1_mo_avg >= 0:
+            # Simple is negative but avg is positive - switch to avg
+            use_avg_lift = True
+            t1_mo = t1_mo_avg
+            print(f"    Auto-switched to avg lift (simple was negative)")
+        else:
+            # Both negative - use whichever is least negative
+            if t1_mo_avg > t1_mo_simple:
+                use_avg_lift = True
+                t1_mo = t1_mo_avg
+                print(f"    Auto-switched to avg lift (least negative)")
+            else:
+                use_avg_lift = False
+                t1_mo = t1_mo_simple
+        
+        t1_pct = (t1_mo / pre_baseline * 100) if pre_baseline > 0 else 0
+        
         result["comparable_count"] = len(comparable)
         result["monthly_lift"] = round(t1_mo, 2)
+        result["methodology"] = "avg_lift" if use_avg_lift else "simple_lift"
         
         # Fetch compliance data
         pid_lookup = _build_property_id_lookup(all_charges)
@@ -540,23 +569,49 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             monthly_revenue_series=None,
             comparable_current_rev=sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0,
             pmc_system=pmc_system,
-            use_avg_lift=args.avg_lift,
+            use_avg_lift=use_avg_lift,
             asset_class="conventional",
             monthly_by_prop=monthly_by_prop,
             latest_month=latest_month,
             selected_charge_codes=selected_codes,
         )
         
-        # Save PDF
-        safe_label = label.replace(" ", "_").replace("/", "-").replace("\\", "-")[:50]
-        filename = f"{safe_label}_{id_val}_{datetime.now().strftime('%Y%m%d')}.pdf"
-        filepath = output_path / filename
+        # Save PDF with detailed naming and PMC folder structure
+        # Get parent company info
+        parent_name = ""
+        parent_id = ""
+        for prop in properties:
+            pn = prop.get("PARENT_COMPANY_NAME") or prop.get("parent_company_name") or ""
+            pi = prop.get("PARENT_COMPANY_ID") or prop.get("parent_company_id") or ""
+            if pn:
+                parent_name = pn
+            if pi:
+                parent_id = str(pi)
+            break
+        
+        # Create PMC subfolder (yardi/entrata)
+        pmc_folder = output_path / pmc_system.lower()
+        pmc_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Build filename with all searchable info
+        # Format: PropertyName_PropID_ParentName_ParentID_YYYYMMDD.pdf
+        def sanitize(s, max_len=40):
+            return s.replace(" ", "_").replace("/", "-").replace("\\", "-").replace(":", "-").replace(",", "")[:max_len]
+        
+        date_str = datetime.now().strftime('%Y%m%d')
+        prop_name_safe = sanitize(label.split(" - ", 1)[-1] if " - " in label else label, 35)
+        parent_name_safe = sanitize(parent_name, 25) if parent_name else "NoParent"
+        
+        filename = f"{prop_name_safe}_{id_val}_{parent_name_safe}_{parent_id}_{date_str}.pdf"
+        filepath = pmc_folder / filename
         
         with open(filepath, "wb") as f:
             f.write(pdf_bytes)
         
         result["status"] = "success"
-        result["pdf_filename"] = filename
+        result["pdf_filename"] = f"{pmc_system}/{filename}"
+        result["parent_company_name"] = parent_name
+        result["parent_company_id"] = parent_id
         
     except Exception as e:
         import traceback
@@ -659,7 +714,10 @@ def main():
                 "type": args.type,
                 "pmc": "not_found",
                 "label": "",
+                "parent_company_name": "",
+                "parent_company_id": "",
                 "status": "failed",
+                "methodology": "",
                 "properties_found": 0,
                 "properties_with_data": 0,
                 "comparable_count": 0,
@@ -682,7 +740,10 @@ def main():
                 "type": args.type,
                 "pmc": pmc_system,
                 "label": label,
+                "parent_company_name": "",
+                "parent_company_id": "",
                 "status": "skipped",
+                "methodology": "",
                 "properties_found": prop_count,
                 "properties_with_data": 0,
                 "comparable_count": 0,
@@ -715,12 +776,13 @@ def main():
     
     with open(csv_path, "w", newline="") as f:
         fieldnames = [
-            "id", "type", "pmc", "label", "status",
+            "id", "type", "pmc", "label", "parent_company_name", "parent_company_id",
+            "status", "methodology",
             "properties_found", "properties_with_data", "comparable_count",
             "monthly_lift", "uncollected_tenants", "suspected_undisclosed",
             "pdf_filename", "error"
         ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(results)
     
