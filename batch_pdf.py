@@ -132,6 +132,10 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
 def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app_imports, conn):
     """Process a single ID and generate PDF. Returns dict with results."""
     
+    # Set session state so app functions use the correct PMC system
+    import streamlit as st
+    st.session_state["pmc_system"] = pmc_system
+    
     get_snowflake_connection = app_imports["get_snowflake_connection"]
     load_properties_for_selection = app_imports["load_properties_for_selection"]
     load_entrata_properties_for_selection = app_imports["load_entrata_properties_for_selection"]
