@@ -635,6 +635,8 @@ def main():
     parser.add_argument("--avg-lift", action="store_true", help="Use average monthly lift methodology")
     parser.add_argument("--include-pm", action="store_true", help="Include property manager appendix")
     parser.add_argument("--verbose", action="store_true", help="Show detailed error traces")
+    parser.add_argument("--pmc", type=str, choices=["yardi", "entrata"], default=None,
+                        help="Force PMC system (yardi or entrata). Overrides auto-detection.")
     
     args = parser.parse_args()
     
@@ -656,6 +658,8 @@ def main():
     print(f"Processing {len(ids)} {args.type} IDs...")
     print(f"Adoption metric: {args.adoption}")
     print(f"Methodology: {'Average Monthly Lift' if args.avg_lift else 'Simple Lift (Current - Pre)'}")
+    if args.pmc:
+        print(f"PMC forced: {args.pmc}")
     print(f"Output folder: {args.output}")
     print("-" * 60)
     
@@ -704,8 +708,12 @@ def main():
     for idx, id_val in enumerate(ids, 1):
         print(f"\n[{idx}/{len(ids)}] Processing {args.type} ID: {id_val}")
         
-        # Auto-detect PMC from PROPERTY_SOURCE_NAME
+        # Auto-detect PMC from PROPERTY_SOURCE_NAME (or use forced --pmc)
         pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type)
+        
+        if args.pmc:
+            pmc_system = args.pmc
+            print(f"  PMC forced to: {args.pmc}")
         
         if pmc_system is None:
             print(f"  ✗ Not found in database")
