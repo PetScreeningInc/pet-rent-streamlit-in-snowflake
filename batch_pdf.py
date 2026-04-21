@@ -118,10 +118,14 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
     
     if pmc_system == "entrata":
         fetch_fn = app_imports["fetch_entrata_for_properties"]
+        # Entrata returns 4 values: charges, results_log, ar_charges, raw_lease_arrays
+        result = fetch_fn(properties, progress_bar, status_text)
+        all_charges = result[0]
+        results_log = result[1]
     else:
         fetch_fn = app_imports["fetch_rentroll_for_properties"]
+        all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
     
-    all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
     return all_charges, results_log
 
 
@@ -158,7 +162,11 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         # Load properties
         if pmc_system == "entrata":
             if id_type == "parent":
-                props_df = load_entrata_properties_for_selection(parent_company_name=label)
+                # Pass ancestry_id for entrata parent lookups (the ID is the ancestry_id)
+                props_df = load_entrata_properties_for_selection(ancestry_id=str(id_val))
+                # Fallback to parent_company_name if ancestry_id returns nothing
+                if not props_df or (hasattr(props_df, '__len__') and len(props_df) == 0):
+                    props_df = load_entrata_properties_for_selection(parent_company_name=label)
             else:
                 props_df = load_entrata_properties_for_selection(property_id=id_val)
         else:  # yardi or unknown — try yardi
