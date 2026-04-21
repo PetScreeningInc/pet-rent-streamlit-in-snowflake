@@ -93,7 +93,7 @@ def detect_pmc_for_id(conn, id_val, id_type="property"):
                 PROPERTY_SOURCE_NAME,
                 COUNT(DISTINCT PROPERTY_ID) as cnt
             FROM PROD.COMMON.D_PROPERTIES
-            WHERE PARENT_COMPANY_ID = %s
+            WHERE PARENT_COMPANY_ANCESTRY_ID = %s
             GROUP BY PARENT_COMPANY_NAME, PROPERTY_SOURCE_NAME
             ORDER BY cnt DESC
         """, (id_val,))
@@ -582,7 +582,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         parent_id = ""
         for prop in properties:
             pn = prop.get("PARENT_COMPANY_NAME") or prop.get("parent_company_name") or ""
-            pi = prop.get("PARENT_COMPANY_ID") or prop.get("parent_company_id") or ""
+            pi = prop.get("PARENT_COMPANY_ANCESTRY_ID") or prop.get("parent_company_ancestry_id") or prop.get("PARENT_COMPANY_ID") or prop.get("parent_company_id") or ""
             if pn:
                 parent_name = pn
             if pi:
