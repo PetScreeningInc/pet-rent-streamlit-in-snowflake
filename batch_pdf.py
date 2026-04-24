@@ -788,6 +788,43 @@ def main():
     error_count = 0
     skipped_count = 0
     
+    # Set up CSV log file upfront so we can write incrementally
+    # This way if the script dies, you still have a log of what was processed
+    fieldnames = [
+        "id", "type", "pmc", "label", "parent_company_name", "parent_company_id",
+        "status", "methodology",
+        "properties_found", "properties_with_data", "comparable_count",
+        "monthly_lift", "uncollected_tenants", "suspected_undisclosed",
+        "pdf_filename", "error", "processed_at"
+    ]
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # In resume mode, look for the most recent batch_log and append to it
+    # Otherwise create a new one
+    csv_path = None
+    if args.resume:
+        # Find most recent batch_log file
+        existing_logs = sorted(output_path.glob("batch_log_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if existing_logs:
+            csv_path = existing_logs[0]
+            print(f"Resuming log file: {csv_path.name}")
+    
+    if csv_path is None:
+        csv_filename = f"batch_log_{timestamp}.csv"
+        csv_path = output_path / csv_filename
+        # Write header for new file
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+    
+    def _append_to_log(row):
+        """Append a single result row to the CSV log immediately."""
+        row_with_timestamp = {**row, "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writerow(row_with_timestamp)
+    
     # Build set of existing PDFs for resume mode
     existing_pdfs = {}  # {id: (filename, date)}
     if args.resume:
@@ -829,7 +866,7 @@ def main():
         if args.resume and str(id_val) in existing_pdfs:
             existing_name, existing_date = existing_pdfs[str(id_val)]
             print(f"  ⟩ SKIPPED (already exists: {existing_name} from {existing_date.strftime('%Y-%m-%d %H:%M')})")
-            results.append({
+            skip_row = {
                 "id": id_val,
                 "type": args.type,
                 "pmc": "",
@@ -846,7 +883,9 @@ def main():
                 "suspected_undisclosed": 0,
                 "pdf_filename": existing_name,
                 "error": "",
-            })
+            }
+            results.append(skip_row)
+            _append_to_log(skip_row)
             skipped_count += 1
             continue
         
@@ -859,7 +898,7 @@ def main():
         
         if pmc_system is None:
             print(f"  ✗ Not found in database")
-            results.append({
+            not_found_row = {
                 "id": id_val,
                 "type": args.type,
                 "pmc": "not_found",
@@ -876,7 +915,9 @@ def main():
                 "suspected_undisclosed": 0,
                 "pdf_filename": "",
                 "error": "ID not found in PROD.COMMON.D_PROPERTIES",
-            })
+            }
+            results.append(not_found_row)
+            _append_to_log(not_found_row)
             error_count += 1
             continue
         
@@ -885,7 +926,7 @@ def main():
         # Check if PMC is supported
         if pmc_system not in ("yardi", "entrata"):
             print(f"  ✗ Unsupported PMC: {pmc_system.upper()} (only Yardi/Entrata supported)")
-            results.append({
+            unsupported_row = {
                 "id": id_val,
                 "type": args.type,
                 "pmc": pmc_system,
@@ -902,13 +943,16 @@ def main():
                 "suspected_undisclosed": 0,
                 "pdf_filename": "",
                 "error": f"Unsupported PMC: {pmc_system}",
-            })
+            }
+            results.append(unsupported_row)
+            _append_to_log(unsupported_row)
             error_count += 1
             continue
         
         # Process the ID
         result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports, conn)
         results.append(result)
+        _append_to_log(result)  # Persist result immediately
         
         if result["status"] == "success":
             print(f"  ✓ Saved: {result['pdf_filename']}")
@@ -919,22 +963,7 @@ def main():
             print(f"  ✗ Error: {result['error']}")
             error_count += 1
     
-    # Write summary CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"batch_log_{timestamp}.csv"
-    csv_path = output_path / csv_filename
-    
-    with open(csv_path, "w", newline="") as f:
-        fieldnames = [
-            "id", "type", "pmc", "label", "parent_company_name", "parent_company_id",
-            "status", "methodology",
-            "properties_found", "properties_with_data", "comparable_count",
-            "monthly_lift", "uncollected_tenants", "suspected_undisclosed",
-            "pdf_filename", "error"
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows(results)
+    # CSV has been written incrementally during the loop
     
     print("\n" + "=" * 60)
     summary = f"Complete: {success_count} succeeded, {error_count} failed"
