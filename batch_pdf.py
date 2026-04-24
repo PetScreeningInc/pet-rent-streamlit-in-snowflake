@@ -319,6 +319,44 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             return None
         filtered["to_date"] = filtered.apply(_effective_to_date, axis=1)
         
+        # ── ENTRATA-specific: deduplicate charges (shared across customers) ──
+        # Charges belong to the lease, not individual customers. Every customer
+        # row for the same lease has identical charges. Need to dedup to avoid
+        # multiplying revenue by number of customers per lease.
+        if pmc_system == "entrata" and "_entrata_charge_dedup_key" in filtered.columns:
+            _pre = len(filtered)
+            
+            # Sort so active customers (current/past/notice) come first
+            _ACTIVE_STATUSES = {"current", "past", "notice"}
+            filtered["_status_sort"] = filtered["tenant_status"].apply(
+                lambda s: 0 if str(s).strip().lower() in _ACTIVE_STATUSES else 1
+            )
+            filtered = filtered.sort_values("_status_sort", kind="stable")
+            
+            # Drop duplicates by dedup key, keeping active status first
+            mask_has_key = filtered["_entrata_charge_dedup_key"].astype(str).str.strip().ne("")
+            dedup_rows = filtered[mask_has_key].drop_duplicates(
+                subset=["_entrata_charge_dedup_key"], keep="first"
+            )
+            non_dedup_rows = filtered[~mask_has_key]
+            filtered = pd.concat([dedup_rows, non_dedup_rows], ignore_index=True)
+            filtered = filtered.drop(columns=["_status_sort"], errors="ignore")
+            _deduped = _pre - len(filtered)
+            
+            # Exclude cancelled/applicant/denied/future leases - not real revenue
+            _INACTIVE_STATUSES = {"cancelled", "applicant", "denied", "future"}
+            _pre_inactive = len(filtered)
+            filtered = filtered[
+                ~filtered["tenant_status"].apply(
+                    lambda s: str(s).strip().lower() in _INACTIVE_STATUSES
+                )
+            ]
+            _dropped_inactive = _pre_inactive - len(filtered)
+            
+            if _deduped > 0 or _dropped_inactive > 0:
+                print(f"    Entrata cleanup: deduplicated {_deduped:,} shared-lease rows, dropped {_dropped_inactive:,} inactive leases")
+            print(f"    After entrata cleanup: {len(filtered):,} charges")
+        
         # Convert to parsed_charges list (same structure as app)
         charge_cols = ["property_id", "property_name", "from_date", "to_date", "amount", 
                        "charge_code", "tenant_code", "unit_code", "tenant_status"]
