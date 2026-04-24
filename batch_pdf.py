@@ -250,14 +250,38 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         # Import parse_date from app
         parse_date = app_imports["parse_date"]
         
-        # Filter for pet-related charge codes (same as app)
+        # Filter for pet-related charge codes (same keywords as app)
         if "charge_code" not in df.columns:
             result["status"] = "failed"
             result["error"] = "No charge_code column in data"
             return result
         
-        # Filter to pet charges only
-        pet_mask = df["charge_code"].str.lower().str.contains("pet", na=False)
+        # Use same keywords as app (app.py line ~6764)
+        pet_keywords = ['pet', 'animal', 'petnr', 'concpet']
+        
+        # Exclude common false positives (e.g. 'carpet', 'carpetclean')
+        excluded_keywords = ['carpet', 'puppet', 'trumpet']
+        
+        def _is_pet_charge(code):
+            if not code:
+                return False
+            code_lower = str(code).lower()
+            # Must contain a pet keyword
+            if not any(kw in code_lower for kw in pet_keywords):
+                return False
+            # Must NOT contain an excluded keyword
+            if any(ex in code_lower for ex in excluded_keywords):
+                return False
+            return True
+        
+        # Allow manual override of charge codes via --charge-codes
+        if args.charge_codes:
+            manual_codes = [c.strip() for c in args.charge_codes.split(",") if c.strip()]
+            pet_mask = df["charge_code"].isin(manual_codes)
+            print(f"    Using manual charge codes: {manual_codes}")
+        else:
+            pet_mask = df["charge_code"].apply(_is_pet_charge)
+        
         filtered = df[pet_mask].copy()
         
         if filtered.empty:
@@ -265,9 +289,11 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             result["error"] = "No pet-related charges found"
             return result
         
-        print(f"    Found {len(filtered):,} pet charges")
+        # Show which charge codes were included for transparency
+        found_codes = filtered["charge_code"].unique().tolist()
+        print(f"    Found {len(filtered):,} pet charges ({len(found_codes)} codes: {', '.join(sorted(found_codes))})")
         
-        selected_codes = filtered["charge_code"].unique().tolist()
+        selected_codes = found_codes
         
         # Normalize dates & amounts (same as app lines ~6993-7019)
         filtered["from_date"] = filtered["charge_from_date"].apply(parse_date)
@@ -653,6 +679,8 @@ def main():
                         help="Skip IDs that already have a PDF in output folder from the last N days (default 4)")
     parser.add_argument("--resume-days", type=int, default=4,
                         help="Number of days to look back when resuming (default: 4)")
+    parser.add_argument("--charge-codes", type=str, default=None,
+                        help="Comma-separated list of specific charge codes to use (overrides auto-detection)")
     
     args = parser.parse_args()
     
