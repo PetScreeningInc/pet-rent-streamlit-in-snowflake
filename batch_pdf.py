@@ -649,6 +649,10 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Show detailed error traces")
     parser.add_argument("--pmc", type=str, choices=["yardi", "entrata"], default=None,
                         help="Force PMC system (yardi or entrata). Overrides auto-detection.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip IDs that already have a PDF in output folder from the last N days (default 4)")
+    parser.add_argument("--resume-days", type=int, default=4,
+                        help="Number of days to look back when resuming (default: 4)")
     
     args = parser.parse_args()
     
@@ -716,9 +720,69 @@ def main():
     results = []
     success_count = 0
     error_count = 0
+    skipped_count = 0
+    
+    # Build set of existing PDFs for resume mode
+    existing_pdfs = {}  # {id: (filename, date)}
+    if args.resume:
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=args.resume_days)
+        print(f"Resume mode: skipping IDs with PDFs newer than {cutoff_date.strftime('%Y-%m-%d')}")
+        
+        # Scan output folder (including PMC subfolders)
+        for pdf_path in output_path.rglob("*.pdf"):
+            # Filename format: PropertyName_PropID_ParentName_ParentID_YYYYMMDD.pdf
+            # Extract ID from filename (second underscore-separated field)
+            try:
+                mtime = datetime.fromtimestamp(pdf_path.stat().st_mtime)
+                if mtime < cutoff_date:
+                    continue
+                
+                parts = pdf_path.stem.split("_")
+                if len(parts) >= 2:
+                    # Try property id (second field) first
+                    prop_id = parts[1]
+                    # For parent type, parent id is 4th field from end
+                    parent_id = parts[-2] if len(parts) >= 4 else None
+                    
+                    # Store both possible IDs
+                    if prop_id and prop_id.isdigit():
+                        existing_pdfs[prop_id] = (pdf_path.name, mtime)
+                    if parent_id and parent_id.isdigit():
+                        existing_pdfs[parent_id] = (pdf_path.name, mtime)
+            except Exception:
+                continue
+        
+        print(f"Found {len(existing_pdfs)} existing PDFs from last {args.resume_days} days")
+        print("-" * 60)
     
     for idx, id_val in enumerate(ids, 1):
         print(f"\n[{idx}/{len(ids)}] Processing {args.type} ID: {id_val}")
+        
+        # Check if we should skip (resume mode)
+        if args.resume and str(id_val) in existing_pdfs:
+            existing_name, existing_date = existing_pdfs[str(id_val)]
+            print(f"  ⟩ SKIPPED (already exists: {existing_name} from {existing_date.strftime('%Y-%m-%d %H:%M')})")
+            results.append({
+                "id": id_val,
+                "type": args.type,
+                "pmc": "",
+                "label": "",
+                "parent_company_name": "",
+                "parent_company_id": "",
+                "status": "skipped",
+                "methodology": "",
+                "properties_found": 0,
+                "properties_with_data": 0,
+                "comparable_count": 0,
+                "monthly_lift": 0,
+                "uncollected_tenants": 0,
+                "suspected_undisclosed": 0,
+                "pdf_filename": existing_name,
+                "error": "",
+            })
+            skipped_count += 1
+            continue
         
         # Auto-detect PMC from PROPERTY_SOURCE_NAME (or use forced --pmc)
         pmc_system, prop_count, label = detect_pmc_for_id(conn, id_val, args.type)
@@ -807,7 +871,10 @@ def main():
         writer.writerows(results)
     
     print("\n" + "=" * 60)
-    print(f"Complete: {success_count} succeeded, {error_count} failed")
+    summary = f"Complete: {success_count} succeeded, {error_count} failed"
+    if skipped_count > 0:
+        summary += f", {skipped_count} skipped (resume mode)"
+    print(summary)
     print(f"PDFs saved to: {output_path.absolute()}")
     print(f"Log saved to: {csv_path.absolute()}")
 
