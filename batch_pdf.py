@@ -437,8 +437,10 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         latest_month = months[-1]
         current_monthly_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in monthly_by_prop)
         
-        # Simple lift (current - pre)
-        t1_mo_simple = current_monthly_rev - pre_baseline if pre_baseline > 0 else 0
+        # Simple lift (current - pre) - uses ONLY comparable properties to match PDF
+        # The PDF uses comparable_current_rev for headline, not full portfolio current_monthly_rev
+        comparable_current_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0
+        t1_mo_simple = comparable_current_rev - pre_baseline if pre_baseline > 0 else 0
         
         # Auto-select methodology: use simple lift unless negative, then try avg lift, then use least negative
         if args.avg_lift:
