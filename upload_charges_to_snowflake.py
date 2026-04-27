@@ -23,14 +23,9 @@ STAGE_NAME   = f"@{SCHEMA}.%{TABLE_NAME}"
 load_dotenv(Path(__file__).parent / ".env")
 
 def get_connection():
-    return snowflake.connector.connect(
-        user       = os.getenv("SNOWFLAKE_USER"),
-        password   = os.getenv("SNOWFLAKE_PASSWORD"),
-        account    = os.getenv("SNOWFLAKE_ACCOUNT"),
-        warehouse  = os.getenv("SNOWFLAKE_WAREHOUSE"),
-        database   = os.getenv("SNOWFLAKE_DATABASE", "RAW"),
-        role       = os.getenv("SNOWFLAKE_ROLE"),
-    )
+    # Prefers keypair auth (SNOWFLAKE_PRIVATE_KEY_PATH); falls back to password.
+    from snowflake_auth import get_snowflake_connection as _build
+    return _build(database=os.getenv("SNOWFLAKE_DATABASE", "RAW"))
 
 def main():
     if len(sys.argv) < 2:

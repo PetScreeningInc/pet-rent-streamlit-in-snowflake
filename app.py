@@ -625,15 +625,12 @@ def _render_property_funnel(
 
 
 # ─── Snowflake connection (cached, with auto-reconnect) ─────────────
+from snowflake_auth import get_snowflake_connection as _build_sf_conn
+
 @st.cache_resource
 def _create_snowflake_connection():
-    return snowflake.connector.connect(
-        account=os.getenv("SNOWFLAKE_ACCOUNT"),
-        user=os.getenv("SNOWFLAKE_USER"),
-        password=os.getenv("SNOWFLAKE_PASSWORD"),
-        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
-        role=os.getenv("SNOWFLAKE_ROLE"),
-    )
+    # Prefers keypair auth (SNOWFLAKE_PRIVATE_KEY_PATH); falls back to password.
+    return _build_sf_conn()
 
 
 def get_snowflake_connection():
