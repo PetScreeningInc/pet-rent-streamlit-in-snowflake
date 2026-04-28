@@ -24,6 +24,14 @@ from typing import Optional
 
 import snowflake.connector
 
+# Load .env from the file's own directory if present, so this helper
+# works whether or not the caller already loaded dotenv.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 
 def _load_private_key_bytes(key_path: str, passphrase: Optional[str]) -> bytes:
     """Load and decrypt a PKCS8 private key, return raw DER bytes."""
