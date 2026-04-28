@@ -108,14 +108,34 @@ def detect_pmc_for_id(conn, id_val, id_type="property"):
         return None, 0, None
 
 
-def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=True):
+def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=True, workers=1):
     """
     Fetch charges via API for a list of properties.
+    workers > 1 → use parallel fetcher (much faster for large parents).
+    workers = 1 → use sequential fetcher (legacy / matches Streamlit app).
     Returns: (all_charges_list, results_log)
     """
+    if workers and workers > 1:
+        from parallel_fetch import fetch_entrata_parallel, fetch_yardi_parallel
+        if pmc_system == "entrata":
+            api_key = app_imports["ENTRATA_API_KEY"]
+            all_charges, results_log, _, _ = fetch_entrata_parallel(
+                properties, api_key, app_imports,
+                workers=workers, verbose=verbose,
+            )
+        else:
+            license_token = app_imports["YARDI_LICENSE_TOKEN"]
+            soap_headers  = app_imports["SOAP_HEADERS"]
+            all_charges, results_log = fetch_yardi_parallel(
+                properties, app_imports, license_token, soap_headers,
+                workers=workers, verbose=verbose,
+            )
+        return all_charges, results_log
+
+    # Sequential path (unchanged)
     progress_bar = FakeProgressBar()
     status_text = FakeStatusText(verbose=verbose)
-    
+
     if pmc_system == "entrata":
         fetch_fn = app_imports["fetch_entrata_for_properties"]
         # Entrata returns 4 values: charges, results_log, ar_charges, raw_lease_arrays
@@ -125,7 +145,7 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
     else:
         fetch_fn = app_imports["fetch_rentroll_for_properties"]
         all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
-    
+
     return all_charges, results_log
 
 
@@ -207,8 +227,9 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         print(f"    Fetching charges via {pmc_system.upper()} API...")
         
         # Fetch charges via API
+        workers = getattr(args, "workers", 1) or 1
         all_charges, fetch_log = fetch_charges_for_properties(
-            properties, pmc_system, app_imports, verbose=False
+            properties, pmc_system, app_imports, verbose=True, workers=workers
         )
         
         if not all_charges:
@@ -721,7 +742,14 @@ def main():
                         help="Number of days to look back when resuming (default: 4)")
     parser.add_argument("--charge-codes", type=str, default=None,
                         help="Comma-separated list of specific charge codes to use (overrides auto-detection)")
-    
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Concurrent property fetches per parent (default 1 = sequential). "
+                             "Try 8 for 5-8x speedup on large parents (Greystar, Trinity, etc).")
+    parser.add_argument("--label", type=str, default=None,
+                        help="Override report label (PDF title + filename prefix). "
+                             "Use when grouping arbitrary property IDs under a custom name, "
+                             "e.g. --label 'TruAmerica' for an asset-owner report.")
+
     args = parser.parse_args()
     
     # Get IDs
@@ -744,6 +772,10 @@ def main():
     print(f"Methodology: {'Average Monthly Lift' if args.avg_lift else 'Simple Lift (Current - Pre)'}")
     if args.pmc:
         print(f"PMC forced: {args.pmc}")
+    if args.label:
+        print(f"Custom label: {args.label}")
+    if args.workers and args.workers > 1:
+        print(f"Concurrent fetches per parent: {args.workers}")
     print(f"Output folder: {args.output}")
     print("-" * 60)
     
@@ -765,8 +797,19 @@ def main():
         fetch_rentroll_for_properties,
         fetch_entrata_for_properties,
         parse_date,
+        # Per-property internals (used by parallel_fetch.py)
+        _fetch_entrata_leases_for_property,
+        _extract_charges_from_entrata_lease,
+        _extract_ar_charges_from_entrata_lease,
+        build_soap_payload,
+        xml_to_dict,
+        extract_property,
+        extract_charges_from_property,
+        ENTRATA_API_KEY,
+        YARDI_LICENSE_TOKEN,
+        SOAP_HEADERS,
     )
-    
+
     app_imports = {
         "get_snowflake_connection": get_snowflake_connection,
         "load_properties_for_selection": load_properties_for_selection,
@@ -780,6 +823,17 @@ def main():
         "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
         "fetch_entrata_for_properties": fetch_entrata_for_properties,
         "parse_date": parse_date,
+        # Internals + constants used by parallel_fetch.py
+        "_fetch_entrata_leases_for_property":   _fetch_entrata_leases_for_property,
+        "_extract_charges_from_entrata_lease":  _extract_charges_from_entrata_lease,
+        "_extract_ar_charges_from_entrata_lease": _extract_ar_charges_from_entrata_lease,
+        "build_soap_payload":         build_soap_payload,
+        "xml_to_dict":                xml_to_dict,
+        "extract_property":           extract_property,
+        "extract_charges_from_property": extract_charges_from_property,
+        "ENTRATA_API_KEY":            ENTRATA_API_KEY,
+        "YARDI_LICENSE_TOKEN":        YARDI_LICENSE_TOKEN,
+        "SOAP_HEADERS":               SOAP_HEADERS,
     }
     
     # Get a connection
@@ -924,6 +978,11 @@ def main():
             continue
         
         print(f"  Found: {label} ({pmc_system.upper()}, {prop_count} properties)")
+
+        # Override label with --label CLI flag if provided
+        if args.label:
+            label = args.label
+            print(f"  Using custom label: {label}")
         
         # Check if PMC is supported
         if pmc_system not in ("yardi", "entrata"):

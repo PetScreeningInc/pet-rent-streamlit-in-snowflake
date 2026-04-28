@@ -6469,6 +6469,15 @@ with st.sidebar:
             placeholder="e.g. 12345, 67890, 11111  or one per line",
             key="multi_property_ids_input",
         )
+        # Optional custom label for the report (e.g. asset owner name)
+        _multi_label_input = st.text_input(
+            "Report label (optional):",
+            placeholder="e.g. TruAmerica, AEW Capital — leave blank to use property count",
+            key="multi_property_label_input",
+            help="When pasting property IDs, give the report a custom title "
+                 "(asset owner, fund, custom group). Used as the PDF title and "
+                 "download filename. Leave blank to default to '<N> Properties'.",
+        )
         _multi_ids_parsed = []
         if _multi_ids_raw and _multi_ids_raw.strip():
             import re
@@ -6478,7 +6487,10 @@ with st.sidebar:
                 if _tok and _tok.isdigit():
                     _multi_ids_parsed.append(int(_tok))
             if _multi_ids_parsed:
-                st.caption(f"{len(_multi_ids_parsed)} property IDs detected")
+                _detected_caption = f"{len(_multi_ids_parsed)} property IDs detected"
+                if _multi_label_input and _multi_label_input.strip():
+                    _detected_caption += f"  ·  label: “{_multi_label_input.strip()}”"
+                st.caption(_detected_caption)
 
     # Display window is now derived from the data (no slider).
     # Set a large default; the actual window will be clamped to the
@@ -6628,7 +6640,8 @@ if fetch_btn:
                 st.error(f"No {_system_label} properties with active integrations found for that selection.")
         else:
             if _use_multi_ids:
-                label = f"{len(properties)} Properties"
+                _custom_label = (_multi_label_input or "").strip() if '_multi_label_input' in dir() else ""
+                label = _custom_label if _custom_label else f"{len(properties)} Properties"
             else:
                 label = selected_parent or (f"Ancestry {selected_ancestry_id}" if selected_ancestry_id else f"Property {selected_property_id}")
             st.session_state.selection_label = label
