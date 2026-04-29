@@ -76,6 +76,23 @@ def _parse_int(s: Optional[str]) -> Optional[int]:
         return None
 
 
+def _suffix_to_dollars(s: Optional[str]) -> Optional[float]:
+    """Convert '$3.6M', '$1.5M', '$500K', or plain '$3,557,800' to a number."""
+    if not s:
+        return None
+    raw = s.replace(",", "").replace("$", "").replace("~", "").strip()
+    try:
+        if raw.endswith("M"):
+            return float(raw[:-1]) * 1_000_000
+        if raw.endswith("K"):
+            return float(raw[:-1]) * 1_000
+        if raw.endswith("B"):
+            return float(raw[:-1]) * 1_000_000_000
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _first_match(text: str, patterns: List[str], group: int = 1, flags=re.IGNORECASE) -> Optional[str]:
     """Try each regex in order, return first match's capture group."""
     for pat in patterns:
@@ -205,22 +222,21 @@ def extract_all(text: str) -> Dict[str, Any]:
     )
 
     # ── Asset value impact ──
-    avi = _first_match(text, [
-        r"Est\.?\s*Asset\s+Value\s+Impact[\s\n]*~?\$?([\d,.]+[MKB]?)",
-        r"~?\$([\d,.]+[MKB]?)\s+in\s+added\s+asset\s+value",
-        r"Unrealized\s+Property\s+Value:\s*\$([\d,.]+[MKB]?)",
+    # Try the precise number first (~$3,557,800), then the M/K rounded form ($3.6M)
+    avi_precise = _first_match(text, [
+        r"~\$([\d,]+)\s+in\s+added\s+asset\s+value",
+        r"Unrealized\s+Property\s+Value:\s*\$([\d,]+)",
+        r"represents\s+~?\$([\d,]+)\s+in\s+added",
     ])
-    if avi:
-        # Handle M/K suffixes
-        avi_clean = avi.replace(",", "")
-        if avi_clean.endswith("M"):
-            d["asset_value_impact"] = float(avi_clean[:-1]) * 1_000_000
-        elif avi_clean.endswith("K"):
-            d["asset_value_impact"] = float(avi_clean[:-1]) * 1_000
-        else:
-            d["asset_value_impact"] = _parse_money(avi)
+    if avi_precise:
+        d["asset_value_impact"] = _parse_money(avi_precise)
     else:
-        d["asset_value_impact"] = None
+        avi = _first_match(text, [
+            r"Est\.?\s*Asset\s+Value\s+Impact[\s\n]*~?\$([\d,.]+[MKB])",
+            r"~?\$([\d,.]+[MKB])\s+in\s+added\s+asset\s+value",
+            r"Est\.?\s*Asset\s+Value\s+Impact[\s\n]*~?\$([\d,.]+)",
+        ])
+        d["asset_value_impact"] = _suffix_to_dollars(avi)
 
     # ── Uncollected tenants + missing monthly rent ──
     d["uncollected_tenants"] = _parse_int(
@@ -250,27 +266,50 @@ def extract_all(text: str) -> Dict[str, Any]:
         ])
     )
 
-    # ── Combined opportunity ──
-    d["combined_opportunity_monthly"] = _parse_money(
+    # ── Pet Revenue Found = uncollected + suspected (the "found" opportunity) ──
+    d["pet_revenue_found_monthly"] = _parse_money(
         _first_match(text, [
-            r"Pet\s+Revenue\s+Found[\s\n]*\$([\d,]+)\s*/?\s*mo",
-            r"Total\s+Opportunity[\s\n]*\$([\d,]+)",
+            r"\$([\d,]+)\s*/\s*mo[\s\n]+PET\s+REVENUE\s+FOUND",
+            r"PET\s+REVENUE\s+FOUND[\s\n]+\$([\d,]+)\s*/?\s*mo",
+            r"Pet\s+Revenue\s+Found[\s\n]+\$([\d,]+)",
         ])
     )
-    # Fallback: compute if both pieces are present
-    if d["combined_opportunity_monthly"] is None:
+    # Fallback: compute from missing + suspected
+    if d["pet_revenue_found_monthly"] is None:
         mr = d.get("missing_monthly_rent") or 0
         sm = d.get("suspected_monthly") or 0
         if mr > 0 or sm > 0:
-            d["combined_opportunity_monthly"] = mr + sm
+            d["pet_revenue_found_monthly"] = mr + sm
 
-    # ── Annual revenue impact ──
-    d["annual_revenue_impact"] = _parse_money(
+    # ── Total Opportunity = actuals lift + found (the headline combined number) ──
+    d["total_opportunity_monthly"] = _parse_money(
         _first_match(text, [
-            r"Annual\s+Revenue\s+Impact[\s\n]*\$([\d,]+)",
-            r"annual\s+basis[^$]*\$([\d,]+)\s+in\s+revenue",
+            r"\$([\d,]+)\s*/\s*mo[\s\n]+TOTAL\s+OPPORTUNITY",
+            r"TOTAL\s+OPPORTUNITY[\s\n]+\$([\d,]+)\s*/?\s*mo",
+            r"Total\s+Opportunity[\s\n]+\$([\d,]+)",
         ])
     )
+    # Fallback: actuals lift + found
+    if d["total_opportunity_monthly"] is None:
+        lift  = d.get("monthly_lift") or 0
+        found = d.get("pet_revenue_found_monthly") or 0
+        if lift > 0 or found > 0:
+            d["total_opportunity_monthly"] = lift + found
+
+    # Keep old field name as alias to total_opportunity for backward compat
+    d["combined_opportunity_monthly"] = d["total_opportunity_monthly"]
+
+    # ── Annual revenue impact (always shown as $X/yr in Opportunity section) ──
+    d["annual_revenue_impact"] = _parse_money(
+        _first_match(text, [
+            r"\$([\d,]+)\s*/\s*yr[\s\n]+ANNUAL\s+REVENUE\s+IMPACT",
+            r"ANNUAL\s+REVENUE\s+IMPACT[\s\n]+\$([\d,]+)\s*/?\s*yr",
+            r"annual\s+basis[^$]*\$([\d,]+)\s+in\s+revenue",
+            r"Annual\s+Revenue\s+Impact[\s\n]*\$([\d,]+)",
+        ])
+    )
+    # Fallback: annualized lift = monthly_lift x 12 (different metric, last resort only)
+    # We DON'T fall back to that — leave blank if unparseable, signals a bug to fix
 
     # ── Total / data properties ──
     d["total_properties"] = _parse_int(
@@ -347,7 +386,10 @@ def main():
         "monthly_lift", "lift_per_unit", "asset_value_impact",
         "uncollected_tenants", "missing_monthly_rent",
         "suspected_undisclosed", "suspected_monthly",
-        "combined_opportunity_monthly", "annual_revenue_impact",
+        "pet_revenue_found_monthly",      # uncollected + suspected
+        "total_opportunity_monthly",       # actuals lift + found (headline combined)
+        "combined_opportunity_monthly",    # alias for total_opportunity (backward compat)
+        "annual_revenue_impact",
         "total_properties", "properties_with_data",
     ]
 
