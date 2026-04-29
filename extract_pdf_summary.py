@@ -90,26 +90,35 @@ def parse_filename(name: str) -> Dict[str, str]:
     """
     Filename format from batch_pdf.py:
         PropertyName_PropID_ParentName_ParentID_YYYYMMDD.pdf
-    Or for entrata parent reports:
-        ParentName_ParentID_HQ_-_Label__YYYYMMDD.pdf
 
-    We extract what we can; the PDF text is the source of truth.
+    Tokens between the trailing date and the start are name/id mixed.
+    The two numeric tokens (excluding the date) are PropID and ParentID,
+    in left-to-right order in the filename.
     """
     stem = Path(name).stem
     parts = stem.split("_")
     info: Dict[str, str] = {"raw_stem": stem}
 
-    # Date is always the last underscore-separated token (YYYYMMDD)
-    if parts and re.match(r"^\d{8}$", parts[-1]):
-        info["run_date"] = parts[-1]
+    if not parts:
+        return info
 
-    # Try to find a numeric parent ID (second-to-last number)
-    nums = [p for p in parts if p.isdigit() and len(p) >= 3]
+    # Date = trailing 8-digit token, if present
+    if re.match(r"^\d{8}$", parts[-1]):
+        info["run_date"] = parts[-1]
+        body = parts[:-1]
+    else:
+        body = parts
+
+    # Numeric tokens in the body (excluding date) are property_id then parent_id.
+    # Filter min length=2 to avoid garbage like '0' but allow legitimate short ids.
+    nums = [p for p in body if p.isdigit() and len(p) >= 2]
+
     if len(nums) >= 2:
-        info["parent_id"] = nums[1]  # second numeric = parent_id typically
-        info["prop_id"] = nums[0]
+        info["prop_id"]   = nums[0]   # first numeric = property id
+        info["parent_id"] = nums[-1]  # last numeric in body = parent id
     elif len(nums) == 1:
         info["parent_id"] = nums[0]
+        info["prop_id"]   = nums[0]
 
     return info
 
@@ -282,12 +291,28 @@ def extract_all(text: str) -> Dict[str, Any]:
 
 # ─── Dedup logic ────────────────────────────────────────────────────
 def dedup_key(info: Dict, data: Dict) -> str:
-    """Build a dedup key. Prefer parent_id from filename, fall back to label."""
-    pid = info.get("parent_id", "")
+    """
+    Build a dedup key for collapsing the same report across multiple run dates.
+
+    Strategy:
+      - prop_id + parent_id together (handles property AND parent reports cleanly).
+      - Falls back to the filename stem WITHOUT the trailing _YYYYMMDD,
+        so two PDFs with the same content but different run dates collapse.
+    """
+    pid    = info.get("prop_id", "")
+    parent = info.get("parent_id", "")
+
+    if pid and parent and pid != parent:
+        return f"pp_{pid}_{parent}"
+    if parent:
+        return f"id_{parent}"
     if pid:
-        return f"pid_{pid}"
-    label = data.get("label", info.get("raw_stem", ""))
-    return f"label_{label}"
+        return f"id_{pid}"
+
+    # Fallback: strip the trailing _YYYYMMDD from the stem and use that
+    stem = info.get("raw_stem", "")
+    stem_no_date = re.sub(r"_\d{8}$", "", stem)
+    return f"stem_{stem_no_date}"
 
 
 # ─── Main ───────────────────────────────────────────────────────────
@@ -398,12 +423,15 @@ def main():
     if args.dry_run:
         print("\n(dry run — no file written)")
         # Print a few sample rows
-        print(f"\nSample rows (first 5):")
-        for r in rows[:5]:
-            print(f"  {r.get('parent_id','?'):>8}  {str(r.get('parent_name',''))[:35]:<35}  "
-                  f"lift=${r.get('monthly_lift','--'):>10}  "
-                  f"unc={r.get('uncollected_tenants','--'):>5}  "
-                  f"susp={r.get('suspected_undisclosed','--'):>5}")
+        print(f"\nSample rows (first 10):")
+        print(f"  {'parent_id':>10}  {'date':>8}  {'name':<35}  {'lift':>10}  {'unc':>5}  {'susp':>5}")
+        for r in rows[:10]:
+            pid = str(r.get('parent_id', '?'))
+            print(f"  {pid:>10}  {str(r.get('run_date','')):>8}  "
+                  f"{str(r.get('parent_name',''))[:35]:<35}  "
+                  f"${str(r.get('monthly_lift','--')):>9}  "
+                  f"{str(r.get('uncollected_tenants','--')):>5}  "
+                  f"{str(r.get('suspected_undisclosed','--')):>5}")
         return
 
     out_path = Path(args.output) if args.output else folder / f"pdf_summary_{datetime.now():%Y%m%d_%H%M%S}.csv"
