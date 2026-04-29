@@ -57,11 +57,15 @@ def read_pdf_text(pdf_path: Path, max_pages: int = 4) -> str:
 
 # ─── Number helpers ─────────────────────────────────────────────────
 def _parse_money(s: Optional[str]) -> Optional[float]:
+    """Parse a money-like string: '$13,816/mo', '+$14,824', '$177,890/yr', '~$4,471', etc."""
     if not s:
         return None
-    s = s.replace(",", "").replace("$", "").replace("+", "").strip()
+    raw = s.strip()
+    # Strip suffixes that get attached to dollar values in PDFs
+    raw = re.sub(r"\s*/\s*(?:mo|month|yr|year)\b", "", raw, flags=re.IGNORECASE)
+    raw = raw.replace(",", "").replace("$", "").replace("+", "").replace("~", "").strip()
     try:
-        return float(s)
+        return float(raw)
     except ValueError:
         return None
 
@@ -141,8 +145,70 @@ def parse_filename(name: str) -> Dict[str, str]:
 
 
 # ─── Extractors ─────────────────────────────────────────────────────
+def parse_key_metrics_table(text: str) -> Dict[str, str]:
+    """
+    Parse the Key Metrics table on page 3, rendered as alternating
+    METRIC / VALUE lines:
+        Pre-PS Baseline
+        $13,816/mo
+        Current Monthly Pet-Related Revenue
+        $30,340/mo
+        ...
+    Returns dict mapping a clean key to the raw value string.
+    """
+    result: Dict[str, str] = {}
+
+    METRICS = [
+        ("Total Properties in Portfolio",       "km_total_properties"),
+        ("Comparable Properties (in analysis)", "km_comparable_properties"),
+        ("Properties with Charge Data",         "km_properties_with_data"),
+        ("Properties with Launch Date",         "km_properties_with_launch"),
+        ("Total Portfolio Units",               "km_total_portfolio_units"),
+        ("Units (in analysis)",                 "km_units_in_analysis"),
+        ("Combined Lift per Unit",              "km_combined_lift_per_unit"),
+        ("Projected Revenue at 100% Adoption",  "km_projected_rev_100pct"),
+        ("Additional Opportunity at 100%",      "km_additional_opp_100pct"),
+        ("Suspected Undisclosed Revenue",       "km_suspected_revenue"),
+        ("Suspected Undisclosed Pets",          "km_suspected_count"),
+        ("Tenants Not Paying Pet Rent",         "km_tenants_not_paying"),
+        ("Est. Asset Value Impact (5% Cap)",    "km_asset_value"),
+        ("Current Monthly Pet-Related Revenue", "km_current_rev"),
+        ("Pre-PS Baseline",                     "km_pre_baseline"),
+        ("Uncollected Revenue",                 "km_uncollected_revenue"),
+        ("Annualized Lift",                     "km_annualized_lift"),
+        ("Monthly Lift",                        "km_monthly_lift"),
+        ("Unit Adoption",                       "km_unit_adoption"),
+    ]
+
+    km_idx = text.find("Key Metrics")
+    if km_idx < 0:
+        return result
+    section = text[km_idx:]
+    for stop in ("Impact by Property", "PetScreening Value Report | "):
+        i = section.find(stop, 50)
+        if i > 0:
+            section = section[:i]
+            break
+
+    lines = [l.strip() for l in section.split("\n") if l.strip()]
+
+    i = 0
+    while i < len(lines) - 1:
+        line = lines[i]
+        for label, key in METRICS:
+            if line == label and key not in result:
+                result[key] = lines[i + 1]
+                break
+        i += 1
+
+    return result
+
+
 def extract_all(text: str) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
+
+    # Pull Key Metrics table values first — most reliable source
+    km = parse_key_metrics_table(text)
 
     # ── Label (PDF header) ──
     # The label is the first bold line in the header. pypdf may render it
@@ -212,12 +278,14 @@ def extract_all(text: str) -> Dict[str, Any]:
         if m:
             d["monthly_lift"] = -d["monthly_lift"]
 
-    # ── Lift per unit ──
+    # ── Lift per unit (Actuals lift, NOT found per unit or combined) ──
+    # Specific patterns to avoid grabbing FOUND PER UNIT / COMBINED LIFT PER UNIT
     d["lift_per_unit"] = _parse_money(
         _first_match(text, [
-            r"\$(-?[\d,.]+)\s*/\s*unit\s*/\s*mo",
-            r"\$(-?[\d,.]+)\s+per\s+unit\s+per\s+month",
-            r"Lift\s+per\s+Unit[\s\n]*\+?\$(-?[\d,.]+)",
+            r"\$(-?[\d,.]+)\s+per\s+unit\s+per\s+month",  # narrative form
+            r"\$(-?[\d,.]+)\s*/\s*unit\s*/\s*mo[\s\n]+LIFT\s+PER\s+UNIT(?!\s+\(FOUND\))",
+            r"^Lift\s+per\s+Unit[\s\n]*\+?\$(-?[\d,.]+)",
+            r"\+?\$(-?[\d,.]+)\s*/\s*unit\s*/\s*mo[\s\n]+\$[\d,]+\s*/\s*[\d,]+\s+units",
         ])
     )
 
@@ -247,8 +315,11 @@ def extract_all(text: str) -> Dict[str, Any]:
     )
     d["missing_monthly_rent"] = _parse_money(
         _first_match(text, [
+            r"\$([\d,]+)[\s\n]+MISSING\s+MONTHLY\s+PET\s+RENT",
+            r"MISSING\s+MONTHLY\s+PET\s+RENT[\s\n]+\$([\d,]+)",
             r"Missing\s+Monthly\s+Pet\s+Rent[\s\n]*\$([\d,]+)",
             r"\$([\d,]+)\s*/\s*mo\s+(?:in\s+)?uncollected",
+            r"=\s*\$([\d,]+)\s*/\s*mo\s+uncollected",
         ])
     )
 
@@ -325,6 +396,137 @@ def extract_all(text: str) -> Dict[str, Any]:
         ])
     )
 
+    # ── Page 1 — "Opportunity" row (Found Per Unit + Est Value Impact (Found)) ──
+    d["found_per_unit"] = _parse_money(
+        _first_match(text, [
+            r"\$(-?[\d,.]+)\s*/\s*unit\s*/\s*mo[\s\n]+FOUND\s+PER\s+UNIT",
+            r"FOUND\s+PER\s+UNIT[\s\n]+\$(-?[\d,.]+)",
+        ])
+    )
+    d["est_value_impact_found"] = _suffix_to_dollars(
+        _first_match(text, [
+            r"\$([\d,.]+[MKB]?)[\s\n]+EST\.?\s*VALUE\s+IMPACT\s*\(?FOUND\)?",
+            r"EST\.?\s*VALUE\s+IMPACT\s*\(?FOUND\)?[\s\n]+\$([\d,.]+[MKB]?)",
+        ])
+    )
+    d["combined_lift_per_unit"] = _parse_money(
+        _first_match(text, [
+            r"\$(-?[\d,.]+)\s*/\s*unit\s*/\s*mo[\s\n]+COMBINED\s+LIFT\s+PER\s+UNIT",
+            r"COMBINED\s+LIFT\s+PER\s+UNIT[\s\n]+\+?\$(-?[\d,.]+)",
+        ])
+    )
+    d["combined_est_value_impact"] = _suffix_to_dollars(
+        _first_match(text, [
+            r"\$([\d,.]+[MKB]?)[\s\n]+COMBINED\s+EST\.?\s*VALUE\s+IMPACT",
+            r"COMBINED\s+EST\.?\s*VALUE\s+IMPACT[\s\n]+\$([\d,.]+[MKB]?)",
+        ])
+    )
+
+    # ── Page 1 — How This Scales ──
+    d["projected_annual_lift"] = _parse_money(
+        _first_match(text, [
+            r"\$([\d,]+)\s*/\s*yr[\s\n]+PROJECTED\s+ANNUAL\s+LIFT",
+            r"approximately\s+\$([\d,]+)\s*/\s*yr\s+in\s+additional",
+        ])
+    )
+    d["projected_asset_value_impact"] = _suffix_to_dollars(
+        _first_match(text, [
+            r"\$([\d,.]+[MKB]?)[\s\n]+PROJECTED\s+ASSET\s+VALUE\s+IMPACT",
+            r"~\$([\d,]+)\s+in\s+added\s+asset\s+value\.\s*\n\s*~?[\d,]+",
+        ])
+    )
+
+    # ── Page 2 — Portfolio Health ──
+    d["avg_unit_adoption_pct"] = _parse_money(
+        _first_match(text, [
+            r"([\d.]+)\s*%[\s\n]+AVG\s+UNIT\s+ADOPTION",
+            r"running\s+at\s+([\d.]+)\s*%\s+unit\s+adoption",
+        ])
+    )
+    d["properties_with_launch"] = _parse_int(
+        _first_match(text, [
+            r"(\d[\d,]*)\s+of\s+\d[\d,]*\s+properties\s+have\s+an\s+established",
+            r"(\d[\d,]*)[\s\n]+PROPERTIES\s+WITH\s+LAUNCH\s+DATE",
+        ])
+    )
+    d["additional_opportunity_at_100pct"] = _parse_money(
+        _first_match(text, [
+            r"an\s+additional\s+\$([\d,]+)\s*/\s*mo\s+opportunity",
+            r"\+?\$([\d,]+)\s*/\s*mo[\s\n]+ADDITIONAL\s+OPPORTUNITY",
+        ])
+    )
+    d["projected_revenue_at_100pct"] = _parse_money(
+        _first_match(text, [
+            r"projected\s+pet\s+fee\s+revenue\s+would\s+be\s+\$([\d,]+)\s*/\s*mo",
+            r"\$([\d,]+)\s*/\s*mo[\s\n]+PROJECTED\s+REVENUE",
+        ])
+    )
+
+    # ── Page 2 — one-time uncollected fees ──
+    d["one_time_uncollected"] = _parse_money(
+        _first_match(text, [
+            r"plus\s+\$([\d,]+)\s+in\s+uncollected\s+one-time",
+            r"\+\s*\$([\d,]+)\s+one-time",
+        ])
+    )
+
+    # ── Key Metrics table fallbacks — only fill if primary extraction missed ──
+    # The table on page 3 is a clean ground-truth source for these numbers.
+    if d.get("pre_revenue") is None:
+        d["pre_revenue"] = _parse_money(km.get("km_pre_baseline"))
+    if d.get("monthly_lift") is None:
+        d["monthly_lift"] = _parse_money(km.get("km_monthly_lift"))
+    if d.get("asset_value_impact") is None:
+        d["asset_value_impact"] = _suffix_to_dollars(km.get("km_asset_value"))
+    if d.get("uncollected_tenants") is None:
+        d["uncollected_tenants"] = _parse_int(km.get("km_tenants_not_paying"))
+    if d.get("missing_monthly_rent") is None:
+        d["missing_monthly_rent"] = _parse_money(km.get("km_uncollected_revenue"))
+    if d.get("suspected_undisclosed") is None:
+        d["suspected_undisclosed"] = _parse_int(km.get("km_suspected_count"))
+    if d.get("suspected_monthly") is None:
+        d["suspected_monthly"] = _parse_money(km.get("km_suspected_revenue"))
+    if d.get("comparable_units") is None:
+        d["comparable_units"] = _parse_int(km.get("km_units_in_analysis"))
+    if d.get("avg_unit_adoption_pct") is None:
+        d["avg_unit_adoption_pct"] = _parse_money(km.get("km_unit_adoption"))
+    if d.get("additional_opportunity_at_100pct") is None:
+        d["additional_opportunity_at_100pct"] = _parse_money(km.get("km_additional_opp_100pct"))
+    if d.get("projected_revenue_at_100pct") is None:
+        d["projected_revenue_at_100pct"] = _parse_money(km.get("km_projected_rev_100pct"))
+
+    # ── Key Metrics table — fields ONLY available there ──
+    # "Comparable Properties (in analysis)" — form: "15 of 16"
+    cp = km.get("km_comparable_properties", "")
+    if cp:
+        m = re.match(r"\s*(\d[\d,]*)\s*(?:of\s*(\d[\d,]*))?", cp)
+        if m:
+            if d.get("comparable_count") is None:
+                d["comparable_count"] = _parse_int(m.group(1))
+            if d.get("total_properties") is None and m.group(2):
+                d["total_properties"] = _parse_int(m.group(2))
+
+    pwl = km.get("km_properties_with_launch", "")
+    if pwl:
+        m = re.match(r"\s*(\d[\d,]*)", pwl)
+        if m and d.get("properties_with_launch") is None:
+            d["properties_with_launch"] = _parse_int(m.group(1))
+
+    pwd = km.get("km_properties_with_data", "")
+    if pwd:
+        m = re.match(r"\s*(\d[\d,]*)", pwd)
+        if m and d.get("properties_with_data") is None:
+            d["properties_with_data"] = _parse_int(m.group(1))
+
+    if km.get("km_total_portfolio_units"):
+        d["total_portfolio_units"] = _parse_int(km["km_total_portfolio_units"])
+    if km.get("km_total_properties"):
+        d["total_properties_in_portfolio"] = _parse_int(km["km_total_properties"])
+    if km.get("km_annualized_lift"):
+        d["annualized_lift"] = _parse_money(km["km_annualized_lift"])
+    if km.get("km_combined_lift_per_unit") and d.get("combined_lift_per_unit") is None:
+        d["combined_lift_per_unit"] = _parse_money(km["km_combined_lift_per_unit"])
+
     return d
 
 
@@ -380,17 +582,39 @@ def main():
     print("-" * 80)
 
     FIELDS = [
+        # Identity
         "parent_id", "parent_name", "pmc", "run_date", "pdf_filename",
+
+        # At a Glance — Actuals row
         "comparable_count", "comparable_units",
         "pre_revenue", "current_revenue", "post_avg_revenue",
         "monthly_lift", "lift_per_unit", "asset_value_impact",
-        "uncollected_tenants", "missing_monthly_rent",
-        "suspected_undisclosed", "suspected_monthly",
-        "pet_revenue_found_monthly",      # uncollected + suspected
-        "total_opportunity_monthly",       # actuals lift + found (headline combined)
-        "combined_opportunity_monthly",    # alias for total_opportunity (backward compat)
+
+        # At a Glance — Opportunity row (Pet Revenue Found)
+        "pet_revenue_found_monthly", "found_per_unit", "est_value_impact_found",
+
+        # At a Glance — Total Opportunity row (Actuals + Found)
+        "total_opportunity_monthly", "combined_lift_per_unit", "combined_est_value_impact",
+        "combined_opportunity_monthly",  # alias of total_opportunity
+
+        # How This Scales (full-portfolio projections)
+        "total_portfolio_units", "projected_annual_lift", "projected_asset_value_impact",
+
+        # Revenue Opportunity (page 2)
+        "uncollected_tenants", "missing_monthly_rent", "one_time_uncollected",
         "annual_revenue_impact",
-        "total_properties", "properties_with_data",
+        "suspected_undisclosed", "suspected_monthly",
+
+        # Portfolio Health (page 2)
+        "avg_unit_adoption_pct",
+        "additional_opportunity_at_100pct", "projected_revenue_at_100pct",
+
+        # Properties counts
+        "properties_with_launch", "properties_with_data",
+        "total_properties", "total_properties_in_portfolio",
+
+        # From Key Metrics table (page 3) — only here
+        "annualized_lift",
     ]
 
     rows_by_key: Dict[str, Dict] = {}
