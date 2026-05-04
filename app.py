@@ -1726,12 +1726,41 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
         j.description          AS charge_type,
         j.amount::STRING       AS charge_amount,
         TO_CHAR(j.bill_start, 'YYYY-MM-DD') AS charge_from_date,
-        TO_CHAR(j.bill_end,   'YYYY-MM-DD') AS charge_to_date,
+        --
+        -- IMPORTANT: clip charge_to_date defensively.
+        --   * BillEnd is often '2099-12-31' (open-ended) which would
+        --     cause downstream code to spread revenue into perpetuity.
+        --   * For Past/Notice tenants, charges effectively end at
+        --     move_out_date — they don't owe pet rent after they leave.
+        --   * Cap at current_date so we never count future months as
+        --     observed revenue.
+        TO_CHAR(
+            LEAST(
+                j.bill_end,
+                COALESCE(j.resolved_move_out_date::TIMESTAMP_NTZ, j.bill_end),
+                CURRENT_TIMESTAMP::TIMESTAMP_NTZ
+            ),
+            'YYYY-MM-DD'
+        )                       AS charge_to_date,
         j.match_type           AS _realpage_match_type
     FROM joined j
     JOIN props p ON p.pmc_id = j.pmc_id AND p.site_id = j.site_id
     WHERE j.resolved_email IS NOT NULL
       AND TRIM(j.resolved_email) <> ''
+      -- Drop charges for residents who are Future/Applicant/Pending —
+      -- they haven't started paying yet and would inflate revenue.
+      -- Past tenants ARE kept (with clipped charge_to_date) so historical
+      -- revenue is preserved. Current/Notice/Former all flow through.
+      AND (j.resolved_lease_status IS NULL
+           OR j.resolved_lease_status NOT IN (
+               'Future Lease', 'Applicant',
+               'Applicant - Lease Signed', 'Pending'
+           ))
+      -- Drop charges where the entire bill window is after move-out
+      -- (defensive — the LEAST() above would clip charge_to to before
+      -- charge_from in this case, producing zero spread).
+      AND (j.resolved_move_out_date IS NULL
+           OR j.bill_start::DATE <= j.resolved_move_out_date)
       {junk_email_clause.replace("j.email", "j.resolved_email")}
     """
 
