@@ -2057,6 +2057,31 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
             or pre_avg >= post_recent_avg * 0.02
         )
 
+        # ADDITIONAL GUARD: detect properties whose CHARGE DATA HISTORY
+        # starts AFTER their launch date. This is the RealPage case — EKS
+        # job started backfilling Nov 2024, but properties may have launched
+        # well before that. Their pre-PS "baseline" of $0/mo is an artifact
+        # of missing data, not a real zero. Without this guard, those
+        # properties would inflate the aggregate lift (e.g. Drift at the
+        # Forum: launched Feb 2022, earliest pet charge Nov 2024, lift
+        # calculation treats 2021-2022 as $0 baseline = bogus).
+        first_data_month = next(
+            (m for m in months if prop_data.get(m, 0) > 0),
+            None,
+        )
+        _data_starts_after_launch = (
+            first_data_month is not None
+            and launch_month is not None
+            and first_data_month > launch_month
+            and (first_data_month.year - launch_month.year) * 12
+                + (first_data_month.month - launch_month.month) >= 3
+        )
+        if _data_starts_after_launch:
+            # The pre-launch "baseline" is fabricated from missing data.
+            # Mark the baseline as unmeaningful so downstream display +
+            # aggregate code excludes this property from lift attribution.
+            _baseline_meaningful = False
+
         analysis[prop] = {
             "n_post": n_post,
             "n_pre": len(pre_baseline_months),
@@ -2064,6 +2089,8 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
             "all_pre_months": len(pre_months),
             "baseline_reliable": len(pre_months) >= 3,
             "baseline_meaningful": _baseline_meaningful,
+            "data_starts_after_launch": _data_starts_after_launch,
+            "first_data_month": first_data_month,
             "pre_avg": pre_avg,
             "post_total": post_total,
             "post_monthly_avg": post_monthly_avg,
@@ -2347,16 +2374,11 @@ def build_individual_property_charts(
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
             elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
-                # Only show lift annotation if baseline is meaningful relative to post
-                # A near-zero baseline (e.g. $8/mo vs $5,600 post) means the property
-                # wasn't really charging pet rent before PS, so the "lift" is misleading.
-                # Threshold: pre_avg must be >= 2% of post_recent_avg to be meaningful.
-                _post_ref = a.get("post_recent_avg", a.get("post_monthly_avg", 0))
-                _baseline_meaningful = (
-                    _post_ref <= 0  # no post data — show whatever we have
-                    or a["pre_avg"] >= _post_ref * 0.02  # baseline is ≥ 2% of post
-                )
-                if _baseline_meaningful:
+                # Use the canonical baseline_meaningful flag computed in
+                # compute_launch_analysis. It now incorporates BOTH the 2%
+                # rule AND the data-history-after-launch guard, so we don't
+                # need to recompute the threshold here.
+                if a.get("baseline_meaningful", True):
                     sign = "+" if a["diff_monthly"] >= 0 else ""
                     color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
                     arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
@@ -2365,6 +2387,10 @@ def build_individual_property_charts(
                         f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
                         f'</span></b>'
                     )
+                elif a.get("data_starts_after_launch", False):
+                    # Be specific about why we can't show lift — helps users
+                    # understand it's a data coverage issue, not a real zero.
+                    short += f'  <span style="color:#999;font-size:0.85em">data starts after launch</span>'
                 else:
                     short += f'  <span style="color:#999;font-size:0.85em">no meaningful pre-PS baseline</span>'
             elif a and a["n_pre"] > 0 and not a.get("baseline_reliable", True):
