@@ -9427,87 +9427,147 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _display_lift = _t1_mo if _use_avg else _simple_lift_mo
                 _display_lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
 
+                # RealPage gets a different layout: skip lift entirely.
+                # The data history doesn't extend back far enough to compute
+                # a real pre-PS baseline (see Documentation tab → RealPage
+                # → Why Lift Analysis Is Not Shown).
+                _is_realpage_summary = st.session_state.get("pmc_system", "yardi") == "real_page"
+
                 st.markdown(
+                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                    'color:#1F2257;margin:24px 0 12px 0">Current Pet Revenue</p>'
+                    if _is_realpage_summary else
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
                     'color:#1F2257;margin:24px 0 12px 0">Value Created</p>',
                     unsafe_allow_html=True,
                 )
 
-                _vc1, _vc2, _vc3 = st.columns(3)
-                with _vc1:
-                    st.markdown(_summary_card(
-                        f"${_display_rev:,.0f}",
-                        _display_rev_label,
-                        _display_rev_sub,
-                        color="#677848",
-                    ), unsafe_allow_html=True)
-                with _vc2:
-                    if _comparable and _display_lift != 0:
-                        _sign = "+" if _display_lift > 0 else ""
+                if _is_realpage_summary:
+                    # ── RealPage card layout: revenue + scope, no lift ──
+                    # Compute simple counters for the cards.
+                    _rp_n_props = len(_monthly_by_prop)
+                    _rp_total_pet_units = sum(
+                        _v.get("missing_count", 0) + _v.get("paying_count", 0)
+                        for _v in (_mr_data.values() if _mr_data else [])
+                    )
+                    _rp1, _rp2, _rp3 = st.columns(3)
+                    with _rp1:
                         st.markdown(_summary_card(
-                            f"{_sign}${_display_lift:,.0f}/mo",
-                            _display_lift_label,
-                            f"Across {len(_comparable)} comparable properties",
-                            color="#677848" if _display_lift > 0 else "#DD7B45",
+                            f"${_current_monthly_rev:,.0f}",
+                            "Current Monthly Pet-Related Revenue",
+                            _latest_str,
+                            color="#677848",
                         ), unsafe_allow_html=True)
-                    else:
+                    with _rp2:
                         st.markdown(_summary_card(
-                            "N/A",
-                            _display_lift_label,
-                            "Requires launch dates and pre-launch data",
-                            color="#636569",
+                            f"{_rp_n_props:,}",
+                            "Properties with Pet Revenue Data",
+                            "From RealPage staging tables",
+                            color="#677848",
                         ), unsafe_allow_html=True)
-                with _vc3:
-                    # Show asset value impact instead of cumulative when using avg lift
-                    if _use_avg:
-                        _annual = _display_lift * 12
-                        _avi = _annual / 0.05 if _annual > 0 else 0
-                        if _avi > 0:
-                            if _avi >= 1_000_000:
-                                _avi_str = f"${_avi / 1_000_000:,.1f}M"
-                            else:
-                                _avi_str = f"${_avi:,.0f}"
-                            st.markdown(_summary_card(
-                                _avi_str,
-                                "Est. Asset Value Impact",
-                                "At 5% cap rate",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
+                    with _rp3:
+                        # Annualized current revenue — simple multiplication, no baseline involved.
+                        _rp_annual = _current_monthly_rev * 12
+                        if _rp_annual >= 1_000_000:
+                            _rp_annual_str = f"${_rp_annual / 1_000_000:,.1f}M"
                         else:
-                            st.markdown(_summary_card(
-                                "N/A",
-                                "Est. Asset Value Impact",
-                                "Requires positive lift",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
-                    else:
-                        if _comparable and _t1_total != 0:
-                            _sign = "+" if _t1_total > 0 else ""
-                            st.markdown(_summary_card(
-                                f"{_sign}${_t1_total:,.0f}",
-                                "Cumulative Pet Revenue Impact",
-                                f"Over {_t1_months} months",
-                                color="#677848" if _t1_total > 0 else "#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "N/A",
-                                "Cumulative Pet Revenue Impact",
-                                "Requires launch dates and pre-launch data",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
+                            _rp_annual_str = f"${_rp_annual:,.0f}"
+                        st.markdown(_summary_card(
+                            _rp_annual_str,
+                            "Annualized Pet Revenue (Run Rate)",
+                            "Current monthly × 12",
+                            color="#677848",
+                        ), unsafe_allow_html=True)
 
-                if _comparable and _display_lift != 0 and _pre_baseline_total > 0:
-                    _lift_pct = (_display_lift / _pre_baseline_total * 100)
                     st.markdown(
-                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        f'text-align:center;margin:8px 0 28px 0">'
-                        f'Pre-PS baseline was ${_pre_baseline_total:,.0f}/mo across {len(_comparable)} properties'
-                        f'{f" -- a {_lift_pct:.1f}% increase" if _lift_pct > 0 else ""}.</p>',
+                        '<div style="background:#F9F4E6;border-left:4px solid #E2AB58;'
+                        'padding:12px 16px;border-radius:0 8px 8px 0;margin:14px 0 28px 0;'
+                        'font-family:Poppins,Arial,sans-serif;font-size:13px;color:#1F2257">'
+                        '<b>Why no lift number?</b> RealPage charge data in Snowflake only goes '
+                        'back to <b>January 2025</b>, and the OneSite API does not return '
+                        'historical post-month data. For properties launched before then, a '
+                        '"pre-PetScreening" baseline cannot be reconstructed honestly. We show '
+                        'current revenue and the missing-pet-rent opportunity below instead. '
+                        'See <i>Documentation → RealPage → Why Lift Analysis Is Not Shown</i> for the full picture.'
+                        '</div>',
                         unsafe_allow_html=True,
                     )
                 else:
-                    st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
+                    _vc1, _vc2, _vc3 = st.columns(3)
+                    with _vc1:
+                        st.markdown(_summary_card(
+                            f"${_display_rev:,.0f}",
+                            _display_rev_label,
+                            _display_rev_sub,
+                            color="#677848",
+                        ), unsafe_allow_html=True)
+                    with _vc2:
+                        if _comparable and _display_lift != 0:
+                            _sign = "+" if _display_lift > 0 else ""
+                            st.markdown(_summary_card(
+                                f"{_sign}${_display_lift:,.0f}/mo",
+                                _display_lift_label,
+                                f"Across {len(_comparable)} comparable properties",
+                                color="#677848" if _display_lift > 0 else "#DD7B45",
+                            ), unsafe_allow_html=True)
+                        else:
+                            st.markdown(_summary_card(
+                                "N/A",
+                                _display_lift_label,
+                                "Requires launch dates and pre-launch data",
+                                color="#636569",
+                            ), unsafe_allow_html=True)
+                    with _vc3:
+                        # Show asset value impact instead of cumulative when using avg lift
+                        if _use_avg:
+                            _annual = _display_lift * 12
+                            _avi = _annual / 0.05 if _annual > 0 else 0
+                            if _avi > 0:
+                                if _avi >= 1_000_000:
+                                    _avi_str = f"${_avi / 1_000_000:,.1f}M"
+                                else:
+                                    _avi_str = f"${_avi:,.0f}"
+                                st.markdown(_summary_card(
+                                    _avi_str,
+                                    "Est. Asset Value Impact",
+                                    "At 5% cap rate",
+                                    color="#677848",
+                                ), unsafe_allow_html=True)
+                            else:
+                                st.markdown(_summary_card(
+                                    "N/A",
+                                    "Est. Asset Value Impact",
+                                    "Requires positive lift",
+                                    color="#636569",
+                                ), unsafe_allow_html=True)
+                        else:
+                            if _comparable and _t1_total != 0:
+                                _sign = "+" if _t1_total > 0 else ""
+                                st.markdown(_summary_card(
+                                    f"{_sign}${_t1_total:,.0f}",
+                                    "Cumulative Pet Revenue Impact",
+                                    f"Over {_t1_months} months",
+                                    color="#677848" if _t1_total > 0 else "#DD7B45",
+                                ), unsafe_allow_html=True)
+                            else:
+                                st.markdown(_summary_card(
+                                    "N/A",
+                                    "Cumulative Pet Revenue Impact",
+                                    "Requires launch dates and pre-launch data",
+                                    color="#636569",
+                                ), unsafe_allow_html=True)
+
+                    if _comparable and _display_lift != 0 and _pre_baseline_total > 0:
+                        _lift_pct = (_display_lift / _pre_baseline_total * 100)
+                        st.markdown(
+                            f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                            f'text-align:center;margin:8px 0 28px 0">'
+                            f'Pre-PS baseline was ${_pre_baseline_total:,.0f}/mo across {len(_comparable)} properties'
+                            f'{f" -- a {_lift_pct:.1f}% increase" if _lift_pct > 0 else ""}.</p>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
 
                 # ═══════════════════════════════════════════════════════════════
                 #  SECTION 2: REVENUE OPPORTUNITY
@@ -10538,7 +10598,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
         # ─── TAB 4: Documentation & SQL ──────────────────────────────
         with tab_docs:
             st.header("Documentation & SQL Reference")
-            st.markdown("Everything that happens behind the scenes. Organized by **Both Systems**, **Yardi-specific**, and **Entrata-specific**.")
+            st.markdown("Everything that happens behind the scenes. Organized by **Shared Logic**, **Yardi-specific**, **Entrata-specific**, and **RealPage-specific**.")
 
             # ══════════════════════════════════════════════════════════
             #  SECTION: BOTH SYSTEMS
@@ -10893,6 +10953,213 @@ The parent company dropdown shows `X / Y` where:
 - **Y** = total properties under that parent company in `d_properties` (regardless of source)
 
 This matches the Yardi behavior. Properties without active integrations are skipped during fetch.
+                """)
+
+            # ══════════════════════════════════════════════════════════
+            #  SECTION: REALPAGE-SPECIFIC
+            # ══════════════════════════════════════════════════════════
+            st.subheader("RealPage-Specific Behavior")
+
+            with st.expander("**RealPage / OneSite — Where the data comes from**", expanded=True):
+                st.markdown("""
+Unlike Yardi (live SOAP) or Entrata (live REST), RealPage data is read from
+Snowflake staging tables that are populated by a daily EKS job calling the
+OneSite SOAP API:
+
+| What | Source |
+|---|---|
+| Scheduled charges | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES` |
+| Resident roster | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST` |
+
+**Why we don't call the API live:**
+
+1. RealPage's `getscheduledcharges` endpoint requires one SOAP call per
+   `(property, post_month)`. For a 100-property parent across 12 months
+   that's 1,200 calls per refresh — too slow for an interactive app.
+2. The two staging tables already give us everything we need: scheduled
+   charges (with their full `BillStart`/`BillEnd` lifetime ranges) and
+   the resident roster.
+3. The EKS job runs daily, so the data is fresh enough for analyst use.
+
+**Property identifier is composite:** `pmcid` + `siteid`, both extracted
+from `D_PROPERTIES.property_source_id` JSON. `property_source_name` is
+`'real_page'` (with underscore — different from `'yardi'` and `'entrata'`).
+
+**No integration_id required.** Yardi/Entrata each have a row in
+`STG_PETSCREENING__INTEGRATIONS` with property-specific credentials.
+RealPage uses a single global credential set, so `D_PROPERTIES.integration_id`
+is `NULL` for all `real_page` properties — the loader does not JOIN
+against the integration table.
+                """)
+
+            with st.expander("**RealPage — Charge ↔ Resident Join Logic**"):
+                st.markdown("""
+The two staging tables are joined in a single SQL roundtrip in
+`fetch_realpage_for_properties`. The join logic mirrors the canonical
+pet-signals query used internally:
+
+```sql
+-- Pick the representative resident per (pmc, site, lease)
+lease_resident_pick AS (
+  SELECT * FROM all_residents
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY pmc_id, site_id, lease_id
+    ORDER BY
+      CASE WHEN hoh_bit = 'TRUE' THEN 0 ELSE 1 END,
+      CASE WHEN signer_bit = 'TRUE' THEN 0 ELSE 1 END,
+      CASE WHEN active_bit = 'TRUE' THEN 0 ELSE 1 END,
+      CASE WHEN contact_status = 'Lease signer' THEN 0 ELSE 1 END,
+      last_name, first_name
+  ) = 1
+)
+```
+
+**Match priority:** direct `ResHID -> resident_member_id` if it matches,
+else fall back to whichever resident is the head-of-household on the
+same `lease_id`. In a spot-check on Drift at the Forum, all 452 charge
+rows resolved via the lease fallback (0 direct ResHID matches), so the
+fallback is doing the heavy lifting in practice.
+
+**`tenant_code = lease_id`** for RealPage. The Snowflake side mirrors
+this: `f_leases.lease_source_external_id` for `real_page` is exactly
+`{"lease_id": N}` (no per-resident tenant_code), so the missing-pet-rent
+SQL falls back to that key when the Yardi-style `tenant_code` JSON path
+is absent.
+
+**Test/model residents are filtered out:** OneSite typically has
+placeholder units with names like `Model, Model`, `Test, Test`,
+`Unknown, Unknown`, `Vacant, Down`, etc. The fetch drops rows where
+`firstname` or `lastname` matches any of: `model`, `test`, `sample`,
+`unknown`, `noname`, `tba`, `vacant`, `*`, or empty.
+                """)
+
+            with st.expander("**RealPage — Why Lift Analysis Is Not Shown**", expanded=True):
+                st.markdown("""
+**RealPage's data history doesn't extend back far enough to compute
+reliable pre-PetScreening baselines.** Direct API testing confirmed
+the limitation:
+
+1. **`getscheduledcharges` ignores its `post_month` parameter.**
+   Five different `post_month` values (current, 12mo ago, 24mo ago,
+   pre-launch, even `'BANANA'`) all returned **byte-identical**
+   responses for the same property. The endpoint always returns the
+   *current* schedule.
+2. **`getresidenttransaction` returns ~6 months** of currently open
+   transactions — not full historical billing.
+3. **Snowflake staging only has 15 distinct `post_month` values**
+   spanning Jan 2025 → May 2026. The EKS job has been accumulating
+   snapshots since Jan 2025; deeper history isn't available anywhere
+   we can access.
+4. **Past residents' historical pet rent payments cannot be recovered.**
+   When a resident moves out, their schedule is wiped from OneSite.
+
+**Implication for the Summary / PDF:** for properties launched before
+January 2025, the "pre-PS baseline" would be fabricated from missing
+data (months that simply have no records). Showing a lift number
+against that baseline would be wrong.
+
+**What we do instead:** for RealPage, the Summary tab and PDF show
+**current pet revenue + missing pet rent opportunity** without the
+lift comparison. Per-property cards show "data starts after launch"
+instead of a fake `+$X/mo` lift annotation.
+
+**The `data_starts_after_launch` guard:** in `compute_launch_analysis`,
+any property whose first non-zero data month is more than 3 months
+after its launch date gets `baseline_meaningful = False` automatically.
+This excludes it from the comparable set.
+
+**Yardi and Entrata are unaffected.** Their data goes back further
+than typical launch dates, so the guard never triggers.
+                """)
+
+            with st.expander("**RealPage — BillEnd Clipping (Bug 1 Fix)**"):
+                st.markdown("""
+OneSite stores open-ended (currently active) charges with `BillEnd =
+'2099-12-31'`. Without clipping, the existing revenue spreading code
+would count those charges into perpetuity — inflating both "current
+revenue" and (for properties that did have pre-PS data) the lift
+calculation.
+
+In a sample of 43 pet charges at Drift at the Forum, **41 (95%)** had
+`BillEnd = 2099-12-31`. The fix clips the effective end date in the
+SQL itself:
+
+```sql
+TO_CHAR(
+    LEAST(
+        bill_end,
+        COALESCE(move_out_date::TIMESTAMP_NTZ, bill_end),
+        CURRENT_TIMESTAMP::TIMESTAMP_NTZ
+    ),
+    'YYYY-MM-DD'
+) AS charge_to_date
+```
+
+**For Past tenants:** charge_to_date is clipped to their `move_out_date`,
+preserving their real historical revenue contribution while preventing
+phantom revenue accruing post-moveout.
+
+**For Current tenants:** charge_to_date is clipped to today, so we never
+count future months as observed revenue.
+
+**Future / Applicant / Pending residents are dropped entirely** from
+charge emission — they haven't started paying yet, so their charges
+shouldn't count as revenue.
+                """)
+
+            with st.expander("**RealPage — Charge Code Filter (CatCode='C' only)**"):
+                st.markdown("""
+OneSite uses two `CatCode` values that look superficially similar but
+mean opposite things:
+
+| `CatCode` | Meaning | What we do |
+|---|---|---|
+| `C` | Charge (resident owes the property) | **Keep** — these are revenue |
+| `P` | Payment / Reimbursement (property owes resident) | **Drop** — these are credits, not revenue |
+
+We filter to `CatCode = 'C'` at the SQL level. Without this, utility
+allowance reimbursements (Section 8 properties) and similar credits
+would be summed alongside actual charges and inflate revenue.
+
+**Pet code matching uses both `transaction_name` (TranName) and
+`description` (TransDesc).** OneSite's pet codes are concentrated
+around the `PETRENT` family (with variants `PET RENT`, `PETR`,
+`PETFEE`, etc.) but description text often spells things out more
+clearly (`'Pet Rent - Dog'`, `'Pet Rent - Cat'`, `'Monthly Pet Rent'`).
+The existing `pet|animal|petnr|concpet` regex still works — we just
+apply it to both fields when the user is selecting which codes count
+as pet-related.
+                """)
+
+            with st.expander("**RealPage — Known DevOps / Pipeline Issues**"):
+                st.markdown("""
+Flagged for the data engineering team to address; the app code mitigates
+where possible:
+
+1. **`getscheduledcharges` parameter is silently ignored.**
+   The EKS job's `MONTHS_BACK=2` setting does nothing — calling the
+   API for any past month returns the current snapshot. The job is
+   essentially generating duplicate snapshots with different
+   `ingested_at` timestamps. Deeper history is not retrievable
+   through this endpoint.
+2. **dbt staging surrogate key omits `resh_id`, `unit_id`, `amount`,
+   `bill_end`.** Two genuinely-different charges (different residents
+   on the same lease, same code, same start) could collapse into one
+   row.
+3. **dbt staging omits `haspets`, `begindate`, `enddate`, `moveindate`.**
+   `haspets` is a unique RealPage advantage — OneSite's own opinion on
+   whether the resident has pets. Combined with PetScreening profile
+   data, this would give us **high-confidence missing pet rent**
+   (`haspets='Y'` + no pet charge + active PS profile = strong signal).
+   Currently dropped at the staging layer.
+4. **Coverage gaps.** Snowflake shows ~6,447 `(pmc, site)` pairs in
+   the charges staging vs ~4,989 enabled `real_page` properties in
+   `D_PROPERTIES`. The 1,458 orphans are either stale entries or
+   missing entries on one side or the other.
+5. **`residentwillhavestatus` typo.** The WSDL field is
+   `residentwillhave**the**status` but the EKS payload sends
+   `residentwillhavestatus`. Probably moot given the API ignores most
+   parameters anyway, but worth fixing for cleanliness.
                 """)
 
             # ══════════════════════════════════════════════════════════
