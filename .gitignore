@@ -6,3 +6,4 @@ __pycache__/
 *.png
 *.html
 auto_exports/
+*.PRE_REALPAGE_BACKUP

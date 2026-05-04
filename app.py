@@ -1441,6 +1441,416 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
     return all_charges, results_log, all_ar_charges, all_raw_lease_arrays
 
 
+
+# ─── RealPage / OneSite (Snowflake-backed) ───────────────────────────
+# Read from staging tables populated daily by EKS jobs. No live SOAP.
+# pmc_system value: 'real_page' (with underscore)
+# tenant_code = lease_id (from f_leases.lease_source_external_id:lease_id)
+
+@st.cache_data(ttl=300)
+def load_realpage_parent_companies():
+    """Count RealPage properties per parent company.
+
+    NOTE: RealPage uses global credentials — there's no integration_id check.
+    A property is "API-accessible" iff it's enabled + active in d_properties
+    AND its property_source_id has both pmcid and siteid populated.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT
+            p.parent_company_name,
+            MAX(p.parent_company_ancestry_id)    AS ancestry_id,
+            MAX(p.parent_company_ancestry_name)   AS ancestry_name,
+            COUNT(DISTINCT p.property_id)         AS total_props,
+            COUNT(DISTINCT CASE
+                WHEN p.property_status = 'active'
+                     AND p.integration_status = 'enabled'
+                     AND PARSE_JSON(p.property_source_id):"pmcid"::STRING IS NOT NULL
+                     AND PARSE_JSON(p.property_source_id):"siteid"::STRING IS NOT NULL
+                THEN p.property_id
+            END) AS api_props
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.parent_company_name IS NOT NULL
+          AND p.property_source_name = 'real_page'
+        GROUP BY 1
+        HAVING api_props > 0
+        ORDER BY 1
+    """)
+    return cur.fetchall()
+
+
+@st.cache_data(ttl=300)
+def load_realpage_all_properties():
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT DISTINCT
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            p.parent_company_ancestry_id
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.property_source_name = 'real_page'
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def load_realpage_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    """Load RealPage properties matching the selection criteria.
+
+    Returns rows with PMC_ID, SITE_ID, PROPERTY_ID, PROPERTY_NAME, etc.
+    No integration credential lookup — RealPage uses global creds.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    where_clause = """
+        WHERE p.property_source_name = 'real_page'
+          AND p.property_status = 'active'
+          AND p.integration_status = 'enabled'
+          AND PARSE_JSON(p.property_source_id):"pmcid"::STRING IS NOT NULL
+          AND PARSE_JSON(p.property_source_id):"siteid"::STRING IS NOT NULL
+    """
+    if parent_company_name:
+        _safe = parent_company_name.replace("'", "''")
+        where_clause += f" AND p.parent_company_name = '{_safe}'"
+    if property_id:
+        where_clause += f" AND p.property_id = {int(property_id)}"
+    if ancestry_id:
+        _safe = str(ancestry_id).replace("'", "''")
+        where_clause += f" AND p.parent_company_ancestry_id = '{_safe}'"
+
+    cur.execute(f"""
+        SELECT DISTINCT
+            PARSE_JSON(p.property_source_id):"pmcid"::STRING  AS pmc_id,
+            PARSE_JSON(p.property_source_id):"siteid"::STRING AS site_id,
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            PARSE_JSON(p.property_source_id):"siteid"::STRING AS property_code,
+            kf.property_launch_date AS property_launch_date
+        FROM PROD.COMMON.D_PROPERTIES p
+        LEFT JOIN PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS kf
+            ON p.property_id = kf.property_id
+        {where_clause}
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+# ─── RealPage charge fetch (Snowflake-backed, not live SOAP) ─────────
+def fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months=24):
+    """Read RealPage scheduled charges + residents from Snowflake staging,
+    join in SQL, and emit charge rows in the same shape as Yardi/Entrata.
+
+    Returns (all_charges, results_log) — same tuple shape as
+    fetch_rentroll_for_properties (Yardi) for downstream parity.
+
+    Single SQL roundtrip. The join logic mirrors the canonical pattern from
+    the standardized pet-signals SQL (see realpage-query-analysis.md):
+    direct match on (pmc_id, site_id, resident_member_id), with HOH-priority
+    fallback to any resident on the same lease when direct match misses.
+
+    The lookback_months argument is kept for interface compat but does not
+    constrain the data — BillStart/BillEnd carry the full charge lifespan
+    inside each row, and downstream display logic clips to the user's window.
+    """
+    if not properties:
+        return [], []
+
+    progress_bar.progress(0.05)
+    status_text.text(f"Reading RealPage data from Snowflake for {len(properties)} properties...")
+
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # Build a VALUES list for the property scope. We carry pmc_id, site_id,
+    # property_id (PetScreening), property_name, property_code, parent_company,
+    # and launch_date so the final SELECT can stamp every charge row.
+    def _esc(s):
+        return str(s if s is not None else "").replace("'", "''")
+
+    select_rows = []
+    for p in properties:
+        pmc = _esc(p.get("PMC_ID") or p.get("pmc_id") or "")
+        site = _esc(p.get("SITE_ID") or p.get("site_id") or "")
+        pid = int(p.get("PROPERTY_ID") or p.get("property_id") or 0)
+        pname = _esc(p.get("PROPERTY_NAME") or p.get("property_name") or "")
+        pcode = _esc(p.get("PROPERTY_CODE") or p.get("property_code") or site)
+        parent = _esc(p.get("PARENT_COMPANY_NAME") or p.get("parent_company_name") or "")
+        launch = p.get("PROPERTY_LAUNCH_DATE") or p.get("property_launch_date")
+        if launch:
+            try:
+                launch_str = launch.strftime("%Y-%m-%d") if hasattr(launch, "strftime") else str(launch)[:10]
+            except Exception:
+                launch_str = ""
+        else:
+            launch_str = ""
+        launch_sql = "NULL" if not launch_str else f"TO_DATE('{launch_str}')"
+        select_rows.append(
+            f"SELECT '{pmc}'::STRING AS pmc_id, '{site}'::STRING AS site_id, "
+            f"{pid}::NUMBER AS property_id, '{pname}'::STRING AS property_name, "
+            f"'{pcode}'::STRING AS property_code, '{parent}'::STRING AS parent_company_name, "
+            f"{launch_sql} AS property_launch_date"
+        )
+    values_sql = "\n        UNION ALL ".join(select_rows)
+
+    # Junk emails to filter out — must match the JUNK_EMAILS constant in app.py.
+    # Reusing it directly via Python f-string isn't ideal because this lives
+    # inside app.py once spliced; we reference JUNK_EMAILS at call time.
+    junk_email_clause = f"AND LOWER(TRIM(j.email)) NOT IN ({JUNK_EMAILS})"
+
+    sql = f"""
+    WITH props AS (
+        {values_sql}
+    ),
+    latest_charges AS (
+        SELECT
+            c.pmc_id, c.site_id, c.resh_id, c.lease_id, c.unit_id,
+            c.transaction_name, c.description, c.amount,
+            c.bill_start, c.bill_end, c.category_code, c.sub_journal,
+            c.post_month, c.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES c
+        JOIN props p ON c.pmc_id = p.pmc_id AND c.site_id = p.site_id
+        WHERE c.category_code = 'C'  -- skip P=Payment/Reimbursement
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY c.pmc_id, c.site_id, c.unit_id, c.lease_id,
+                         c.resh_id, c.transaction_name, c.bill_start
+            ORDER BY c.post_month DESC, c.ingested_at DESC
+        ) = 1
+    ),
+    all_residents AS (
+        SELECT
+            r.pmc_id, r.site_id, r.resident_member_id, r.lease_id, r.unit_id,
+            r.first_name, r.last_name, r.email, r.lease_status,
+            r.move_out_date, r.unit_number,
+            r.hoh_bit, r.signer_bit, r.active_bit, r.contact_status,
+            r.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+        JOIN props p ON r.pmc_id = p.pmc_id AND r.site_id = p.site_id
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY r.pmc_id, r.site_id, r.lease_id, r.resident_member_id
+            ORDER BY r.ingested_at DESC
+        ) = 1
+    ),
+    -- Pick the representative resident per (pmc, site, lease) using
+    -- HOH > signer > active > contact_status priority. This handles
+    -- the common case where ReshID on the charge does NOT directly match
+    -- a residentmemberid (in our spot-check, 0 of 169 (resh_id, lease_id)
+    -- pairs matched directly while 212 matched via lease_id only).
+    -- Lease-id is the canonical join key — same as the standardized
+    -- pet-signals SQL across PMCs.
+    lease_resident_pick AS (
+        SELECT
+            r.pmc_id, r.site_id, r.lease_id,
+            r.first_name, r.last_name, r.email,
+            r.lease_status, r.move_out_date, r.unit_number, r.hoh_bit
+        FROM all_residents r
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY r.pmc_id, r.site_id, r.lease_id
+            ORDER BY
+                CASE WHEN r.hoh_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.signer_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.active_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.contact_status = 'Lease signer' THEN 0 ELSE 1 END,
+                COALESCE(r.last_name, ''),
+                COALESCE(r.first_name, '')
+        ) = 1
+    ),
+    -- Also pick a direct resident match by (pmc, site, resh_id) when it
+    -- exists. Prefer that over the lease pick when both are populated
+    -- (gives more accurate per-resident attribution for charges that
+    -- DO carry a valid ReshID).
+    direct_resident AS (
+        SELECT
+            r.pmc_id, r.site_id, r.resident_member_id,
+            r.first_name, r.last_name, r.email,
+            r.lease_status, r.move_out_date, r.unit_number
+        FROM all_residents r
+    ),
+    joined AS (
+        SELECT
+            c.*,
+            COALESCE(dr.first_name,    lp.first_name)    AS resolved_first_name,
+            COALESCE(dr.last_name,     lp.last_name)     AS resolved_last_name,
+            COALESCE(dr.email,         lp.email)         AS resolved_email,
+            COALESCE(dr.lease_status,  lp.lease_status)  AS resolved_lease_status,
+            COALESCE(dr.move_out_date, lp.move_out_date) AS resolved_move_out_date,
+            COALESCE(dr.unit_number,   lp.unit_number)   AS resolved_unit_number,
+            CASE
+                WHEN dr.email IS NOT NULL THEN 'resh_id'
+                WHEN lp.email IS NOT NULL THEN 'lease_id'
+                ELSE 'no_match'
+            END AS match_type
+        FROM latest_charges c
+        LEFT JOIN direct_resident dr
+            ON dr.pmc_id = c.pmc_id
+           AND dr.site_id = c.site_id
+           AND dr.resident_member_id = c.resh_id
+        LEFT JOIN lease_resident_pick lp
+            ON lp.pmc_id = c.pmc_id
+           AND lp.site_id = c.site_id
+           AND lp.lease_id = c.lease_id
+    )
+    SELECT
+        p.parent_company_name AS parent_company,
+        p.property_id          AS property_id,
+        p.property_name        AS property_name,
+        p.property_code        AS property_code,
+        p.property_launch_date AS launch_date,
+        COALESCE(j.resolved_unit_number, j.unit_id) AS unit_code,
+        ''                     AS unit_type,
+        ''                     AS market_rent,
+        j.lease_id::STRING     AS lease_id,
+        j.lease_id::STRING     AS tenant_code,
+        j.resolved_first_name  AS first_name,
+        j.resolved_last_name   AS last_name,
+        CASE j.resolved_lease_status
+            WHEN 'Current'                  THEN 'Current'
+            WHEN 'Former'                   THEN 'Past'
+            WHEN 'Future Lease'             THEN 'Future'
+            WHEN 'Applicant'                THEN 'Applicant'
+            WHEN 'Applicant - Lease Signed' THEN 'Applicant'
+            WHEN 'Former Applicant'         THEN 'Past'
+            WHEN 'Pending'                  THEN 'Future'
+            ELSE COALESCE(j.resolved_lease_status, '')
+        END AS tenant_status,
+        ''                     AS lease_from,
+        ''                     AS lease_to,
+        ''                     AS move_in,
+        TO_CHAR(j.resolved_move_out_date, 'YYYY-MM-DD') AS move_out,
+        j.resolved_email       AS email,
+        j.transaction_name     AS charge_code,
+        j.description          AS charge_type,
+        j.amount::STRING       AS charge_amount,
+        TO_CHAR(j.bill_start, 'YYYY-MM-DD') AS charge_from_date,
+        TO_CHAR(j.bill_end,   'YYYY-MM-DD') AS charge_to_date,
+        j.match_type           AS _realpage_match_type
+    FROM joined j
+    JOIN props p ON p.pmc_id = j.pmc_id AND p.site_id = j.site_id
+    WHERE j.resolved_email IS NOT NULL
+      AND TRIM(j.resolved_email) <> ''
+      {junk_email_clause.replace("j.email", "j.resolved_email")}
+    """
+
+    progress_bar.progress(0.30)
+    status_text.text("Querying Snowflake staging tables...")
+    cur.execute(sql)
+    rows = cur.fetchall()
+    progress_bar.progress(0.85)
+
+    # Filter out test/model residents (data hygiene — model units are common in OneSite)
+    test_words = {'model', 'test', 'sample', 'unknown', 'noname', 'tba', 'vacant', '*', ''}
+    def _is_test(fn, ln):
+        f = (fn or "").lower().strip()
+        l = (ln or "").lower().strip()
+        if f in test_words or l in test_words:
+            return True
+        if 'model' in f or 'model' in l:
+            return True
+        return False
+
+    # Build per-property fetch summary
+    by_prop = {}
+    test_filtered = 0
+    for r in rows:
+        # DictCursor returns uppercase keys in this codebase
+        fn = r.get("FIRST_NAME", "")
+        ln = r.get("LAST_NAME", "")
+        if _is_test(fn, ln):
+            test_filtered += 1
+            continue
+        pid = r.get("PROPERTY_ID")
+        by_prop.setdefault(pid, {
+            "property_name": r.get("PROPERTY_NAME"),
+            "property_code": r.get("PROPERTY_CODE"),
+            "charges": 0,
+            "resh_matches": 0,
+            "lease_matches": 0,
+            "no_matches": 0,
+        })
+        by_prop[pid]["charges"] += 1
+        mt = r.get("_REALPAGE_MATCH_TYPE", "no_match")
+        if mt == "resh_id":
+            by_prop[pid]["resh_matches"] += 1
+        elif mt == "lease_id":
+            by_prop[pid]["lease_matches"] += 1
+        else:
+            by_prop[pid]["no_matches"] += 1
+
+    # Strip the internal _REALPAGE_MATCH_TYPE field from the returned rows
+    # (it's diagnostic, not part of the unified schema)
+    all_charges = []
+    for r in rows:
+        if _is_test(r.get("FIRST_NAME", ""), r.get("LAST_NAME", "")):
+            continue
+        # Lowercase keys for parity with extract_charges_from_property /
+        # _extract_charges_from_entrata_lease (which return lowercase dicts)
+        all_charges.append({
+            "parent_company": r.get("PARENT_COMPANY"),
+            "property_id":    r.get("PROPERTY_ID"),
+            "property_name":  r.get("PROPERTY_NAME"),
+            "property_code":  r.get("PROPERTY_CODE"),
+            "launch_date":    r.get("LAUNCH_DATE"),
+            "unit_code":      r.get("UNIT_CODE", ""),
+            "unit_type":      r.get("UNIT_TYPE", ""),
+            "market_rent":    r.get("MARKET_RENT", ""),
+            "lease_id":       r.get("LEASE_ID", ""),
+            "tenant_code":    r.get("TENANT_CODE", ""),
+            "first_name":     r.get("FIRST_NAME", ""),
+            "last_name":      r.get("LAST_NAME", ""),
+            "tenant_status":  r.get("TENANT_STATUS", ""),
+            "lease_from":     r.get("LEASE_FROM", ""),
+            "lease_to":       r.get("LEASE_TO", ""),
+            "move_in":        r.get("MOVE_IN", ""),
+            "move_out":       r.get("MOVE_OUT", ""),
+            "email":          r.get("EMAIL", ""),
+            "charge_code":    r.get("CHARGE_CODE", ""),
+            "charge_type":    r.get("CHARGE_TYPE", ""),
+            "charge_amount":  r.get("CHARGE_AMOUNT", ""),
+            "charge_from_date": r.get("CHARGE_FROM_DATE", ""),
+            "charge_to_date":   r.get("CHARGE_TO_DATE", ""),
+        })
+
+    # Build results_log — one entry per property (matches Yardi/Entrata shape)
+    results_log = []
+    for prop in properties:
+        pid = prop.get("PROPERTY_ID") or prop.get("property_id")
+        info = by_prop.get(pid)
+        if info is None:
+            results_log.append({
+                "property": prop.get("PROPERTY_NAME") or prop.get("property_name", ""),
+                "code": prop.get("PROPERTY_CODE") or prop.get("property_code", ""),
+                "status": "Warning: No charges found in Snowflake",
+                "charges": 0,
+            })
+        else:
+            status_str = f"Success ({info['charges']} charges; "
+            status_str += f"{info['resh_matches']} resh-match / {info['lease_matches']} lease-match"
+            if info['no_matches'] > 0:
+                status_str += f" / {info['no_matches']} unmatched"
+            status_str += ")"
+            # Surface a clear warning when the no_match count is non-trivial.
+            if info['no_matches'] > 0 and info['no_matches'] > info['charges'] * 0.05:
+                status_str = status_str.replace("Success", "Warning")
+            results_log.append({
+                "property": info["property_name"],
+                "code":     info["property_code"],
+                "status":   status_str,
+                "charges":  info["charges"],
+            })
+
+    cur.close()
+    progress_bar.progress(1.0)
+    if test_filtered > 0:
+        status_text.text(f"Done — {len(all_charges):,} charge rows ({test_filtered} test/model residents filtered).")
+    else:
+        status_text.text(f"Done — {len(all_charges):,} charge rows.")
+
+    return all_charges, results_log
+
 # ─── Yardi API fetch ─────────────────────────────────────────────────
 def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months=24):
     """Call GetRentroll API for each property, return all charge rows.
@@ -5394,7 +5804,8 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
         COALESCE(
             l.lease_source_external_id:tenant_code::STRING,
             l.lease_source_external_id:"customerId"::STRING,
-            l.lease_source_external_id:"customer_id"::STRING
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
         ) AS tenant_code,
         ue.user_email,
         ue.user_first_name,
@@ -5669,7 +6080,8 @@ def fetch_missing_pet_rent_by_property(
         COALESCE(
             l.lease_source_external_id:tenant_code::STRING,
             l.lease_source_external_id:"customerId"::STRING,
-            l.lease_source_external_id:"customer_id"::STRING
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
         ) AS tenant_code,
         ue.user_first_name,
         ue.user_last_name,
@@ -5967,7 +6379,8 @@ def fetch_suspected_undisclosed_by_property(
         COALESCE(
             l.lease_source_external_id:tenant_code::STRING,
             l.lease_source_external_id:"customerId"::STRING,
-            l.lease_source_external_id:"customer_id"::STRING
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
         ) AS tenant_code,
         ue.user_first_name,
         ue.user_last_name,
@@ -6202,7 +6615,8 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
         COALESCE(
             l.lease_source_external_id:tenant_code::STRING,
             l.lease_source_external_id:"customerId"::STRING,
-            l.lease_source_external_id:"customer_id"::STRING
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
         ) AS tenant_code,
         ue.user_first_name,
         ue.user_last_name,
@@ -6329,6 +6743,29 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
 # STREAMLIT UI
 # ═════════════════════════════════════════════════════════════════════
 
+
+# ─── PMC system routing (for the 3-way Yardi/Entrata/RealPage switch) ──
+def _load_parent_companies_for(pmc_system):
+    if pmc_system == "entrata":
+        return load_entrata_parent_companies()
+    if pmc_system == "real_page":
+        return load_realpage_parent_companies()
+    return load_parent_companies()
+
+def _load_all_properties_for(pmc_system):
+    if pmc_system == "entrata":
+        return load_entrata_all_properties()
+    if pmc_system == "real_page":
+        return load_realpage_all_properties()
+    return load_all_properties()
+
+def _load_properties_for_selection_for(pmc_system, **kwargs):
+    if pmc_system == "entrata":
+        return load_entrata_properties_for_selection(**kwargs)
+    if pmc_system == "real_page":
+        return load_realpage_properties_for_selection(**kwargs)
+    return load_properties_for_selection(**kwargs)
+
 # ─── Branded header ──────────────────────────────────────────────────
 if _PS_LOGO_DARK_URI:
     st.markdown(
@@ -6382,14 +6819,23 @@ with st.sidebar:
 
     # ── PMC System selector ──────────────────────────────────────────
     st.header("PMC System")
+    # 3-way PMC switch. Internal session value is the canonical lower-case
+    # string used as `pmc_system` everywhere downstream and as
+    # `du.unit_source` / `m.property_source_name` in SQL substitution.
+    #   Yardi    -> 'yardi'
+    #   Entrata  -> 'entrata'
+    #   RealPage -> 'real_page'   <-- with underscore, matches D_PROPERTIES
+    _pmc_labels  = ["Yardi", "Entrata", "RealPage"]
+    _pmc_values  = ["yardi", "entrata", "real_page"]
+    _curr_idx = _pmc_values.index(st.session_state.pmc_system) if st.session_state.pmc_system in _pmc_values else 0
     _pmc_choice = st.radio(
         "Data Source:",
-        ["Yardi", "Entrata"],
-        index=0 if st.session_state.pmc_system == "yardi" else 1,
+        _pmc_labels,
+        index=_curr_idx,
         help="Select the property management system to fetch charge data from.",
         horizontal=True,
     )
-    _pmc_system = _pmc_choice.lower()
+    _pmc_system = _pmc_values[_pmc_labels.index(_pmc_choice)]
     # If user switches PMC system, clear stale data
     if _pmc_system != st.session_state.pmc_system:
         st.session_state.pmc_system = _pmc_system
@@ -6404,8 +6850,9 @@ with st.sidebar:
             if (_sk.startswith("missing_rent_") and isinstance(st.session_state[_sk], dict)) or _sk in ("export_html", "exec_html"):
                 del st.session_state[_sk]
 
-    _is_entrata = _pmc_system == "entrata"
-    _system_label = "Entrata" if _is_entrata else "Yardi"
+    _is_entrata  = _pmc_system == "entrata"
+    _is_realpage = _pmc_system == "real_page"
+    _system_label = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage"}[_pmc_system]
 
     st.divider()
     st.header("Select Properties")
@@ -6421,7 +6868,7 @@ with st.sidebar:
     selected_ancestry_id = None
 
     if search_by == "Parent Company Name":
-        parents = load_entrata_parent_companies() if _is_entrata else load_parent_companies()
+        parents = _load_parent_companies_for(_pmc_system)
         parent_options = {
             f"{r['PARENT_COMPANY_NAME']} ({r['TOTAL_PROPS']} props)": r
             for r in parents
@@ -6434,7 +6881,7 @@ with st.sidebar:
                         f"{row['API_PROPS']} of {row['TOTAL_PROPS']} have {_system_label} API access")
 
     elif search_by == "Parent Company Ancestry ID":
-        parents = load_entrata_parent_companies() if _is_entrata else load_parent_companies()
+        parents = _load_parent_companies_for(_pmc_system)
         ancestry_options = {}
         for r in parents:
             aid = r.get('ANCESTRY_ID') or ''
@@ -6453,7 +6900,7 @@ with st.sidebar:
                         f"{row['API_PROPS']} of {row['TOTAL_PROPS']} have {_system_label} API access")
 
     else:
-        all_props = load_entrata_all_properties() if _is_entrata else load_all_properties()
+        all_props = _load_all_properties_for(_pmc_system)
         prop_options = {
             f"{r['PROPERTY_NAME']} (ID: {r['PROPERTY_ID']})": r['PROPERTY_ID']
             for r in all_props
@@ -6611,7 +7058,7 @@ if fetch_btn:
     else:
         if _use_multi_ids:
             # Load all integrated properties, then filter to the pasted IDs
-            _all_integrated = load_entrata_properties_for_selection() if _is_entrata else load_properties_for_selection()
+            _all_integrated = _load_properties_for_selection_for(_pmc_system)
             _multi_id_set = set(_multi_ids_parsed)
             properties = [p for p in _all_integrated if int(p['PROPERTY_ID']) in _multi_id_set]
             if not properties:
@@ -6622,18 +7069,12 @@ if fetch_btn:
                            f"Missing/inactive: {', '.join(_missing[:10])}")
         else:
             # Route to correct property loader based on PMC system
-            if _is_entrata:
-                properties = load_entrata_properties_for_selection(
-                    parent_company_name=selected_parent,
-                    property_id=selected_property_id,
-                    ancestry_id=selected_ancestry_id,
-                )
-            else:
-                properties = load_properties_for_selection(
-                    parent_company_name=selected_parent,
-                    property_id=selected_property_id,
-                    ancestry_id=selected_ancestry_id,
-                )
+            properties = _load_properties_for_selection_for(
+                _pmc_system,
+                parent_company_name=selected_parent,
+                property_id=selected_property_id,
+                ancestry_id=selected_ancestry_id,
+            )
 
         if not properties:
             if not _use_multi_ids:  # multi-ID already showed its own warning
@@ -6652,7 +7093,7 @@ if fetch_btn:
             _resolved_ancestry_id = selected_ancestry_id
             if not _resolved_ancestry_id and (selected_parent or selected_ancestry_id):
                 try:
-                    _pc_list = load_entrata_parent_companies() if _is_entrata else load_parent_companies()
+                    _pc_list = _load_parent_companies_for(_pmc_system)
                     for r in _pc_list:
                         if (selected_parent and r['PARENT_COMPANY_NAME'] == selected_parent) or \
                            (selected_ancestry_id and str(r.get('ANCESTRY_ID', '')) == selected_ancestry_id):
@@ -6666,7 +7107,7 @@ if fetch_btn:
             # Get total property count for context
             total_count = None
             if selected_parent or selected_ancestry_id:
-                _pc_list2 = load_entrata_parent_companies() if _is_entrata else load_parent_companies()
+                _pc_list2 = _load_parent_companies_for(_pmc_system)
                 for r in _pc_list2:
                     if (selected_parent and r['PARENT_COMPANY_NAME'] == selected_parent) or \
                        (selected_ancestry_id and str(r.get('ANCESTRY_ID', '')) == selected_ancestry_id):
@@ -6702,8 +7143,12 @@ if fetch_btn:
             status_text = st.empty()
 
             # Route to correct API fetch
-            if _is_entrata:
+            if _pmc_system == "entrata":
                 all_charges, fetch_log, ar_charges, raw_lease_arrays = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
+            elif _pmc_system == "real_page":
+                all_charges, fetch_log = fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months)
+                ar_charges = []
+                raw_lease_arrays = []
             else:
                 all_charges, fetch_log = fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months)
                 ar_charges = []
@@ -7020,7 +7465,8 @@ if st.session_state.all_charges_df is not None:
                             COALESCE(
                                 l.lease_source_external_id:tenant_code::STRING,
                                 l.lease_source_external_id:"customerId"::STRING,
-                                l.lease_source_external_id:"customer_id"::STRING
+                                l.lease_source_external_id:"customer_id"::STRING,
+                                l.lease_source_external_id:"lease_id"::STRING
                             ) AS tenant_code,
                             ue.user_email,
                             ue.user_first_name,
