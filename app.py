@@ -3428,6 +3428,38 @@ def generate_tranche_pdf(
     from fpdf import FPDF
 
     class PDF(FPDF):
+        @staticmethod
+        def _safe_pdf_text(text):
+            """Convert Unicode punctuation to core-font-safe text for fpdf Helvetica."""
+            if text is None:
+                return ""
+            replacements = {
+                "\u2013": "-",      # en dash
+                "\u2014": "--",     # em dash
+                "\u2010": "-",      # hyphen
+                "\u2011": "-",      # non-breaking hyphen
+                "\u2012": "-",      # figure dash
+                "\u2212": "-",      # minus sign
+                "\u2018": "'",
+                "\u2019": "'",
+                "\u201a": ",",
+                "\u201c": '"',
+                "\u201d": '"',
+                "\u201e": '"',
+                "\u2026": "...",
+                "\u2022": "-",
+                "\u00a0": " ",
+            }
+            safe = str(text)
+            for src, dst in replacements.items():
+                safe = safe.replace(src, dst)
+            # Built-in PDF core fonts are Latin-1 only; replace anything else
+            # instead of failing the entire report download.
+            return safe.encode("latin-1", "replace").decode("latin-1")
+
+        def normalize_text(self, text):
+            return super().normalize_text(self._safe_pdf_text(text))
+
         def header(self):
             self.set_fill_color(31, 34, 87)  # #1F2257
             self.rect(0, 0, 210, 38, 'F')
