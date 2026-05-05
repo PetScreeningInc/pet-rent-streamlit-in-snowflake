@@ -6703,16 +6703,12 @@ def fetch_suspected_undisclosed_by_property(
         ue.household_profile_started_alltime,
         ue.assistance_profile_started_alltime,
         CASE
-            WHEN ue.household_profile_started_alltime > 0
-                 AND NOT (ue.user_pet_type = 'household' AND ue.user_pet_status = 'active')
+            WHEN ue.user_pet_type = 'household'
+                 AND ue.user_pet_status IN ('draft','non_responsive','pending','returned')
             THEN 'Abandoned household profile'
-            WHEN ue.assistance_profile_started_alltime > 0
-                 AND ue.user_pet_type = 'assistance'
+            WHEN ue.user_pet_type = 'assistance'
                  AND ue.user_pet_status IN ('draft','non_responsive','declined','not_recommended','returned')
             THEN 'Unresolved assistance request'
-            WHEN ue.assistance_profile_started_alltime > 0
-                 AND ue.user_pet_type = 'not_pet'
-            THEN 'No-pet after assistance started'
             ELSE 'Other suspected'
         END AS suspected_reason
     FROM PROD.common.d_units du
@@ -6739,30 +6735,20 @@ def fetch_suspected_undisclosed_by_property(
           AND ue.user_pet_status IN ('recommended', 'expired')
       )
       AND (
-            /* 1) Household profile started but NOT currently active household */
+            /* Current unresolved household profile, not any all-time household history */
             (
-              ue.household_profile_started_alltime > 0
-              AND NOT (
-                ue.user_pet_type = 'household'
-                AND ue.user_pet_status = 'active'
-              )
+              ue.user_pet_type = 'household'
+              AND ue.user_pet_status IN ('draft', 'non_responsive', 'pending', 'returned')
             )
             OR
-            /* 2) Assistance profile started + unresolved / denied / no-pet */
+            /* Current unresolved/denied assistance profile. Exclude not_pet rows;
+               a resident who attested no pet is too weak for the suspected KPI. */
             (
-              ue.assistance_profile_started_alltime > 0
-              AND (
-                    (
-                      ue.user_pet_type = 'assistance'
-                      AND ue.user_pet_status IN (
-                        'draft', 'non_responsive', 'declined',
-                        'not_recommended', 'returned'
-                      )
-                    )
-                    OR (
-                      ue.user_pet_type = 'not_pet'
-                    )
-                  )
+              ue.user_pet_type = 'assistance'
+              AND ue.user_pet_status IN (
+                'draft', 'non_responsive', 'declined',
+                'not_recommended', 'returned'
+              )
             )
           )
       AND COALESCE(pp.pet_profile_archive_reason, '') = ''
@@ -6965,16 +6951,12 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
         l.lease_start_date,
         l.lease_end_date,
         CASE
-            WHEN ue.household_profile_started_alltime > 0
-                 AND NOT (ue.user_pet_type = 'household' AND ue.user_pet_status = 'active')
+            WHEN ue.user_pet_type = 'household'
+                 AND ue.user_pet_status IN ('draft','non_responsive','pending','returned')
             THEN 'Abandoned household profile'
-            WHEN ue.assistance_profile_started_alltime > 0
-                 AND ue.user_pet_type = 'assistance'
+            WHEN ue.user_pet_type = 'assistance'
                  AND ue.user_pet_status IN ('draft','non_responsive','declined','not_recommended','returned')
             THEN 'Unresolved assistance request'
-            WHEN ue.assistance_profile_started_alltime > 0
-                 AND ue.user_pet_type = 'not_pet'
-            THEN 'No-pet after assistance started'
             ELSE 'Other suspected'
         END AS suspected_reason
     FROM PROD.common.d_units du
@@ -7001,28 +6983,20 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
           AND ue.user_pet_status IN ('recommended', 'expired')
       )
       AND (
+            /* Current unresolved household profile, not any all-time household history */
             (
-              ue.household_profile_started_alltime > 0
-              AND NOT (
-                ue.user_pet_type = 'household'
-                AND ue.user_pet_status = 'active'
-              )
+              ue.user_pet_type = 'household'
+              AND ue.user_pet_status IN ('draft', 'non_responsive', 'pending', 'returned')
             )
             OR
+            /* Current unresolved/denied assistance profile. Exclude not_pet rows;
+               a resident who attested no pet is too weak for the suspected export. */
             (
-              ue.assistance_profile_started_alltime > 0
-              AND (
-                    (
-                      ue.user_pet_type = 'assistance'
-                      AND ue.user_pet_status IN (
-                        'draft', 'non_responsive', 'declined',
-                        'not_recommended', 'returned'
-                      )
-                    )
-                    OR (
-                      ue.user_pet_type = 'not_pet'
-                    )
-                  )
+              ue.user_pet_type = 'assistance'
+              AND ue.user_pet_status IN (
+                'draft', 'non_responsive', 'declined',
+                'not_recommended', 'returned'
+              )
             )
           )
       AND COALESCE(pp.pet_profile_archive_reason, '') = ''
@@ -10781,13 +10755,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 but are **NOT paying** any of the selected pet charge codes.
 
                 **Who qualifies as "suspected":**
-                - **Abandoned household profile** — started a household pet profile in PetScreening but never completed it
-                - **Unresolved assistance request** — submitted an assistance animal request that was declined, left in draft, or returned
-                - **No-pet after assistance started** — declared "no pet" after starting an assistance animal profile
+                - **Abandoned household profile** — current household pet profile is still incomplete/unresolved
+                - **Unresolved assistance request** — current assistance animal request was declined, left in draft, or returned
                 
-                *Note: Assistance profiles with `recommended` or `expired` status are excluded.*
+                *Conservative rule: old all-time profile history, expired profiles, recommended assistance animals, and "no pet" attestations are excluded.*
 
-                These patterns suggest the resident likely has a pet but hasn't completed the proper screening process.
+                These patterns suggest the current resident likely has a pet but hasn't completed the proper screening process.
                 """
             )
             st.info(
@@ -11001,9 +10974,8 @@ a likely undisclosed pet. The following are **excluded**:
 | **Profiles already paying** any selected charge code | They're paying — not missing |
 
 **Who IS included (suspected reasons):**
-- **Abandoned household profile** — started a household pet profile but never completed it
-- **Unresolved assistance request** — assistance request was declined, left in draft, or returned
-- **No-pet after assistance started** — declared "no pet" after starting an assistance animal profile
+- **Abandoned household profile** — current household pet profile is incomplete/unresolved
+- **Unresolved assistance request** — current assistance request was declined, left in draft, or returned
                 """)
 
             with st.expander("**Charge Classification — Recurring vs One-Time**"):
@@ -11694,11 +11666,10 @@ active household pet screening who simply aren't being charged), suspected undis
 
 | Category | What it means | Why it matters |
 |----------|---------------|----------------|
-| **Abandoned household profile** | Resident started a household pet profile but never completed it | They likely have a pet but abandoned the process — possibly to avoid pet rent |
-| **Unresolved assistance request** | Submitted an assistance animal request that was declined, left in draft, or returned | The request signals they have an animal. A denied request doesn't mean the pet left. |
-| **No-pet after assistance started** | Declared "no pet" after beginning an assistance animal profile | Suspicious pattern — why start an assistance profile if you have no pet? |
+| **Abandoned household profile** | Current household pet profile is incomplete/unresolved | They likely have a pet but have not completed screening |
+| **Unresolved assistance request** | Current assistance animal request was declined, left in draft, or returned | The request signals they have an animal. A denied request doesn't mean the pet left. |
 
-**Exclusions:** Assistance profiles with `recommended` or `expired` status are excluded from suspected cases.
+**Exclusions:** Old all-time profile history, expired profiles, recommended assistance animals, residents who attested `not_pet`, archived profiles, and residents already paying the selected pet charge codes are excluded from suspected cases.
 
 **How the red bars on charts are calculated:**
 
@@ -11714,7 +11685,7 @@ The estimated revenue methodology is the same as confirmed missing rent (orange 
 |--------|-------------------|-----------------|
 | **Who** | Active household pet profile — **confirmed** pet owner | Behavioral signals — **likely** pet owner |
 | **Confidence** | High — they told us they have a pet | Medium — inferred from profile behavior |
-| **Source** | `user_pet_type = 'household'` AND `user_pet_status = 'active'` | Abandoned profiles, unresolved requests, suspicious no-pet declarations |
+| **Source** | `user_pet_type = 'household'` AND `user_pet_status = 'active'` | Current unresolved household/assistance profile state |
 | **Use case** | Revenue you're definitely leaving on the table | Additional revenue opportunity — worth investigating |
 
 **Important notes:**
