@@ -3878,130 +3878,192 @@ def generate_tranche_pdf(
 
     pdf.ln(1)
 
-    # ── KPI cards -- row 1: core metrics ──
-    _glance_row1 = []
-    if _has_comparable and _headline_units > 0:
-        _glance_row1.append({
-            "value": f"{_headline_units:,}",
-            "label": "Comparable Units",
-            "sub": f"{comparable_count} properties with pre & post data",
-            "color": dark_blue,
-        })
-    elif total_units and total_units > 0:
-        _glance_row1.append({
-            "value": f"{total_units:,}",
-            "label": "Live Units",
-            "sub": f"Across {n_props_with_data} properties",
-            "color": dark_blue,
-        })
-    else:
-        _glance_row1.append({
-            "value": f"{n_props_with_data}",
-            "label": "Properties Analyzed",
-            "sub": f"of {n_props_total} total",
-            "color": dark_blue,
-        })
+    # ── KPI cards: 3 summary cards ──
+    # RealPage uses a different layout: 3 cards mirroring the Summary tab's
+    # "Current Pet Revenue" section (current monthly / props with data /
+    # annualized run-rate) plus a yellow info banner. No "Actuals" row at
+    # all — there's no lift to show.
+    if _is_realpage:
+        _rp_latest_str = latest_month.strftime("%B %Y") if latest_month else "Latest month"
+        _rp_annual_glance = current_monthly_rev * 12
+        _rp_glance_row = [
+            {
+                "value": f"${current_monthly_rev:,.0f}",
+                "label": "Current Monthly Pet-Related Revenue",
+                "sub": _rp_latest_str,
+                "color": dark_blue,
+            },
+            {
+                "value": f"{n_props_with_data:,}",
+                "label": "Properties with Pet Revenue Data",
+                "sub": "Across the analyzed portfolio",
+                "color": dark_blue,
+            },
+            {
+                "value": _format_large_currency(_rp_annual_glance) if _rp_annual_glance > 0 else "--",
+                "label": "Annualized Pet Revenue (Run Rate)",
+                "sub": "Current monthly x 12",
+                "color": _teal_blue if _rp_annual_glance > 0 else dark_blue,
+            },
+        ]
+        draw_card_row(_rp_glance_row)
+        pdf.ln(2)
 
-    _glance_row1.append({
-        "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
-        "label": "Pre-PS Revenue",
-        "sub": (
-            f"Avg baseline across {comparable_count} properties" if _has_comparable
-            else ("RealPage history starts Jan 2025" if _is_realpage
-                  else ("No pre-launch data" if _no_pre_data else None))
-        ),
-        "color": dark_blue if _headline_pre > 0 else (160, 160, 160),
-    })
-    if use_avg_lift and _comp_post_avg > 0:
-        _glance_row1.append({
-            "value": f"${_comp_post_avg:,.0f}/mo",
-            "label": "Post-PS Avg Revenue",
-            "sub": f"Avg across {comparable_count} properties, all post-launch months",
-            "color": dark_blue,
-        })
+        # Explanatory paragraph in a tinted info box, matching the Summary tab banner.
+        # Use the same background color as the dog-bone-white tone from the Streamlit banner.
+        _banner_text = (
+            "Why no lift number? RealPage charge data history begins January 2025, "
+            "and the OneSite API does not return historical post-month data. For "
+            "properties launched before then, a \"pre-PetScreening\" baseline "
+            "cannot be reconstructed honestly. We show current revenue and the "
+            "missing-pet-rent opportunity below instead."
+        )
+        # Render as a soft tinted callout. Measure the text height by
+        # doing a dry-run multi_cell with split_only=True (FPDF returns the
+        # split lines without writing them), then draw the background
+        # rect first and the text once on top.
+        pdf.set_font('Helvetica', '', 9)
+        _y_before = pdf.get_y()
+        # Estimate height: split_only returns a list of lines; line height ~4.2mm
+        try:
+            _lines = pdf.multi_cell(USABLE_W - 8, 4.2, _banner_text, split_only=True)
+        except TypeError:
+            # Older fpdf versions may not support split_only; fall back to
+            # a simple character-count estimate (rough).
+            _lines = [""] * max(1, len(_banner_text) // 90 + 2)
+        _h = max(8, len(_lines) * 4.2 + 4)
+        # Background rect (dog-bone-white #F9F4E6)
+        pdf.set_fill_color(249, 244, 230)
+        pdf.rect(PAGE_L, _y_before, USABLE_W, _h, 'F')
+        # Left border accent (warm-amber #E2AB58)
+        pdf.set_fill_color(226, 171, 88)
+        pdf.rect(PAGE_L, _y_before, 1.5, _h, 'F')
+        # Render the text once, on top of the rect
+        pdf.set_xy(PAGE_L + 4, _y_before + 2)
+        pdf.set_text_color(*dark_blue)
+        pdf.multi_cell(USABLE_W - 8, 4.2, _banner_text)
+        pdf.set_y(_y_before + _h + 2)
     else:
-        _glance_row1.append({
-            "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
-            "label": "Current Revenue",
-            "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
-            "color": dark_blue,
-        })
-    draw_card_row(_glance_row1)
-    pdf.ln(1)
-
-    # ── KPI cards -- row 2: lift + per-unit + cap rate ──
-    _glance_row2 = []
-    if _no_pre_data:
-        # Show blank cards with explanation for no pre-PS data.
-        # RealPage gets a clearer cause vs the generic "No pre-launch baseline".
-        _no_pre_sub = "RealPage history starts Jan 2025" if _is_realpage else "No pre-launch baseline"
-        _glance_row2.append({
-            "value": "--",
-            "label": "Monthly Lift",
-            "sub": _no_pre_sub,
-            "color": (160, 160, 160),
-        })
-        _glance_row2.append({
-            "value": "--",
-            "label": "Lift per Unit",
-            "sub": _no_pre_sub,
-            "color": (160, 160, 160),
-        })
-    elif _active_lift != 0:
-        _lift_sign = "+" if _active_lift > 0 else ""
-        _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
-        _lift_sub = f"${_comp_post_avg:,.0f} avg - ${_headline_pre:,.0f} pre" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
-        _glance_row2.append({
-            "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
-            "label": _lift_label,
-            "sub": _lift_sub,
-            "color": _teal_blue if _active_lift > 0 else orange,
-        })
-        if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
-            _lpu_sign = "+" if _lift_per_unit > 0 else ""
-            _glance_row2.append({
-                "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
-                "label": "Lift per Unit",
-                "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
-                "color": _teal_blue if _lift_per_unit > 0 else orange,
+        # Non-RealPage: original row 1 + row 2 layout.
+        _glance_row1 = []
+        if _has_comparable and _headline_units > 0:
+            _glance_row1.append({
+                "value": f"{_headline_units:,}",
+                "label": "Comparable Units",
+                "sub": f"{comparable_count} properties with pre & post data",
+                "color": dark_blue,
             })
-    elif total_units and total_units > 0 and _rev_per_unit > 0:
-        _glance_row2.append({
-            "value": f"${_rev_per_unit:,.2f}/unit/mo",
-            "label": "Revenue per Unit",
-            "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
-            "color": _teal_blue,
-        })
-    if _asset_value_impact > 0:
-        _avi_str = _format_large_currency(_asset_value_impact)
-        _glance_row2.append({
-            "value": _avi_str,
-            "label": "Est. Asset Value Impact",
-            "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate",
-            "color": _teal_blue,
-        })
+        elif total_units and total_units > 0:
+            _glance_row1.append({
+                "value": f"{total_units:,}",
+                "label": "Live Units",
+                "sub": f"Across {n_props_with_data} properties",
+                "color": dark_blue,
+            })
+        else:
+            _glance_row1.append({
+                "value": f"{n_props_with_data}",
+                "label": "Properties Analyzed",
+                "sub": f"of {n_props_total} total",
+                "color": dark_blue,
+            })
 
-    # Pad row 2 to 3 cards (but skip padding for no-pre-data case)
-    if not _no_pre_data:
-        while len(_glance_row2) < 3:
-            if _opp_recurring_mo > 0 and t2_tenants > 0:
+        _glance_row1.append({
+            "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
+            "label": "Pre-PS Revenue",
+            "sub": (
+                f"Avg baseline across {comparable_count} properties" if _has_comparable
+                else ("No pre-launch data" if _no_pre_data else None)
+            ),
+            "color": dark_blue if _headline_pre > 0 else (160, 160, 160),
+        })
+        if use_avg_lift and _comp_post_avg > 0:
+            _glance_row1.append({
+                "value": f"${_comp_post_avg:,.0f}/mo",
+                "label": "Post-PS Avg Revenue",
+                "sub": f"Avg across {comparable_count} properties, all post-launch months",
+                "color": dark_blue,
+            })
+        else:
+            _glance_row1.append({
+                "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
+                "label": "Current Revenue",
+                "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
+                "color": dark_blue,
+            })
+        draw_card_row(_glance_row1)
+        pdf.ln(1)
+
+        # ── KPI cards -- row 2: lift + per-unit + cap rate ──
+        _glance_row2 = []
+        if _no_pre_data:
+            _glance_row2.append({
+                "value": "--",
+                "label": "Monthly Lift",
+                "sub": "No pre-launch baseline",
+                "color": (160, 160, 160),
+            })
+            _glance_row2.append({
+                "value": "--",
+                "label": "Lift per Unit",
+                "sub": "No pre-launch baseline",
+                "color": (160, 160, 160),
+            })
+        elif _active_lift != 0:
+            _lift_sign = "+" if _active_lift > 0 else ""
+            _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+            _lift_sub = f"${_comp_post_avg:,.0f} avg - ${_headline_pre:,.0f} pre" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
+            _glance_row2.append({
+                "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
+                "label": _lift_label,
+                "sub": _lift_sub,
+                "color": _teal_blue if _active_lift > 0 else orange,
+            })
+            if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
+                _lpu_sign = "+" if _lift_per_unit > 0 else ""
                 _glance_row2.append({
-                    "value": f"${_opp_recurring_mo:,.0f}/mo",
-                    "label": "Revenue Left on Table",
-                    "sub": f"{t2_tenants:,} tenants not paying pet rent",
-                    "color": orange,
+                    "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
+                    "label": "Lift per Unit",
+                    "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
+                    "color": _teal_blue if _lift_per_unit > 0 else orange,
                 })
-            else:
-                _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
-            break
+        elif total_units and total_units > 0 and _rev_per_unit > 0:
+            _glance_row2.append({
+                "value": f"${_rev_per_unit:,.2f}/unit/mo",
+                "label": "Revenue per Unit",
+                "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
+                "color": _teal_blue,
+            })
+        if _asset_value_impact > 0:
+            _avi_str = _format_large_currency(_asset_value_impact)
+            _glance_row2.append({
+                "value": _avi_str,
+                "label": "Est. Asset Value Impact",
+                "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate",
+                "color": _teal_blue,
+            })
 
-    # Only show Actuals row if we have pre-PS data to compare against
-    if _glance_row2 and not _no_pre_data:
-        pdf.ln(3)  # space for label pill
-        draw_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
-    elif _no_pre_data:
-        # Skip Actuals row entirely for no pre-PS data — the Opportunity row will show actionable data
-        pass
+        # Pad row 2 to 3 cards (but skip padding for no-pre-data case)
+        if not _no_pre_data:
+            while len(_glance_row2) < 3:
+                if _opp_recurring_mo > 0 and t2_tenants > 0:
+                    _glance_row2.append({
+                        "value": f"${_opp_recurring_mo:,.0f}/mo",
+                        "label": "Revenue Left on Table",
+                        "sub": f"{t2_tenants:,} tenants not paying pet rent",
+                        "color": orange,
+                    })
+                else:
+                    _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+                break
+
+        # Only show Actuals row if we have pre-PS data to compare against
+        if _glance_row2 and not _no_pre_data:
+            pdf.ln(3)  # space for label pill
+            draw_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
+        elif _no_pre_data:
+            # Skip Actuals row entirely for no pre-PS data — the Opportunity row will show actionable data
+            pass
 
     pdf.ln(1)
 
@@ -4212,7 +4274,7 @@ def generate_tranche_pdf(
             {
                 "value": f"{n_props_with_data:,}",
                 "label": "Properties with Pet Revenue Data",
-                "sub": "From RealPage staging tables",
+                "sub": "From RealPage charge data",
                 "color": dark_blue,
             },
             {
@@ -4229,12 +4291,11 @@ def generate_tranche_pdf(
         )
         narrative(
             f"Across {n_props_with_data} RealPage properties, current pet rent revenue is "
-            f"${current_monthly_rev:,.0f}/mo. RealPage's API does not return historical "
-            f"post-month data -- charge schedules are wiped when residents move out, and "
-            f"the daily Snowflake snapshots only go back to January 2025. Because of this, "
-            f"a credible pre-PetScreening baseline cannot be reconstructed for properties "
-            f"launched before then. The Revenue Opportunity section below quantifies the "
-            f"actionable upside from missing pet rent on existing residents."
+            f"${current_monthly_rev:,.0f}/mo. RealPage's data does not extend back far enough to "
+            f"reconstruct a credible pre-PetScreening baseline for properties launched before "
+            f"early 2025 -- charge schedules in OneSite are kept current rather than archived. "
+            f"This report focuses on current revenue and the missing-pet-rent opportunity below, "
+            f"which together quantify the actionable upside on existing residents."
         )
     else:
         draw_card_row([
@@ -4328,14 +4389,14 @@ def generate_tranche_pdf(
         f"are not included in these numbers."
     )
 
-    # RealPage-specific data history disclosure
+    # RealPage-specific data history disclosure (client-facing wording).
     if _is_realpage:
         _dt_lines.append(
-            "RealPage charge data in our Snowflake staging only goes back to January 2025, "
-            "and the OneSite getscheduledcharges API does not return historical post-month "
-            "data. Because of this, no pre-PetScreening baseline is computed and no lift "
-            "number is shown for RealPage properties -- the report focuses on current "
-            "revenue and missing-pet-rent opportunity."
+            "RealPage charge data in this report covers the historical window currently "
+            "available from the source system. For properties that launched PetScreening "
+            "before that window, a pre-PetScreening baseline cannot be reconstructed, so "
+            "this report does not show a lift number for RealPage properties -- the focus "
+            "is on current revenue and the missing-pet-rent opportunity."
         )
 
     # Comparable vs non-comparable breakdown
@@ -5108,10 +5169,10 @@ def generate_tranche_pdf(
         narrative(
             "Current Pet Revenue: sum of pet fee charges for the most recently completed "
             "month across all RealPage properties. Annualized run-rate is current monthly "
-            "x 12 (no growth assumption baked in). RealPage charge history in our data "
-            "warehouse begins January 2025, and the OneSite getscheduledcharges API does "
-            "not return historical post-month data, so a true pre-PetScreening baseline "
-            "is not available -- this report does not show a lift number for RealPage."
+            "x 12 (no growth assumption baked in). For properties that launched PetScreening "
+            "before the available RealPage data window, a pre-PetScreening baseline cannot "
+            "be reconstructed -- so this report does not show a lift number for RealPage "
+            "properties. The Revenue Opportunity section quantifies the actionable upside."
         )
     elif use_avg_lift:
         narrative(
@@ -9604,7 +9665,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.markdown(_summary_card(
                             f"{_rp_n_props:,}",
                             "Properties with Pet Revenue Data",
-                            "From RealPage staging tables",
+                            "From RealPage charge data",
                             color="#677848",
                         ), unsafe_allow_html=True)
                     with _rp3:
