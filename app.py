@@ -1611,14 +1611,21 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
             c.pmc_id, c.site_id, c.resh_id, c.lease_id, c.unit_id,
             c.transaction_name, c.description, c.amount,
             c.bill_start, c.bill_end, c.category_code, c.sub_journal,
-            c.post_month, c.ingested_at
+            TRY_TO_DATE(c.post_month) AS post_month,
+            c.ingested_at
         FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES c
         JOIN props p ON c.pmc_id = p.pmc_id AND c.site_id = p.site_id
         WHERE c.category_code = 'C'  -- skip P=Payment/Reimbursement
+          AND TRY_TO_DATE(c.post_month) IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (
+            -- RealPage scheduled charges are snapshots by requested PostMonth.
+            -- BillStart can be years earlier, but the API/raw table only proves
+            -- the charge existed for the post_month snapshot. Keep one row per
+            -- observed month instead of deduping to latest and back-projecting
+            -- BillStart history before the first available post_month.
             PARTITION BY c.pmc_id, c.site_id, c.unit_id, c.lease_id,
-                         c.resh_id, c.transaction_name, c.bill_start
-            ORDER BY c.post_month DESC, c.ingested_at DESC
+                         c.resh_id, c.transaction_name, TRY_TO_DATE(c.post_month)
+            ORDER BY c.ingested_at DESC
         ) = 1
     ),
     all_residents AS (
@@ -1725,20 +1732,16 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
         j.transaction_name     AS charge_code,
         j.description          AS charge_type,
         j.amount::STRING       AS charge_amount,
-        TO_CHAR(j.bill_start, 'YYYY-MM-DD') AS charge_from_date,
-        --
-        -- IMPORTANT: clip charge_to_date defensively.
-        --   * BillEnd is often '2099-12-31' (open-ended) which would
-        --     cause downstream code to spread revenue into perpetuity.
-        --   * For Past/Notice tenants, charges effectively end at
-        --     move_out_date — they don't owe pet rent after they leave.
-        --   * Cap at current_date so we never count future months as
-        --     observed revenue.
+        -- RealPage scheduled-charge rows are monthly snapshots. Do NOT use
+        -- BillStart/BillEnd as the app-visible date range; BillStart often
+        -- predates our first available PostMonth by years and would fabricate
+        -- pre-2025 history. Count each observed PostMonth as one monthly charge.
+        TO_CHAR(j.post_month, 'YYYY-MM-DD') AS charge_from_date,
         TO_CHAR(
             LEAST(
-                j.bill_end,
-                COALESCE(j.resolved_move_out_date::TIMESTAMP_NTZ, j.bill_end),
-                CURRENT_TIMESTAMP::TIMESTAMP_NTZ
+                LAST_DAY(j.post_month),
+                COALESCE(j.resolved_move_out_date::DATE, LAST_DAY(j.post_month)),
+                CURRENT_DATE
             ),
             'YYYY-MM-DD'
         )                       AS charge_to_date,
@@ -6024,6 +6027,30 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
     paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
 
+    realpage_current_resident_clause = ""
+    if pmc_system == 'real_page':
+        # RealPage resident/charge data is a current snapshot. Require the
+        # PetScreening profile's lease/email to still exist in the latest
+        # RealPage resident list; otherwise old f_leases rows make past tenants
+        # look like current missing pet-rent opportunities.
+        realpage_current_resident_clause = """
+      AND EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      )
+        """
+
     # ── Step 2: Query Snowflake for PetScreening household profiles ──
     # ** MUST match fetch_missing_pet_rent_by_property exactly: compliant + household + active **
     sql_profiles = f"""
@@ -6061,6 +6088,7 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
       AND ue.user_email IS NOT NULL
       AND TRIM(ue.user_email) <> ''
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
     """
     cur.execute(sql_profiles)
     profiles_df = pd.DataFrame(cur.fetchall())
@@ -6234,7 +6262,12 @@ def fetch_missing_pet_rent_by_property(
     _has_frequency = 'frequency' in pet_charges.columns
     code_class = {}   # {(property_name, charge_code): "recurring" | "onetime"}
     for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
-        if _has_frequency:
+        if pmc_system == "real_page":
+            # RealPage rows are monthly scheduled-charge snapshots keyed by
+            # post_month. Their normalized date span is intentionally one month,
+            # but pet rent is still recurring for missing-rent estimation.
+            code_class[(pname, code)] = "recurring"
+        elif _has_frequency:
             # Entrata: use the frequency field directly
             freqs = grp['frequency'].dropna().str.strip().str.lower()
             onetime_count = (freqs == 'one-time').sum()
@@ -6300,6 +6333,28 @@ def fetch_missing_pet_rent_by_property(
             'status': str(row.get('tenant_status', '')).strip().lower(),
         }
 
+    realpage_current_resident_clause = ""
+    if pmc_system == 'real_page':
+        # RealPage is current-snapshot data. Do not let stale f_leases rows from
+        # previous residents inflate current missing pet-rent estimates.
+        realpage_current_resident_clause = """
+      AND EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      )
+        """
+
     # ── Step 2: Snowflake → PetScreening household profiles with tenant_code ──
     sql_profiles = f"""
     SELECT DISTINCT
@@ -6333,6 +6388,7 @@ def fetch_missing_pet_rent_by_property(
       AND ue.user_email IS NOT NULL
       AND TRIM(ue.user_email) <> ''
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
     """
     cur.execute(sql_profiles)
     profiles_df = pd.DataFrame(cur.fetchall())
@@ -6535,7 +6591,11 @@ def fetch_suspected_undisclosed_by_property(
     _has_frequency = 'frequency' in pet_charges.columns
     code_class = {}
     for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
-        if _has_frequency:
+        if pmc_system == "real_page":
+            # RealPage scheduled charges are monthly snapshots, so the normalized
+            # one-month span should not make pet rent look like a one-time fee.
+            code_class[(pname, code)] = "recurring"
+        elif _has_frequency:
             freqs = grp['frequency'].dropna().str.strip().str.lower()
             onetime_count = (freqs == 'one-time').sum()
             monthly_count = (freqs.isin(['monthly', 'recurring'])).sum()
@@ -6598,6 +6658,29 @@ def fetch_suspected_undisclosed_by_property(
     _all_onetime = [v for v in avg_onetime_by_prop.values() if v > 0]
     portfolio_avg_rec = float(np.mean(_all_recurring)) if _all_recurring else 0
     portfolio_avg_ot = float(np.mean(_all_onetime)) if _all_onetime else 0
+
+    realpage_current_resident_clause = ""
+    if pmc_system == 'real_page':
+        # RealPage current resident list is the freshness anchor for suspected
+        # undisclosed pets too; otherwise old f_leases rows can surface prior
+        # residents/leases as current opportunities.
+        realpage_current_resident_clause = """
+      AND EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      )
+        """
 
     # ── Step 2: Query Snowflake for suspected undisclosed pets ──
     sql_suspected = f"""
@@ -6686,6 +6769,7 @@ def fetch_suspected_undisclosed_by_property(
       AND ue.user_email IS NOT NULL
       AND TRIM(ue.user_email) <> ''
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
     """
     cur.execute(sql_suspected)
     profiles_df = pd.DataFrame(cur.fetchall())
@@ -6835,6 +6919,26 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
     # Step 1: From live API data, build paying tenant set (normalized)
     paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
 
+    realpage_current_resident_clause = ""
+    if pmc_system == 'real_page':
+        realpage_current_resident_clause = """
+      AND EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      )
+        """
+
     # Step 2: Query Snowflake for suspected undisclosed profiles
     sql = f"""
     SELECT DISTINCT
@@ -6925,6 +7029,7 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
       AND ue.user_email IS NOT NULL
       AND TRIM(ue.user_email) <> ''
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
     """
     cur.execute(sql)
     profiles_df = pd.DataFrame(cur.fetchall())
@@ -8027,7 +8132,12 @@ if st.session_state.all_charges_df is not None:
                     _by_prop_code[key].append(rec)
 
                 for (pname, code), recs in _by_prop_code.items():
-                    if _has_frequency:
+                    if st.session_state.get("pmc_system") == "real_page":
+                        # RealPage uses one row per observed post_month. Treat
+                        # selected pet-rent codes as recurring even though each
+                        # row's normalized date span is one month.
+                        _code_class[(pname, code)] = "recurring"
+                    elif _has_frequency:
                         freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency')]
                         onetime_count = sum(1 for f in freqs if f == 'one-time')
                         monthly_count = sum(1 for f in freqs if f in ('monthly', 'recurring'))

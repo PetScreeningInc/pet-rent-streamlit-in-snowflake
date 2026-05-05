@@ -410,6 +410,13 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             _by_prop_code[key].append(rec)
         
         for (pname, code), recs in _by_prop_code.items():
+            if pmc_system == "real_page":
+                # RealPage rows are one observed post_month each. Keep the charge
+                # code classified as recurring so PDFs/missing-rent estimates don't
+                # label monthly pet rent as a one-time fee.
+                _code_class[(pname, code)] = "recurring"
+                continue
+
             spans = []
             for r in recs:
                 f, t = r.get("from_date"), r.get("to_date")
