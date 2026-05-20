@@ -4117,6 +4117,8 @@ def generate_tranche_pdf(
         )
 
     # ── Portfolio extrapolation callout (if non-comparable properties exist) ──
+    # Use total_units from the data when total_portfolio_units isn't manually set
+    _effective_portfolio_units = total_portfolio_units if total_portfolio_units > 0 else total_units
     if _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
         pdf.ln(2)
         # Use the combined per-unit (actuals lift + found) so the zinger reflects
@@ -4133,7 +4135,7 @@ def generate_tranche_pdf(
         _cb_start_y = pdf.get_y()
         _cb_text = (
             f"Applying the combined ${_zinger_per_unit:,.2f}/unit/mo across ALL "
-            f"{total_portfolio_units:,} units in {label}'s portfolio -- including "
+            f"{_effective_portfolio_units:,} units in {label}'s portfolio -- including "
             f"{_noncomp_count} properties ({_noncomp_units:,} units) without pre-launch "
             f"data -- the estimated total portfolio impact would be "
             f"~${_total_portfolio_lift:,.0f}/mo (${_total_portfolio_lift_annual:,.0f}/yr)."
@@ -4168,20 +4170,20 @@ def generate_tranche_pdf(
     # Use combined lift per unit (actuals + found) for scaling
     # Skip "How This Scales" for single-property PDFs -- only show for parent company reports
     _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
-    _show_scaling = (n_props_total > 1 and total_portfolio_units and total_portfolio_units > 0 
+    _show_scaling = (n_props_total > 1 and _effective_portfolio_units and _effective_portfolio_units > 0 
                      and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0)
     if _show_scaling:
         pdf.ln(2)
         section_heading("How This Scales", green, min_space=30)
 
-        _proj_monthly = _scale_lift_per_unit * total_portfolio_units
+        _proj_monthly = _scale_lift_per_unit * _effective_portfolio_units
         _proj_annual = _proj_monthly * 12
         _proj_asset_value = _proj_annual / _cap_rate
 
         _lift_source = "combined lift + found" if _leakage_mo > 0 else "lift"
         _scale_text = (
             f"If {label} were to roll PetScreening across their full portfolio of "
-            f"~{total_portfolio_units:,} units, the ${_scale_lift_per_unit:,.2f}/unit/mo {_lift_source} "
+            f"~{_effective_portfolio_units:,} units, the ${_scale_lift_per_unit:,.2f}/unit/mo {_lift_source} "
             f"would translate to approximately ${_proj_annual:,.0f}/yr in additional pet fee revenue. "
             f"Capitalized at a 5% cap rate, that represents ~${_proj_asset_value:,.0f} in added asset value."
         )
@@ -4190,7 +4192,7 @@ def generate_tranche_pdf(
         pdf.ln(1)
         draw_card_row([
             {
-                "value": f"~{total_portfolio_units:,}",
+                "value": f"~{_effective_portfolio_units:,}",
                 "label": "Total Portfolio Units",
                 "sub": "Full portfolio rollout target",
                 "color": dark_blue,
@@ -4198,7 +4200,7 @@ def generate_tranche_pdf(
             {
                 "value": f"${_proj_annual:,.0f}/yr",
                 "label": "Projected Annual Lift",
-                "sub": f"${_scale_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units x 12",
+                "sub": f"${_scale_lift_per_unit:,.2f}/unit/mo x {_effective_portfolio_units:,} units x 12",
                 "color": green,
             },
             {
@@ -4210,7 +4212,7 @@ def generate_tranche_pdf(
         ])
 
         show_work(
-            f"Per-unit {_lift_source}: ${_scale_lift_per_unit:,.2f}/unit/mo x {total_portfolio_units:,} units "
+            f"Per-unit {_lift_source}: ${_scale_lift_per_unit:,.2f}/unit/mo x {_effective_portfolio_units:,} units "
             f"= ${_proj_monthly:,.0f}/mo x 12 = ${_proj_annual:,.0f}/yr / 0.05 = ${_proj_asset_value:,.0f}"
         )
 
@@ -8671,18 +8673,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.markdown("---")
                         st.markdown("**Suspected Undisclosed** — tenants who started screening but abandoned, had unresolved assistance requests, or declared no-pet after starting an assistance profile")
 
-                        # Compute suspected recurring/one-time
-                        s_recurring_mo = 0
-                        s_onetime_total = 0
-                        if _has_suspected:
-                            for _v in _suspected_data.values():
-                                _cnt = _v.get("missing_count", 0)
-                                if _cnt == 0:
-                                    continue
-                                s_recurring_mo += _cnt * _v.get("avg_recurring", 0)
-                                s_onetime_total += _cnt * _v.get("avg_onetime", 0)
+                        # Compute suspected recurring using SAME avg fee as
+                        # confirmed missing rent (tenants x portfolio avg fee).
+                        # This keeps the numbers apples-to-apples and avoids
+                        # suspected showing higher revenue than confirmed.
+                        _confirmed_avg_fee = (c_recurring_mo / c_total) if (_has_confirmed and c_total > 0 and c_recurring_mo > 0) else 0
+                        if _confirmed_avg_fee <= 0:
+                            # Fall back to per-property avg if no confirmed data
+                            _all_s_rec = [_v.get("avg_recurring", 0) for _v in _suspected_data.values() if _v.get("avg_recurring", 0) > 0]
+                            _confirmed_avg_fee = sum(_all_s_rec) / len(_all_s_rec) if _all_s_rec else 0
+                        s_recurring_mo = s_total * _confirmed_avg_fee
+                        s_onetime_total = 0  # One-time fees excluded for suspected
                         s_annual_recurring = s_recurring_mo * 12
-                        s_annual_impact = s_annual_recurring + s_onetime_total
+                        s_annual_impact = s_annual_recurring
 
                         sc1, sc2, sc3 = st.columns(3)
                         sc1.metric(
@@ -8693,7 +8696,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         sc2.metric(
                             "Potential Pet Rent",
                             f"${s_recurring_mo:,.0f}/mo",
-                            help="Estimated recurring pet rent if these tenants were confirmed and charged.",
+                            help=f"{s_total:,} tenants x ${_confirmed_avg_fee:,.0f}/mo avg fee = ${s_recurring_mo:,.0f}/mo (same avg fee as confirmed missing rent).",
                         )
                         sc3.metric(
                             "Potential Annual Impact",
@@ -9467,18 +9470,29 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         v["monthly_missing"].get(_latest_month, 0) for v in _su_data.values()
                     ) if _latest_month else 0
 
-                # Recalculate suspected undisclosed revenue using the SAME simple
-                # formula as missing pet rent (tenants x portfolio avg recurring fee).
-                # The raw monthly_missing sum can include one-time deposits added to
-                # the first active month, which inflates the headline. Keep it apples
-                # to apples with the displayed missing rent figure.
-                if _mr_data and _mr_total_profiles > 0 and _mr_current_mo > 0:
-                    _avg_fee = _mr_current_mo / _mr_total_profiles
+                # Recalculate suspected undisclosed revenue using the SAME
+                # avg RECURRING fee as confirmed missing rent. The raw
+                # monthly_missing sums include one-time deposits in the first
+                # active month, inflating the headline. We compute:
+                #   avg_fee = sum(count * avg_recurring) / total_profiles
+                # This matches the "$28/mo" shown in the Missing Rent tab.
+                if _mr_data and _mr_total_profiles > 0:
+                    _mr_recurring_only = sum(
+                        v.get("missing_count", 0) * v.get("avg_recurring", 0)
+                        for v in _mr_data.values()
+                    )
+                    _avg_fee = _mr_recurring_only / _mr_total_profiles if _mr_total_profiles > 0 else 0
                 else:
                     _all_avg_rec = [v.get("avg_recurring", 0) for v in (_su_data or {}).values() if v.get("avg_recurring", 0) > 0]
                     _avg_fee = sum(_all_avg_rec) / len(_all_avg_rec) if _all_avg_rec else 0
                 if _su_total_profiles > 0 and _avg_fee > 0:
                     _su_current_mo = _su_total_profiles * _avg_fee
+                # Also recalculate _mr_current_mo to use pure recurring (no one-time)
+                if _mr_data and _mr_total_profiles > 0:
+                    _mr_current_mo = sum(
+                        v.get("missing_count", 0) * v.get("avg_recurring", 0)
+                        for v in _mr_data.values()
+                    )
 
                 # ═══════════════════════════════════════════════════════════════
                 #  TRANCHE-BASED IMPACT SUMMARY
