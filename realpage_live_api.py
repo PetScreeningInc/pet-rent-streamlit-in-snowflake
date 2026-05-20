@@ -32,7 +32,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -294,14 +294,14 @@ def _parse_charges_response(xml_text: str, post_month: str) -> List[Dict[str, An
         rows.append({
             "resh_id":           d.get("ReshID", "") or "",
             "unit_id":           d.get("UnitID", "") or "",
-            "lease_id":          d.get("LeaseID", "") or "",
+            "lease_id":          d.get("LeaID", "") or d.get("LeaseID", "") or "",
             "category_code":     d.get("CatCode", "") or "",
             "transaction_name":  d.get("TranName", "") or "",
             "description":       d.get("TransDesc", "") or "",
-            "amount":            d.get("Amount", "") or "",
+            "amount":            d.get("TransAmt", "") or d.get("Amount", "") or "",
             "bill_start":        d.get("BillStart", "") or "",
             "bill_end":          d.get("BillEnd", "") or "",
-            "sub_journal":       d.get("SubJournal", "") or "",
+            "sub_journal":       d.get("SubJournal", "") or d.get("Grouptorent", "") or "",
             "post_month":        d.get("PostMonth", "") or post_month,
         })
     return rows
@@ -501,6 +501,7 @@ def _join_and_emit(
     post_month_date: date,
     today: date,
     junk_emails: set,
+    lookback_start: Optional[date] = None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int]:
     """Replicate the SQL join logic and return:
         (rows, resh_match_count, lease_match_count, no_match_count).
@@ -568,7 +569,14 @@ def _join_and_emit(
     lease_matches = 0
     no_matches = 0
 
-    charge_from_str = post_month_date.strftime("%Y-%m-%d")
+    # Determine the earliest month to emit rows for.  The API always
+    # returns the *current* charge snapshot (postmonth is ignored), but
+    # each charge carries BillStart/BillEnd which tells us how far back
+    # the charge existed.  We expand each charge into one row per month
+    # from max(bill_start, lookback_start) to min(bill_end, move_out, today)
+    # so the downstream spreading logic sees realistic monthly history.
+    if lookback_start is None:
+        lookback_start = date(2025, 1, 1)
 
     for c in charges:
         resh_id = (c.get("resh_id") or "").strip()
@@ -583,11 +591,11 @@ def _join_and_emit(
         else:
             match_type = "no_match"
 
-        def _coalesce(field: str) -> Any:
-            if direct is not None and direct.get(field):
-                return direct.get(field)
-            if lease_r is not None and lease_r.get(field):
-                return lease_r.get(field)
+        def _coalesce(field: str, _d=direct, _l=lease_r) -> Any:
+            if _d is not None and _d.get(field):
+                return _d.get(field)
+            if _l is not None and _l.get(field):
+                return _l.get(field)
             return ""
 
         first_name = _coalesce("first_name") or ""
@@ -608,64 +616,90 @@ def _join_and_emit(
         if _is_test_name(first_name, last_name):
             continue
 
-        # Drop charges where bill window is entirely after move-out.
+        # Parse date boundaries for this charge.
         bill_start = _parse_date(c.get("bill_start") or "")
         bill_end = _parse_date(c.get("bill_end") or "")
         move_out_date = _parse_date(move_out_raw)
+
+        # Drop charges where bill window is entirely after move-out.
         if (
             move_out_date is not None and bill_start is not None
             and bill_start > move_out_date
         ):
             continue
 
-        # ── charge_to_date = min(bill_end, move_out, today) ──
-        # If bill_end is missing, clip to today/move_out only.
-        candidates = [today]
+        # ── Determine the monthly range to emit rows for ──
+        # Start: first of max(bill_start, lookback_start)
+        if bill_start is not None:
+            emit_start = max(bill_start.replace(day=1), lookback_start)
+        else:
+            emit_start = lookback_start
+
+        # End: min(bill_end, move_out, today), clipped to first-of-month
+        end_candidates = [today]
         if bill_end is not None:
-            candidates.append(bill_end)
+            end_candidates.append(bill_end)
         if move_out_date is not None:
-            candidates.append(move_out_date)
-        charge_to = min(candidates)
-        # Don't let charge_to fall before the first of the current month.
-        if charge_to < post_month_date:
-            charge_to = post_month_date
+            end_candidates.append(move_out_date)
+        emit_end = min(end_candidates)
+
+        # Skip if the charge ended before our lookback window.
+        if emit_end < lookback_start:
+            continue
 
         tenant_status = TENANT_STATUS_MAP.get(lease_status, lease_status or "")
 
-        rows.append({
-            "parent_company":   parent_company,
-            "property_id":      property_id,
-            "property_name":    property_name,
-            "property_code":    property_code,
-            "launch_date":      launch_date,
-            "unit_code":        str(unit_number),
-            "unit_type":        "",
-            "market_rent":      "",
-            "lease_id":         str(lease_id),
-            "tenant_code":      str(lease_id),
-            "first_name":       str(first_name),
-            "last_name":        str(last_name),
-            "tenant_status":    tenant_status,
-            "lease_from":       "",
-            "lease_to":         "",
-            "move_in":          "",
-            "move_out":         (
-                move_out_date.strftime("%Y-%m-%d") if move_out_date else ""
-            ),
-            "email":            email,
-            "charge_code":      c.get("transaction_name") or "",
-            "charge_type":      c.get("description") or "",
-            "charge_amount":    str(c.get("amount") or ""),
-            "charge_from_date": charge_from_str,
-            "charge_to_date":   charge_to.strftime("%Y-%m-%d"),
-        })
+        # Generate one row per month the charge was active.
+        month_cursor = emit_start.replace(day=1)
+        emitted_any = False
+        while month_cursor <= emit_end:
+            # charge_from = first of this month
+            charge_from = month_cursor
+            # charge_to = last day of month, clipped to emit_end
+            if month_cursor.month == 12:
+                next_month = month_cursor.replace(year=month_cursor.year + 1, month=1)
+            else:
+                next_month = month_cursor.replace(month=month_cursor.month + 1)
+            last_day = next_month - timedelta(days=1)
+            charge_to = min(last_day, emit_end)
 
-        if match_type == "resh_id":
-            resh_matches += 1
-        elif match_type == "lease_id":
-            lease_matches += 1
-        else:
-            no_matches += 1
+            rows.append({
+                "parent_company":   parent_company,
+                "property_id":      property_id,
+                "property_name":    property_name,
+                "property_code":    property_code,
+                "launch_date":      launch_date,
+                "unit_code":        str(unit_number),
+                "unit_type":        "",
+                "market_rent":      "",
+                "lease_id":         str(lease_id),
+                "tenant_code":      str(lease_id),
+                "first_name":       str(first_name),
+                "last_name":        str(last_name),
+                "tenant_status":    tenant_status,
+                "lease_from":       "",
+                "lease_to":         "",
+                "move_in":          "",
+                "move_out":         (
+                    move_out_date.strftime("%Y-%m-%d") if move_out_date else ""
+                ),
+                "email":            email,
+                "charge_code":      c.get("transaction_name") or "",
+                "charge_type":      c.get("description") or "",
+                "charge_amount":    str(c.get("amount") or ""),
+                "charge_from_date": charge_from.strftime("%Y-%m-%d"),
+                "charge_to_date":   charge_to.strftime("%Y-%m-%d"),
+            })
+            emitted_any = True
+            month_cursor = next_month
+
+        if emitted_any:
+            if match_type == "resh_id":
+                resh_matches += 1
+            elif match_type == "lease_id":
+                lease_matches += 1
+            else:
+                no_matches += 1
 
     return rows, resh_matches, lease_matches, no_matches
 
@@ -715,12 +749,20 @@ def fetch_realpage_live(
     post_month_date = today.replace(day=1)
     post_month_str = post_month_date.strftime("%Y-%m")
 
+    # Lookback: expand charges from Jan 2025 (or further if lookback_months
+    # requests it) through today using each charge's BillStart/BillEnd.
+    lookback_start = date(2025, 1, 1)
+    months_back_date = (today - timedelta(days=lookback_months * 30)).replace(day=1)
+    if months_back_date < lookback_start:
+        lookback_start = months_back_date
+
     total = len(properties)
     try:
         progress_bar.progress(0.02)
         status_text.text(
             f"Live RealPage API: fetching {total} property"
-            f"{'ies' if total != 1 else 'y'} (current month {post_month_str})..."
+            f"{'ies' if total != 1 else 'y'} "
+            f"(expanding history from {lookback_start.strftime('%b %Y')})..."
         )
     except Exception:  # noqa: BLE001
         pass
@@ -782,6 +824,7 @@ def fetch_realpage_live(
 
             rows, resh_m, lease_m, no_m = _join_and_emit(
                 prop, fetched, post_month_date, today, junk,
+                lookback_start=lookback_start,
             )
             all_charges.extend(rows)
 
