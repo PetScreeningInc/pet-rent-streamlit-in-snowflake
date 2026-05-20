@@ -7304,6 +7304,21 @@ with st.sidebar:
             reverse=True,
         )
 
+    # RealPage-only: optionally bypass Snowflake staging and call the OneSite
+    # SOAP API directly. Slower, but gives real-time data instead of whatever
+    # the nightly Airbyte sync last landed.
+    if _is_realpage:
+        st.toggle(
+            "\U0001F534 Use Live RealPage API (slower, bypasses Snowflake)",
+            key="realpage_use_live_api",
+            help=(
+                "Calls the OneSite SOAP API directly instead of reading from "
+                "Snowflake staging tables. Much slower for many properties "
+                "(2-4 SOAP calls per property) but gives real-time data. "
+                "Only the current-month snapshot is returned \u2014 no historical backfill."
+            ),
+        )
+
     fetch_btn = st.button(f"Fetch {_system_label} Data", type="primary", use_container_width=True)
 
     if _saved_files:
@@ -7485,7 +7500,14 @@ if fetch_btn:
             if _pmc_system == "entrata":
                 all_charges, fetch_log, ar_charges, raw_lease_arrays = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
             elif _pmc_system == "real_page":
-                all_charges, fetch_log = fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months)
+                if st.session_state.get("realpage_use_live_api"):
+                    from realpage_live_api import fetch_realpage_live
+                    all_charges, fetch_log = fetch_realpage_live(
+                        properties, progress_bar, status_text, lookback_months,
+                        junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
+                    )
+                else:
+                    all_charges, fetch_log = fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months)
                 ar_charges = []
                 raw_lease_arrays = []
             else:
