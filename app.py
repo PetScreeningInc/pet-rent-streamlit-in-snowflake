@@ -3413,6 +3413,7 @@ def generate_tranche_pdf(
     monthly_by_prop=None,
     latest_month=None,
     selected_charge_codes=None,
+    avg_pet_fee=0,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -3895,6 +3896,17 @@ def generate_tranche_pdf(
             f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
             f"across {n_props_with_data} properties."
         )
+    # Add opportunity context (missing rent + suspected) -- emphasize this is
+    # across the entire portfolio, not just the comparable subset analyzed above.
+    _glance_leakage_mo = (_opp_recurring_mo or 0) + (su_current_mo or 0)
+    _glance_leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
+    if _glance_leakage_mo > 0 and _glance_leakage_tenants > 0:
+        _glance_parts.append(
+            f" Across the entire portfolio, {_glance_leakage_tenants:,} residents are not paying pet "
+            f"fees today -- a combined ~${_glance_leakage_mo:,.0f}/mo opportunity (confirmed missing "
+            f"rent + suspected undisclosed pets)."
+        )
+
     narrative("".join(_glance_parts))
 
     pdf.ln(1)
@@ -4107,16 +4119,47 @@ def generate_tranche_pdf(
     # ── Portfolio extrapolation callout (if non-comparable properties exist) ──
     if _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
         pdf.ln(2)
-        _extrapolated_noncomp_lift = _lift_per_unit * _noncomp_units
-        _total_portfolio_lift = _active_lift + _extrapolated_noncomp_lift
-        pdf.set_font('Helvetica', '', 8.5)
-        pdf.set_text_color(*body_gray)
-        pdf.multi_cell(USABLE_W, 4,
-            f"Note: {_noncomp_count} properties ({_noncomp_units:,} units) are excluded from the "
-            f"lift analysis because they launched PetScreening too recently to have pre-launch "
-            f"charge data for comparison. Applying the same ${_lift_per_unit:,.2f}/unit/mo lift "
-            f"to those units, the estimated total portfolio lift would be ~${_total_portfolio_lift:,.0f}/mo."
+        # Use the combined per-unit (actuals lift + found) so the zinger reflects
+        # the same number we surface in the Total Opportunity row when possible.
+        _zinger_per_unit = _cumulative_lift_per_unit if (_leakage_mo > 0 and _cumulative_lift_per_unit > 0) else _lift_per_unit
+        _extrapolated_noncomp_lift = _zinger_per_unit * _noncomp_units
+        _total_portfolio_lift = (_active_lift + (_leakage_mo or 0)) + _extrapolated_noncomp_lift
+        _total_portfolio_lift_annual = _total_portfolio_lift * 12
+
+        # Prominent multi-line callout (matches callout_box visual style but
+        # supports wrapped narrative text + a colored total number).
+        _cb_x = PAGE_L + 4
+        _cb_w = USABLE_W - 8
+        _cb_start_y = pdf.get_y()
+        _cb_text = (
+            f"Applying the combined ${_zinger_per_unit:,.2f}/unit/mo across ALL "
+            f"{total_portfolio_units:,} units in {label}'s portfolio -- including "
+            f"{_noncomp_count} properties ({_noncomp_units:,} units) without pre-launch "
+            f"data -- the estimated total portfolio impact would be "
+            f"~${_total_portfolio_lift:,.0f}/mo (${_total_portfolio_lift_annual:,.0f}/yr)."
         )
+        # Measure required height
+        pdf.set_font('Helvetica', 'B', 9.5)
+        _cb_line_h = 5
+        _cb_pad = 3
+        _cb_lines = pdf.multi_cell(_cb_w - 8, _cb_line_h, _cb_text, split_only=True) if hasattr(pdf, 'multi_cell') else [_cb_text]
+        try:
+            _cb_line_count = max(1, len(_cb_lines))
+        except Exception:
+            _cb_line_count = 3
+        _cb_h = _cb_line_count * _cb_line_h + _cb_pad * 2
+        # Background + left accent bar
+        pdf.set_fill_color(245, 250, 240)
+        pdf.set_draw_color(*green)
+        pdf.rect(_cb_x, _cb_start_y, _cb_w, _cb_h, 'F')
+        pdf.set_fill_color(*green)
+        pdf.rect(_cb_x, _cb_start_y, 2.5, _cb_h, 'F')
+        # Text body in green-tinted dark color
+        pdf.set_xy(_cb_x + 6, _cb_start_y + _cb_pad)
+        pdf.set_text_color(*green)
+        pdf.set_font('Helvetica', 'B', 9.5)
+        pdf.multi_cell(_cb_w - 8, _cb_line_h, _cb_text)
+        pdf.set_y(_cb_start_y + _cb_h + 2)
         pdf.ln(1)
 
     # ═══════════════════════════════════════════════════════════
@@ -4384,17 +4427,32 @@ def generate_tranche_pdf(
                 f"Unrealized Property Value: ${_opp_value_impact:,.0f}  (${_opp_annual_impact:,.0f}/yr at 5% cap rate)"
             )
         if su_total_profiles and su_total_profiles > 0:
-            narrative(
-                f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
-                f"(abandoned screening, unresolved requests), representing an estimated "
-                f"${su_current_mo:,.0f}/mo in potential additional revenue."
-            )
+            if avg_pet_fee and avg_pet_fee > 0:
+                narrative(
+                    f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
+                    f"(abandoned screening, unresolved requests). Using the same ${avg_pet_fee:,.0f}/mo "
+                    f"avg fee, that represents ~${su_current_mo:,.0f}/mo in potential additional revenue."
+                )
+            else:
+                narrative(
+                    f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
+                    f"(abandoned screening, unresolved requests), representing an estimated "
+                    f"${su_current_mo:,.0f}/mo in potential additional revenue."
+                )
     elif su_total_profiles and su_total_profiles > 0:
-        narrative(
-            f"No confirmed tenants are missing pet rent charges. However, "
-            f"{su_total_profiles:,} tenants show signals of undisclosed pets, representing "
-            f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
-        )
+        if avg_pet_fee and avg_pet_fee > 0:
+            narrative(
+                f"No confirmed tenants are missing pet rent charges. However, "
+                f"{su_total_profiles:,} tenants show signals of undisclosed pets. Using the same "
+                f"${avg_pet_fee:,.0f}/mo avg fee, that represents ~${su_current_mo:,.0f}/mo in "
+                f"potential additional revenue."
+            )
+        else:
+            narrative(
+                f"No confirmed tenants are missing pet rent charges. However, "
+                f"{su_total_profiles:,} tenants show signals of undisclosed pets, representing "
+                f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
+            )
     else:
         _opportunity_note = (
             "All screened tenants are currently being charged pet rent -- no billing gaps identified."
@@ -4500,7 +4558,7 @@ def generate_tranche_pdf(
     metrics = []
     # Revenue metric label/value based on toggle
     _km_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else current_monthly_rev
-    _km_rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Monthly Pet-Related Revenue"
+    _km_rev_label = "Post-PS Avg Pet Revenue (comparable)" if use_avg_lift else "Current Monthly Pet-Related Revenue (total portfolio)"
     metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo", None))
     metrics.append((_km_rev_label, f"${_km_rev:,.0f}/mo", None))
     if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
@@ -8270,9 +8328,9 @@ if st.session_state.all_charges_df is not None:
 
                     _total_props = len(st.session_state.get("property_ids", []))
                     lcol3.metric(
-                        "Launch Dates",
-                        f"{n_with_launch} of {_total_props} properties",
-                        help=launch_detail,
+                        "Comparable Properties",
+                        f"{n_comparable} of {_total_props}",
+                        help=f"{n_comparable} properties with pre & post data (used for lift calculation).\n{launch_detail}",
                     )
 
                     caption_parts = [f"**{n_comparable}** properties have pre & post data for comparison."]
@@ -9409,6 +9467,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         v["monthly_missing"].get(_latest_month, 0) for v in _su_data.values()
                     ) if _latest_month else 0
 
+                # Recalculate suspected undisclosed revenue using the SAME simple
+                # formula as missing pet rent (tenants x portfolio avg recurring fee).
+                # The raw monthly_missing sum can include one-time deposits added to
+                # the first active month, which inflates the headline. Keep it apples
+                # to apples with the displayed missing rent figure.
+                if _mr_data and _mr_total_profiles > 0 and _mr_current_mo > 0:
+                    _avg_fee = _mr_current_mo / _mr_total_profiles
+                else:
+                    _all_avg_rec = [v.get("avg_recurring", 0) for v in (_su_data or {}).values() if v.get("avg_recurring", 0) > 0]
+                    _avg_fee = sum(_all_avg_rec) / len(_all_avg_rec) if _all_avg_rec else 0
+                if _su_total_profiles > 0 and _avg_fee > 0:
+                    _su_current_mo = _su_total_profiles * _avg_fee
+
                 # ═══════════════════════════════════════════════════════════════
                 #  TRANCHE-BASED IMPACT SUMMARY
                 # ═══════════════════════════════════════════════════════════════
@@ -10307,6 +10378,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             monthly_by_prop=_monthly_by_prop,
                             latest_month=_latest_month,
                             selected_charge_codes=selected_codes,
+                            avg_pet_fee=_avg_fee,
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
