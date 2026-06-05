@@ -546,12 +546,18 @@ def _join_and_emit(
         dedup[key] = r
     residents = list(dedup.values())
 
-    # ── direct_resident map: resident_member_id -> resident ──
-    direct_by_resh: Dict[str, Dict[str, Any]] = {}
+    # ── direct_resident map: (lease_id, resident_member_id) -> resident ──
+    # RealPage ReshID/resident_member_id values are not globally unique within a
+    # site.  Joining only on resident_member_id can misattribute a charge to a
+    # resident from an unrelated lease/unit, which then makes the missing-pet-rent
+    # report miss the actual paying lease.  Require the lease to line up; if it
+    # does not, fall back to the lease-level representative below.
+    direct_by_lease_resh: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for r in residents:
+        lid = (r.get("lease_id") or "").strip()
         rid = (r.get("resident_member_id") or "").strip()
-        if rid:
-            direct_by_resh[rid] = r
+        if lid and rid:
+            direct_by_lease_resh[(lid, rid)] = r
 
     # ── lease_resident_pick: pick one resident per lease_id ──
     by_lease: Dict[str, List[Dict[str, Any]]] = {}
@@ -581,7 +587,7 @@ def _join_and_emit(
     for c in charges:
         resh_id = (c.get("resh_id") or "").strip()
         lease_id = (c.get("lease_id") or "").strip()
-        direct = direct_by_resh.get(resh_id) if resh_id else None
+        direct = direct_by_lease_resh.get((lease_id, resh_id)) if resh_id and lease_id else None
         lease_r = lease_pick.get(lease_id) if lease_id else None
 
         if direct is not None:
@@ -635,8 +641,20 @@ def _join_and_emit(
         else:
             emit_start = lookback_start
 
-        # End: min(bill_end, move_out, today), clipped to first-of-month
-        end_candidates = [today]
+        # End: normally clip to today for current/past scheduled charges.
+        # If the API returns a future scheduled pet-rent charge (e.g. a July
+        # PETRENT setup returned in June), emit one future-month row so the
+        # missing-rent report treats the tenant/lease as covered while revenue
+        # charts still only count it if the user selects that future month.
+        if bill_start is not None and bill_start > today:
+            future_month = bill_start.replace(day=1)
+            if future_month.month == 12:
+                next_future_month = future_month.replace(year=future_month.year + 1, month=1)
+            else:
+                next_future_month = future_month.replace(month=future_month.month + 1)
+            end_candidates = [next_future_month - timedelta(days=1)]
+        else:
+            end_candidates = [today]
         if bill_end is not None:
             end_candidates.append(bill_end)
         if move_out_date is not None:

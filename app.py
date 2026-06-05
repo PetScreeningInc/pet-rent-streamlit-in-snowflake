@@ -1666,13 +1666,15 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
                 COALESCE(r.first_name, '')
         ) = 1
     ),
-    -- Also pick a direct resident match by (pmc, site, resh_id) when it
-    -- exists. Prefer that over the lease pick when both are populated
-    -- (gives more accurate per-resident attribution for charges that
-    -- DO carry a valid ReshID).
+    -- Also pick a direct resident match by (pmc, site, lease_id, resh_id) when it
+    -- exists.  RealPage resident_member_id/ReshID values are not globally unique
+    -- within a site; joining only on resident_member_id can attribute a pet
+    -- charge to an unrelated historical resident and prevent the actual lease
+    -- from being recognized as paying.  If the lease does not line up, the join
+    -- intentionally misses and the lease-level fallback below is used.
     direct_resident AS (
         SELECT
-            r.pmc_id, r.site_id, r.resident_member_id,
+            r.pmc_id, r.site_id, r.lease_id, r.resident_member_id,
             r.first_name, r.last_name, r.email,
             r.lease_status, r.move_out_date, r.unit_number
         FROM all_residents r
@@ -1695,6 +1697,7 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
         LEFT JOIN direct_resident dr
             ON dr.pmc_id = c.pmc_id
            AND dr.site_id = c.site_id
+           AND dr.lease_id = c.lease_id
            AND dr.resident_member_id = c.resh_id
         LEFT JOIN lease_resident_pick lp
             ON lp.pmc_id = c.pmc_id
