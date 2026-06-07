@@ -143,6 +143,10 @@ def test_summary_tab_uses_at_a_glance_cards_instead_of_old_three_section_layout(
     assert "Tenants Not Paying" in summary_source
     assert "Suspected Undisclosed" in summary_source
     assert "Average {_adopt_type_label} Adoption" in summary_source
+    assert "n_props_with_data" in summary_source
+    assert "_total_units" in summary_source
+    assert "properties with charge data" in summary_source
+    assert "units represented" in summary_source
 
     at_a_glance_source = summary_source[summary_source.index("#  SUMMARY AT A GLANCE"):]
     assert "SECTION 1: VALUE CREATED" not in at_a_glance_source

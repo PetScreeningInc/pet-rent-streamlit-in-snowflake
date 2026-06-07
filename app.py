@@ -9909,6 +9909,16 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _render_summary_card_row(_context_row, row_label="Portfolio Health", row_label_color=_dark_blue)
 
                 _summary_parts = []
+                if n_props_with_data > 0:
+                    if _total_units > 0:
+                        _summary_parts.append(
+                            f'Data pulled for <strong>{n_props_with_data:,} properties with charge data</strong>, '
+                            f'with <strong>{_total_units:,} units represented</strong>. '
+                        )
+                    else:
+                        _summary_parts.append(
+                            f'Data pulled for <strong>{n_props_with_data:,} properties with charge data</strong>. '
+                        )
                 if _headline_pre > 0:
                     _summary_parts.append(
                         f'Pre-PS baseline was <strong>${_headline_pre:,.0f}/mo</strong> across {len(_comparable)} comparable properties. '
