@@ -2311,6 +2311,19 @@ def _resolve_launch_dt(launch):
     return None
 
 
+def _property_monthly_lift_for_display(prop_data, months, analysis):
+    """Return one property's default Monthly Lift: latest revenue minus pre-PS baseline.
+
+    The portfolio headline uses current/latest month revenue minus the pre-PS
+    baseline. Individual property trend badges should use the same methodology
+    property-by-property, not the post-launch average stored in diff_monthly.
+    """
+    if not prop_data or not months or not analysis:
+        return 0
+    latest_month = months[-1]
+    return prop_data.get(latest_month, 0) - analysis.get("pre_avg", 0)
+
+
 def build_individual_property_charts(
     monthly_by_prop, months, launch_dates, title_prefix,
     launch_analysis=None,
@@ -2385,12 +2398,13 @@ def build_individual_property_charts(
                 # rule AND the data-history-after-launch guard, so we don't
                 # need to recompute the threshold here.
                 if a.get("baseline_meaningful", True):
-                    sign = "+" if a["diff_monthly"] >= 0 else ""
-                    color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
-                    arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
+                    display_lift = _property_monthly_lift_for_display(monthly_by_prop.get(p, {}), months, a)
+                    sign = "+" if display_lift >= 0 else ""
+                    color = "#677848" if display_lift >= 0 else "#CF5A3F"
+                    arrow = "↑" if display_lift >= 0 else "↓"
                     short += (
                         f'  <b><span style="color:{color}">'
-                        f'{arrow} {sign}{_fmt_dollar(a["diff_monthly"])}/mo'
+                        f'{arrow} {sign}{_fmt_dollar(display_lift)}/mo'
                         f'</span></b>'
                     )
                 elif a.get("data_starts_after_launch", False):
@@ -10451,6 +10465,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             file_name=f"PetScreening_Value_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
                             mime="application/pdf",
                             use_container_width=True,
+                            type="primary",
                             key="dl_exec_pdf",
                             help="Full report with At a Glance, trends, appendix",
                         )
@@ -10470,6 +10485,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             file_name=f"PetScreening_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
                             mime="application/pdf",
                             use_container_width=True,
+                            type="primary",
                             key="dl_orig_pdf",
                             help="Standard report without enhanced sections",
                         )
@@ -10487,6 +10503,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             file_name=f"PetScreening_Value_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.html",
                             mime="text/html",
                             use_container_width=True,
+                            type="primary",
                             key="dl_exec_html",
                         )
                     else:
