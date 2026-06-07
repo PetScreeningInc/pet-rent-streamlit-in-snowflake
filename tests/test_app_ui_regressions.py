@@ -5,14 +5,42 @@ from pathlib import Path
 APP_SOURCE = Path("app.py").read_text()
 
 
+class _PandasStub:
+    @staticmethod
+    def isna(value):
+        return value is None
+
+
 def _load_app_function(name):
     module = ast.parse(APP_SOURCE)
     for node in module.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
-            namespace = {"datetime": datetime}
+            namespace = {"datetime": datetime, "pd": _PandasStub}
             exec(compile(ast.Module(body=[node], type_ignores=[]), "app.py", "exec"), namespace)
             return namespace[name]
     raise AssertionError(f"{name} not found in app.py")
+
+
+def test_compute_launch_analysis_uses_observed_pre_months_not_missing_calendar_zeroes():
+    """Sparse history should not dilute one real pre-PS bar into a fake 6-month average."""
+    compute = _load_app_function("compute_launch_analysis")
+    months = [
+        datetime(2026, 1, 1),
+        datetime(2026, 2, 1),
+        datetime(2026, 3, 1),
+        datetime(2026, 4, 1),
+        datetime(2026, 5, 1),
+        datetime(2026, 6, 1),  # only observed pre-PS month
+        datetime(2026, 7, 1),  # launch/current month
+    ]
+    monthly_by_prop = {"Joinery": {months[5]: 50, months[6]: 50}}
+    launch_dates = {"Joinery": datetime(2026, 7, 1)}
+
+    analysis = compute(monthly_by_prop, months, launch_dates)["Joinery"]
+
+    assert analysis["pre_avg"] == 50
+    assert analysis["n_pre"] == 1
+    assert analysis["baseline_month_label"] == "1 observed pre month"
 
 
 def test_property_monthly_lift_for_display_uses_latest_month_minus_pre_baseline():
@@ -38,7 +66,15 @@ def test_property_monthly_lift_for_display_uses_latest_month_minus_pre_baseline(
     assert calc(prop_data, months, analysis) == -50
 
 
-def test_individual_chart_subtitle_uses_property_display_lift_helper():
+def test_property_monthly_lift_is_zero_when_only_real_pre_bar_matches_latest_month():
+    calc = _load_app_function("_property_monthly_lift_for_display")
+    months = [datetime(2026, 6, 1), datetime(2026, 7, 1)]
+    prop_data = {months[0]: 50, months[1]: 50}
+
+    assert calc(prop_data, months, {"pre_avg": 50}) == 0
+
+
+def test_individual_chart_subtitle_uses_property_display_lift_helper_even_with_sparse_baseline():
     helper_idx = APP_SOURCE.index("_property_monthly_lift_for_display")
     chart_idx = APP_SOURCE.index("def build_individual_property_charts")
     chart_source = APP_SOURCE[chart_idx: APP_SOURCE.index("def generate_html_report", chart_idx)]
@@ -46,13 +82,29 @@ def test_individual_chart_subtitle_uses_property_display_lift_helper():
     assert helper_idx < chart_idx
     assert "_property_monthly_lift_for_display(" in chart_source
     assert 'a["diff_monthly"]' not in chart_source
+    assert 'a.get("baseline_meaningful", True)' in chart_source
+    assert 'and a.get("baseline_reliable", True)' not in chart_source
+    assert 'baseline_month_label' in chart_source
 
 
-def test_report_download_buttons_are_primary_when_generated():
-    """All generated report downloads should use the same highlighted/ready style."""
+def test_summary_downloads_only_include_enhanced_pdf_and_html():
+    """The Summary section should not offer the old duplicate Original PDF download."""
+    summary_start = APP_SOURCE.index("# ─── TAB 2: Summary")
+    summary_end = APP_SOURCE.index("# ─── TAB 3: Missing Pet Rent Report", summary_start)
+    summary_source = APP_SOURCE[summary_start:summary_end]
+
+    assert 'label="Enhanced PDF"' in summary_source
+    assert 'key="dl_exec_pdf"' in summary_source
+    assert 'label="Download HTML"' in summary_source
+    assert 'key="dl_exec_html"' in summary_source
+    assert "Original PDF" not in summary_source
+    assert "dl_orig_pdf" not in summary_source
+
+
+def test_generated_report_download_buttons_are_primary_when_generated():
+    """Generated report downloads should use the same highlighted/ready style."""
     for label, key in (
         ("Enhanced PDF", "dl_exec_pdf"),
-        ("Original PDF", "dl_orig_pdf"),
         ("Download HTML", "dl_exec_html"),
     ):
         key_pos = APP_SOURCE.index(f'key="{key}"')
@@ -60,3 +112,13 @@ def test_report_download_buttons_are_primary_when_generated():
         button_block = APP_SOURCE[button_start:key_pos]
         assert f'label="{label}"' in button_block, label
         assert 'type="primary"' in button_block, label
+
+
+def test_documentation_explains_current_baseline_and_monthly_lift_methodology():
+    docs_idx = APP_SOURCE.index("**Launch Date Handling — Charts & Impact Calculation**")
+    docs_source = APP_SOURCE[docs_idx:APP_SOURCE.index("# ══════════════════════════════════════════════════════════", docs_idx)]
+
+    assert "observed pre-launch months" in docs_source
+    assert "Latest/current-month lift" in docs_source
+    assert "missing months are not averaged as $0" in docs_source
+    assert "Post-launch current lift" not in docs_source

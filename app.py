@@ -1550,8 +1550,10 @@ def fetch_realpage_for_properties(properties, progress_bar, status_text, lookbac
 
     Single SQL roundtrip. The join logic mirrors the canonical pattern from
     the standardized pet-signals SQL (see realpage-query-analysis.md):
-    direct match on (pmc_id, site_id, resident_member_id), with HOH-priority
-    fallback to any resident on the same lease when direct match misses.
+    direct match on (pmc_id, site_id, lease_id, resident_member_id), with
+    HOH-priority fallback to any resident on the same lease when direct match
+    misses. Lease_id is required because RealPage resident_member_id values are
+    not unique enough by themselves within a site.
 
     The lookback_months argument is kept for interface compat but does not
     constrain the data — BillStart/BillEnd carry the full charge lifespan
@@ -2027,11 +2029,22 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
 
         post_total = sum(prop_data.get(m, 0) for m in post_months)
 
-        # Pre-launch avg: use up to 6 months before launch (whatever is available)
-        # This gives a robust "business as usual" baseline that smooths seasonal noise
+        # Pre-launch avg: use up to 6 OBSERVED months before launch.
+        # Important: `months` is the display calendar, not proof that a property
+        # has charge data for every month. Treating missing dict keys as $0 would
+        # fabricate a fake baseline (e.g. one real $50 pre-PS bar across a 6-month
+        # window becomes $8/mo). Only average months that are actually present in
+        # the property's revenue series; explicit zero values still count if the
+        # data source emitted them.
         pre_baseline_months = pre_months[-6:] if len(pre_months) >= 1 else pre_months
-        pre_values = [prop_data.get(m, 0) for m in pre_baseline_months]
+        pre_values = [prop_data[m] for m in pre_baseline_months if m in prop_data]
+        n_observed_pre = len(pre_values)
         pre_avg = sum(pre_values) / len(pre_values) if pre_values else 0
+        baseline_month_label = (
+            f"{n_observed_pre} observed pre month"
+            if n_observed_pre == 1
+            else f"{n_observed_pre} observed pre months"
+        )
 
         # Post-launch: all-time average (kept for charts and backward compat)
         post_monthly_avg = post_total / n_post if n_post > 0 else 0
@@ -2090,10 +2103,12 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
 
         analysis[prop] = {
             "n_post": n_post,
-            "n_pre": len(pre_baseline_months),
+            "n_pre": n_observed_pre,
+            "n_pre_calendar": len(pre_baseline_months),
+            "baseline_month_label": baseline_month_label,
             "n_recent_post": n_completed_post,
             "all_pre_months": len(pre_months),
-            "baseline_reliable": len(pre_months) >= 3,
+            "baseline_reliable": n_observed_pre >= 3,
             "baseline_meaningful": _baseline_meaningful,
             "data_starts_after_launch": _data_starts_after_launch,
             "first_data_month": first_data_month,
@@ -2392,7 +2407,7 @@ def build_individual_property_charts(
             launch_month = datetime(launch_dt.year, launch_dt.month, 1)
             if launch_month < m0:
                 short += f" Live since {launch_dt.strftime('%b %Y')}"
-            elif a and a["n_pre"] > 0 and a.get("baseline_reliable", True):
+            elif a and a["n_pre"] > 0:
                 # Use the canonical baseline_meaningful flag computed in
                 # compute_launch_analysis. It now incorporates BOTH the 2%
                 # rule AND the data-history-after-launch guard, so we don't
@@ -2413,8 +2428,6 @@ def build_individual_property_charts(
                     short += f'  <span style="color:#999;font-size:0.85em">data starts after launch</span>'
                 else:
                     short += f'  <span style="color:#999;font-size:0.85em">no meaningful pre-PS baseline</span>'
-            elif a and a["n_pre"] > 0 and not a.get("baseline_reliable", True):
-                short += f'  <span style="color:#999;font-size:0.85em">insufficient baseline</span>'
             else:
                 short += f' Launched {launch_dt.strftime("%b %Y")}'
         else:
@@ -2595,18 +2608,22 @@ def build_individual_property_charts(
                 )
 
         # ── Baseline (pre-launch avg) — use row/col so axis refs are correct ──
-        # Only show baseline line if it's meaningful relative to post-launch revenue
-        _post_ref_bl = a.get("post_recent_avg", a.get("post_monthly_avg", 0)) if a else 0
-        _bl_meaningful = a and a["pre_avg"] > 0 and a["n_pre"] > 0 and (
-            _post_ref_bl <= 0 or a["pre_avg"] >= _post_ref_bl * 0.02
+        # Only show the canonical baseline if compute_launch_analysis marked it
+        # meaningful. Do not recompute here; that can bypass source-history guards.
+        _bl_meaningful = (
+            a
+            and a["pre_avg"] > 0
+            and a["n_pre"] > 0
+            and a.get("baseline_meaningful", True)
         )
-        if _bl_meaningful:
+        if _bl_meaningful and a:
             fig.add_hline(
                 y=a["pre_avg"],
                 row=r, col=c,
                 line=dict(color="#E2AB58", width=1.5, dash="dot"),
             )
-            _baseline_label = f"Pre-PS baseline ${a['pre_avg']:,.0f}/mo ({a['n_pre']}mo avg)"
+            _month_label = a.get("baseline_month_label", f"{a['n_pre']} observed pre months")
+            _baseline_label = f"Pre-PS baseline ${a['pre_avg']:,.0f}/mo ({_month_label})"
             if not a.get("baseline_reliable", True):
                 _baseline_label += " -- insufficient data"
             fig.add_annotation(
@@ -10311,7 +10328,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                          "where current-month comparisons distort the story due to seasonality.",
                 )
 
-                _exec_col1, _exec_col2, _exec_col3, _exec_col4 = st.columns(4)
+                _exec_col1, _exec_col2, _exec_col3 = st.columns(3)
 
                 # ── Generate button ──
                 with _exec_col1:
@@ -10473,28 +10490,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         st.button("Enhanced PDF", disabled=True,
                                   use_container_width=True, key="dl_pdf_disabled")
 
-                # ── Original PDF download (same data, no At a Glance/appendix) ──
-                with _exec_col3:
-                    if "exec_pdf" in st.session_state and st.session_state["exec_pdf"]:
-                        # Generate a simpler PDF without the new sections
-                        # For now, link to the HTML which has the original layout
-                        safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
-                        st.download_button(
-                            label="Original PDF",
-                            data=st.session_state["exec_pdf"],
-                            file_name=f"PetScreening_Report_{safe_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                            type="primary",
-                            key="dl_orig_pdf",
-                            help="Standard report without enhanced sections",
-                        )
-                    else:
-                        st.button("Original PDF", disabled=True,
-                                  use_container_width=True, key="dl_orig_pdf_disabled")
-
                 # ── HTML download ──
-                with _exec_col4:
+                with _exec_col3:
                     if "exec_html" in st.session_state and st.session_state["exec_html"]:
                         safe_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
                         st.download_button(
@@ -10912,15 +10909,12 @@ average as fallback if no payers at that property).
 - **Source:** `PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS.PROPERTY_LAUNCH_DATE`
 - **Launch month is counted as post-launch** (green bar). The red line sits at the boundary
   between the last pre-launch month and the launch month.
-- **Pre-launch baseline** = average of up to 6 months before the launch month (uses whatever data is available)
-- **Post-launch current lift** = average of all completed post-launch months (excludes current partial month)
-- **Cumulative impact** = total actual post-launch revenue − (pre_avg × number of post months)
-- **Baseline reliability** (Entrata): if fewer than 3 pre-launch months of charge data
-  are available, the baseline is flagged as unreliable. Charts show "-- insufficient data"
-  and the impact table adds a "(low data)" badge. A warning banner appears if most
-  properties in the portfolio have unreliable baselines.
-- **Properties launched before the lookback window** have no pre-launch data and are excluded
-  from the impact calculation
+- **Pre-launch baseline** = average of up to 6 observed pre-launch months. Only months with actual property revenue records are averaged; missing months are not averaged as $0.
+- **Latest/current-month lift** = latest visible month revenue − pre-launch baseline. This is the default headline and individual-property badge methodology.
+- **Average Monthly Lift toggle** = optional seasonal/student-housing view that uses completed post-launch average lift instead of latest-month lift.
+- **Cumulative impact** = total actual post-launch revenue − (pre_avg × number of post months).
+- **Baseline reliability**: fewer than 3 observed pre-launch months are flagged as low-data, but the baseline still uses the observed months instead of diluting with missing calendar months.
+- **Properties launched before the lookback window** have no pre-launch data in the selected window and are excluded from before/after impact.
                 """)
 
             # ══════════════════════════════════════════════════════════
@@ -11210,11 +11204,12 @@ lease_resident_pick AS (
 )
 ```
 
-**Match priority:** direct `ResHID -> resident_member_id` if it matches,
-else fall back to whichever resident is the head-of-household on the
-same `lease_id`. In a spot-check on Drift at the Forum, all 452 charge
-rows resolved via the lease fallback (0 direct ResHID matches), so the
-fallback is doing the heavy lifting in practice.
+**Match priority:** direct match on the full
+`(pmc_id, site_id, lease_id, resident_member_id)` key when the charge's
+`ResHID` maps to a resident on the same lease. If that does not line up,
+fall back to the representative resident on the same `lease_id`.
+`lease_id` is required in the direct match because RealPage
+`resident_member_id` values are not unique enough by themselves inside a site.
 
 **`tenant_code = lease_id`** for RealPage. The Snowflake side mirrors
 this: `f_leases.lease_source_external_id` for `real_page` is exactly
@@ -11298,9 +11293,11 @@ phantom revenue accruing post-moveout.
 **For Current tenants:** charge_to_date is clipped to today, so we never
 count future months as observed revenue.
 
-**Future / Applicant / Pending residents are dropped entirely** from
-charge emission — they haven't started paying yet, so their charges
-shouldn't count as revenue.
+**Future scheduled charges are preserved carefully.** Applicant/pending
+residents are not counted as current revenue, but if RealPage returns a
+future scheduled `PETRENT` row, the app keeps one future-month row so a
+resident already set up for pet rent does not look missing just because
+billing begins after today.
                 """)
 
             with st.expander("**RealPage — Charge Code Filter (CatCode='C' only)**"):
