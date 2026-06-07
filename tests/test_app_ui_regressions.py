@@ -43,6 +43,30 @@ def test_compute_launch_analysis_uses_observed_pre_months_not_missing_calendar_z
     assert analysis["baseline_month_label"] == "1 observed pre month"
 
 
+def test_low_data_pre_baseline_still_counts_as_comparable_when_meaningful():
+    """A property with 1-2 observed pre months should feed the aggregate, matching its chart badge."""
+    is_comparable = _load_app_function("_launch_analysis_is_comparable")
+
+    assert is_comparable({"n_pre": 2, "baseline_reliable": False, "baseline_meaningful": True}) is True
+    assert is_comparable({"n_pre": 1, "baseline_reliable": False, "baseline_meaningful": True}) is True
+    assert is_comparable({"n_pre": 2, "baseline_reliable": False, "baseline_meaningful": False}) is False
+    assert is_comparable({"n_pre": 0, "baseline_reliable": True, "baseline_meaningful": True}) is False
+
+
+def test_fee_collection_aggregate_uses_same_comparable_rule_as_individual_lift_badges():
+    """Top Fee Collection metrics should not drop low-data properties that show lift in charts."""
+    fc_start = APP_SOURCE.index("# KPI ROW 1: Launch impact metrics")
+    fc_end = APP_SOURCE.index("# ═══════════════════════════════════════════════════════════\n                # KPI ROW 2", fc_start)
+    fc_source = APP_SOURCE[fc_start:fc_end]
+
+    comparable_start = fc_source.index("comparable = {p: a for p, a in launch_analysis.items()")
+    comparable_end = fc_source.index("n_no_pre = len(launch_analysis) - len(comparable)", comparable_start)
+    comparable_source = fc_source[comparable_start:comparable_end]
+
+    assert "_launch_analysis_is_comparable(a)" in comparable_source
+    assert 'a.get("baseline_reliable", True)' not in comparable_source
+
+
 def test_property_monthly_lift_for_display_uses_latest_month_minus_pre_baseline():
     """Property chart lift should match default summary methodology: latest month - pre baseline."""
     calc = _load_app_function("_property_monthly_lift_for_display")

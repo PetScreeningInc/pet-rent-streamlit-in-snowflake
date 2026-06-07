@@ -2513,6 +2513,17 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
     return analysis
 
 
+def _launch_analysis_is_comparable(a):
+    """Return True when a property can contribute to pre/post lift metrics.
+
+    Comparable means we observed at least one real pre-PS revenue month and the
+    baseline is meaningful. A short 1-2 month baseline is still included, but it
+    remains flagged as low-data/insufficient in charts and tables. This keeps the
+    portfolio aggregate aligned with individual property lift badges.
+    """
+    return bool(a and a.get("n_pre", 0) > 0 and a.get("baseline_meaningful", True))
+
+
 # ─── Compliance / adoption data from QBR table ──────────────────────
 @st.cache_data(ttl=600)
 def fetch_compliance_data(property_ids_tuple):
@@ -3118,7 +3129,7 @@ def generate_html_report(
     comparable = {}
     if launch_analysis:
         comparable = {p: a for p, a in launch_analysis.items()
-                      if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
+                      if _launch_analysis_is_comparable(a)}
     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
     _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -3151,7 +3162,7 @@ def generate_html_report(
         sorted_la = sorted(launch_analysis.items(), key=lambda x: -x[1].get("diff_monthly", 0))
         for prop, a in sorted_la:
             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-            if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True):
+            if _launch_analysis_is_comparable(a):
                 s_m = "+" if a["diff_monthly"] >= 0 else ""
                 s_t = "+" if a["diff_total"] >= 0 else ""
                 color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
@@ -8593,7 +8604,7 @@ if st.session_state.all_charges_df is not None:
                 _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
                 _funnel_comparable = {
                     p: a for p, a in launch_analysis.items()
-                    if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
+                    if _launch_analysis_is_comparable(a)
                 } if launch_analysis else {}
                 _render_property_funnel(
                     n_total=st.session_state.get("total_parent_props") or None,
@@ -8722,7 +8733,7 @@ if st.session_state.all_charges_df is not None:
 
                 if launch_analysis:
                     comparable = {p: a for p, a in launch_analysis.items()
-                                  if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
+                                  if _launch_analysis_is_comparable(a)}
                     n_no_pre = len(launch_analysis) - len(comparable)
 
                     # Read toggle state (same as Summary tab)
@@ -9509,8 +9520,10 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         for prop, a in launch_analysis.items():
                             short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                            # Properties need pre-launch months AND reliable+meaningful baseline to compare
-                            has_comparison = a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)
+                            # Properties need observed pre-launch data and a meaningful baseline to compare.
+                            # A 1-2 month baseline is marked as low-data, but still contributes
+                            # so the table matches the top aggregate and individual chart lift badges.
+                            has_comparison = _launch_analysis_is_comparable(a)
 
                             if has_comparison:
                                 sign_m = "+" if a["diff_monthly"] >= 0 else ""
@@ -9831,9 +9844,9 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _launch_dates = _cd.get("launch_dates", {})
                 _launch_analysis = compute_launch_analysis(_monthly_by_prop, _months, _launch_dates)
 
-                # Comparable properties (with reliable pre & post data)
+                # Comparable properties (with observed pre data and meaningful baseline)
                 _comparable = {p: a for p, a in _launch_analysis.items()
-                               if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)} if _launch_analysis else {}
+                               if _launch_analysis_is_comparable(a)} if _launch_analysis else {}
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 

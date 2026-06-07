@@ -174,6 +174,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
     load_realpage_properties_for_selection = app_imports["load_realpage_properties_for_selection"]
     load_appfolio_properties_for_selection = app_imports["load_appfolio_properties_for_selection"]
     compute_launch_analysis = app_imports["compute_launch_analysis"]
+    launch_analysis_is_comparable = app_imports["_launch_analysis_is_comparable"]
     fetch_compliance_data = app_imports["fetch_compliance_data"]
     fetch_missing_pet_rent_by_property = app_imports["fetch_missing_pet_rent_by_property"]
     fetch_suspected_undisclosed_by_property = app_imports["fetch_suspected_undisclosed_by_property"]
@@ -483,7 +484,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         launch_analysis = compute_launch_analysis(monthly_by_prop, months, launch_dates)
         
         comparable = {p: a for p, a in launch_analysis.items()
-                      if a["n_pre"] > 0 and a.get("baseline_reliable", True) and a.get("baseline_meaningful", True)}
+                      if launch_analysis_is_comparable(a)}
         
         # Compute metrics
         pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
@@ -827,6 +828,7 @@ def main():
         load_realpage_properties_for_selection,
         load_appfolio_properties_for_selection,
         compute_launch_analysis,
+        _launch_analysis_is_comparable,
         fetch_compliance_data,
         fetch_missing_pet_rent_by_property,
         fetch_suspected_undisclosed_by_property,
@@ -857,6 +859,7 @@ def main():
         "load_realpage_properties_for_selection": load_realpage_properties_for_selection,
         "load_appfolio_properties_for_selection": load_appfolio_properties_for_selection,
         "compute_launch_analysis": compute_launch_analysis,
+        "_launch_analysis_is_comparable": _launch_analysis_is_comparable,
         "fetch_compliance_data": fetch_compliance_data,
         "fetch_missing_pet_rent_by_property": fetch_missing_pet_rent_by_property,
         "fetch_suspected_undisclosed_by_property": fetch_suspected_undisclosed_by_property,
