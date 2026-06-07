@@ -2184,7 +2184,7 @@ def fetch_appfolio_for_properties(properties, progress_bar, status_text, lookbac
             CASE WHEN t.occupancy_id IS NOT NULL THEN 'occupancy_id' ELSE 'no_match' END AS match_type
         FROM latest_charges c
         LEFT JOIN tenant_pick t ON t.occupancy_id = c.occupancy_id
-        LEFT JOIN latest_units u ON u.unit_id = t.tenant_unit_id
+        LEFT JOIN latest_units u ON u.unit_id = t.unit_id
     )
     SELECT
         p.parent_company_name AS parent_company,

@@ -2,7 +2,7 @@
 """
 Batch PDF Generator for PetScreening Value Reports
 
-Auto-detects PMC system (Yardi/Entrata/RealPage) for each ID and calls the appropriate API.
+Auto-detects PMC system (Yardi/Entrata/RealPage/AppFolio) for each ID and calls the appropriate API/Snowflake source.
 
 Usage:
     python batch_pdf.py --ids 123,456,789
@@ -42,9 +42,6 @@ logging.getLogger("streamlit").setLevel(logging.ERROR)
 # Add the app directory to path so we can import from app.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import pandas as pd
-import numpy as np
-import requests
 from collections import defaultdict
 
 
@@ -123,12 +120,12 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
                 properties, api_key, app_imports,
                 workers=workers, verbose=verbose,
             )
-        elif pmc_system == "real_page":
-            # RealPage reads from Snowflake — single-query, parallelism
+        elif pmc_system in ("real_page", "appfolio"):
+            # RealPage/AppFolio read from Snowflake — single-query, parallelism
             # at the per-property level adds no benefit. Fall through.
             progress_bar = FakeProgressBar()
             status_text = FakeStatusText(verbose=verbose)
-            fetch_fn = app_imports["fetch_realpage_for_properties"]
+            fetch_fn = app_imports["fetch_realpage_for_properties"] if pmc_system == "real_page" else app_imports["fetch_appfolio_for_properties"]
             all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
         else:
             license_token = app_imports["YARDI_LICENSE_TOKEN"]
@@ -152,6 +149,9 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
     elif pmc_system == "real_page":
         fetch_fn = app_imports["fetch_realpage_for_properties"]
         all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
+    elif pmc_system == "appfolio":
+        fetch_fn = app_imports["fetch_appfolio_for_properties"]
+        all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
     else:
         fetch_fn = app_imports["fetch_rentroll_for_properties"]
         all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
@@ -161,6 +161,8 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
 
 def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app_imports, conn):
     """Process a single ID and generate PDF. Returns dict with results."""
+    import pandas as pd
+    import numpy as np
     
     # Set session state so app functions use the correct PMC system
     import streamlit as st
@@ -170,6 +172,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
     load_properties_for_selection = app_imports["load_properties_for_selection"]
     load_entrata_properties_for_selection = app_imports["load_entrata_properties_for_selection"]
     load_realpage_properties_for_selection = app_imports["load_realpage_properties_for_selection"]
+    load_appfolio_properties_for_selection = app_imports["load_appfolio_properties_for_selection"]
     compute_launch_analysis = app_imports["compute_launch_analysis"]
     fetch_compliance_data = app_imports["fetch_compliance_data"]
     fetch_missing_pet_rent_by_property = app_imports["fetch_missing_pet_rent_by_property"]
@@ -211,6 +214,13 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
                     props_df = load_realpage_properties_for_selection(parent_company_name=label)
             else:
                 props_df = load_realpage_properties_for_selection(property_id=id_val)
+        elif pmc_system == "appfolio":
+            if id_type == "parent":
+                props_df = load_appfolio_properties_for_selection(ancestry_id=str(id_val))
+                if not props_df or (hasattr(props_df, '__len__') and len(props_df) == 0):
+                    props_df = load_appfolio_properties_for_selection(parent_company_name=label)
+            else:
+                props_df = load_appfolio_properties_for_selection(property_id=id_val)
         else:  # yardi or unknown — try yardi
             if id_type == "parent":
                 props_df = load_properties_for_selection(parent_company_name=label)
@@ -410,10 +420,11 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             _by_prop_code[key].append(rec)
         
         for (pname, code), recs in _by_prop_code.items():
-            if pmc_system == "real_page":
-                # RealPage rows are one observed post_month each. Keep the charge
-                # code classified as recurring so PDFs/missing-rent estimates don't
-                # label monthly pet rent as a one-time fee.
+            if pmc_system in ("real_page", "appfolio"):
+                # RealPage rows are one observed post_month each; AppFolio rows
+                # come from getrecurringcharges. Keep provider-backed monthly pet
+                # rent classified as recurring so PDFs/missing-rent estimates
+                # don't label monthly pet rent as a one-time fee.
                 _code_class[(pname, code)] = "recurring"
                 continue
 
@@ -759,8 +770,8 @@ def main():
     parser.add_argument("--avg-lift", action="store_true", help="Use average monthly lift methodology")
     parser.add_argument("--include-pm", action="store_true", help="Include property manager appendix")
     parser.add_argument("--verbose", action="store_true", help="Show detailed error traces")
-    parser.add_argument("--pmc", type=str, choices=["yardi", "entrata", "real_page"], default=None,
-                        help="Force PMC system (yardi, entrata, or real_page). Overrides auto-detection.")
+    parser.add_argument("--pmc", type=str, choices=["yardi", "entrata", "real_page", "appfolio"], default=None,
+                        help="Force PMC system (yardi, entrata, real_page, or appfolio). Overrides auto-detection.")
     parser.add_argument("--resume", action="store_true",
                         help="Skip IDs that already have a PDF in output folder from the last N days (default 4)")
     parser.add_argument("--resume-days", type=int, default=4,
@@ -814,6 +825,7 @@ def main():
         load_properties_for_selection,
         load_entrata_properties_for_selection,
         load_realpage_properties_for_selection,
+        load_appfolio_properties_for_selection,
         compute_launch_analysis,
         fetch_compliance_data,
         fetch_missing_pet_rent_by_property,
@@ -823,6 +835,7 @@ def main():
         fetch_rentroll_for_properties,
         fetch_entrata_for_properties,
         fetch_realpage_for_properties,
+        fetch_appfolio_for_properties,
         parse_date,
         # Per-property internals (used by parallel_fetch.py)
         _fetch_entrata_leases_for_property,
@@ -842,6 +855,7 @@ def main():
         "load_properties_for_selection": load_properties_for_selection,
         "load_entrata_properties_for_selection": load_entrata_properties_for_selection,
         "load_realpage_properties_for_selection": load_realpage_properties_for_selection,
+        "load_appfolio_properties_for_selection": load_appfolio_properties_for_selection,
         "compute_launch_analysis": compute_launch_analysis,
         "fetch_compliance_data": fetch_compliance_data,
         "fetch_missing_pet_rent_by_property": fetch_missing_pet_rent_by_property,
@@ -851,6 +865,7 @@ def main():
         "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
         "fetch_entrata_for_properties": fetch_entrata_for_properties,
         "fetch_realpage_for_properties": fetch_realpage_for_properties,
+        "fetch_appfolio_for_properties": fetch_appfolio_for_properties,
         "parse_date": parse_date,
         # Internals + constants used by parallel_fetch.py
         "_fetch_entrata_leases_for_property":   _fetch_entrata_leases_for_property,
@@ -1014,8 +1029,8 @@ def main():
             print(f"  Using custom label: {label}")
         
         # Check if PMC is supported
-        if pmc_system not in ("yardi", "entrata", "real_page"):
-            print(f"  ✗ Unsupported PMC: {pmc_system.upper()} (only Yardi/Entrata/RealPage supported)")
+        if pmc_system not in ("yardi", "entrata", "real_page", "appfolio"):
+            print(f"  ✗ Unsupported PMC: {pmc_system.upper()} (only Yardi/Entrata/RealPage/AppFolio supported)")
             unsupported_row = {
                 "id": id_val,
                 "type": args.type,

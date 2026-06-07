@@ -102,8 +102,23 @@ def test_appfolio_is_routed_as_snowflake_backed_provider_with_live_api_toggle_pl
     assert "appfolio_use_live_api" in routing_source
     assert "AppFolio live API is not enabled yet" in routing_source
     assert "fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months)" in APP_SOURCE
+    assert "t.tenant_unit_id" not in APP_SOURCE
+    assert "LEFT JOIN latest_units u ON u.unit_id = t.unit_id" in APP_SOURCE
 
 
 def test_appfolio_recurring_classification_matches_realpage_provider_override():
     assert 'pmc_system in ("real_page", "appfolio")' in APP_SOURCE
     assert "AppFolio getrecurringcharges rows are recurring by endpoint semantics" in APP_SOURCE
+
+
+def test_batch_scripts_include_realpage_and_appfolio_provider_paths():
+    batch_pdf = Path("batch_pdf.py").read_text()
+    batch_csv = Path("batch_csv.py").read_text()
+
+    for source in (batch_pdf, batch_csv):
+        assert '"real_page"' in source
+        assert '"appfolio"' in source
+        assert "load_realpage_properties_for_selection" in source
+        assert "load_appfolio_properties_for_selection" in source
+        assert "fetch_realpage_for_properties" in source
+        assert "fetch_appfolio_for_properties" in source

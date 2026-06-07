@@ -13,7 +13,7 @@ Examples:
     python batch_csv.py --ids 123,456 --type property --report missing
     python batch_csv.py --ids 61610 --type parent --report both --workers 8
     python batch_csv.py --file ids.txt --type parent --report suspected --output ./batch_csvs
-    python batch_csv.py --ids 123 --charge-codes PETRENT,PETFEE --pmc entrata
+    python batch_csv.py --ids 123 --charge-codes PETRENT,PETFEE --pmc appfolio
 """
 
 from __future__ import annotations
@@ -101,12 +101,14 @@ def load_app_imports() -> dict[str, Any]:
         extract_charges_from_property,
         extract_property,
         fetch_entrata_for_properties,
+        fetch_appfolio_for_properties,
         fetch_realpage_for_properties,
         fetch_rentroll_for_properties,
         generate_missing_pet_rent_report,
         generate_suspected_undisclosed_report,
         get_snowflake_connection,
         load_entrata_properties_for_selection,
+        load_appfolio_properties_for_selection,
         load_properties_for_selection,
         load_realpage_properties_for_selection,
         parse_date,
@@ -124,12 +126,14 @@ def load_app_imports() -> dict[str, Any]:
         "extract_charges_from_property": extract_charges_from_property,
         "extract_property": extract_property,
         "fetch_entrata_for_properties": fetch_entrata_for_properties,
+        "fetch_appfolio_for_properties": fetch_appfolio_for_properties,
         "fetch_realpage_for_properties": fetch_realpage_for_properties,
         "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
         "generate_missing_pet_rent_report": generate_missing_pet_rent_report,
         "generate_suspected_undisclosed_report": generate_suspected_undisclosed_report,
         "get_snowflake_connection": get_snowflake_connection,
         "load_entrata_properties_for_selection": load_entrata_properties_for_selection,
+        "load_appfolio_properties_for_selection": load_appfolio_properties_for_selection,
         "load_properties_for_selection": load_properties_for_selection,
         "load_realpage_properties_for_selection": load_realpage_properties_for_selection,
         "parse_date": parse_date,
@@ -157,6 +161,14 @@ def load_properties(
             props_df = loader(property_id=id_val)
     elif pmc_system == "real_page":
         loader = app_imports["load_realpage_properties_for_selection"]
+        if id_type == "parent":
+            props_df = loader(ancestry_id=str(id_val))
+            if props_df is None or len(props_df) == 0:
+                props_df = loader(parent_company_name=label)
+        else:
+            props_df = loader(property_id=id_val)
+    elif pmc_system == "appfolio":
+        loader = app_imports["load_appfolio_properties_for_selection"]
         if id_type == "parent":
             props_df = loader(ancestry_id=str(id_val))
             if props_df is None or len(props_df) == 0:
@@ -244,7 +256,7 @@ def process_single_id(
             label = args.label
         if pmc_system is None:
             raise ValueError("ID not found in PROD.COMMON.D_PROPERTIES")
-        if pmc_system not in ("yardi", "entrata", "real_page"):
+        if pmc_system not in ("yardi", "entrata", "real_page", "appfolio"):
             raise ValueError(f"Unsupported PMC: {pmc_system}")
 
         label_text = str(label or id_val)
@@ -374,7 +386,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pmc",
-        choices=["yardi", "entrata", "real_page"],
+        choices=["yardi", "entrata", "real_page", "appfolio"],
         default=None,
         help="Force PMC system; overrides auto-detection",
     )
