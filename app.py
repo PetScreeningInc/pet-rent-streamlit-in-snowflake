@@ -9663,448 +9663,298 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 )
 
                 # ═══════════════════════════════════════════════════════════════
-                #  SECTION 1: VALUE CREATED
+                #  SUMMARY AT A GLANCE
                 # ═══════════════════════════════════════════════════════════════
-                def _summary_card(value_text, label_text, sublabel_text="", color="#677848", bg="#fff"):
-                    """Render a single big-number card."""
+                def _format_summary_large_currency(val):
+                    """Format large currency values with K/M suffixes for compact cards."""
+                    val = val or 0
+                    if abs(val) >= 1_000_000:
+                        return f"${val / 1_000_000:,.1f}M"
+                    if abs(val) >= 100_000:
+                        return f"${val / 1_000:,.0f}K"
+                    return f"${val:,.0f}"
+
+                def _summary_glance_card(value_text, label_text, sublabel_text="", color="#1F2257", bg="#fff"):
+                    """Render an At-a-Glance style big-number card for the app Summary tab."""
                     _sub_html = ""
                     if sublabel_text:
-                        _sub_html = f'<div style="font-size:12px;color:#86868B;margin-top:4px">{sublabel_text}</div>'
+                        _sub_html = f'<div style="font-size:12px;color:#86868B;margin-top:5px;line-height:1.35">{sublabel_text}</div>'
                     return (
-                        f'<div style="background:{bg};border:1px solid #E8E4DA;border-radius:12px;'
-                        f'padding:32px 24px;text-align:center">'
-                        f'<div style="font-size:42px;font-weight:700;color:{color};letter-spacing:-1px;'
-                        f'font-family:Poppins,sans-serif">{value_text}</div>'
-                        f'<div style="font-size:13px;font-weight:600;color:#636569;margin-top:8px;'
-                        f'text-transform:uppercase;letter-spacing:0.5px">{label_text}</div>'
+                        f'<div style="background:{bg};border:1px solid #E8E4DA;border-radius:14px;'
+                        f'padding:24px 18px;text-align:center;min-height:142px;'
+                        f'box-shadow:0 1px 2px rgba(31,34,87,0.04)">'
+                        f'<div style="font-size:34px;line-height:1.05;font-weight:750;color:{color};letter-spacing:-1.1px;'
+                        f'font-family:Poppins,Arial,sans-serif;white-space:normal;overflow-wrap:anywhere">{value_text}</div>'
+                        f'<div style="font-size:12px;line-height:1.25;font-weight:700;color:#636569;margin-top:10px;'
+                        f'text-transform:uppercase;letter-spacing:0.65px;font-family:Poppins,Arial,sans-serif">{label_text}</div>'
                         f'{_sub_html}'
                         f'</div>'
                     )
 
+                def _render_summary_card_row(cards, row_label=None, row_label_color="#1F2257"):
+                    """Render a row of up to three At-a-Glance cards with an optional pill label."""
+                    if row_label:
+                        st.markdown(
+                            f'<div style="display:inline-block;background:{row_label_color};color:white;'
+                            f'border-radius:999px;padding:4px 11px;margin:10px 0 8px 0;'
+                            f'font-family:Poppins,Arial,sans-serif;font-size:11px;font-weight:700;'
+                            f'text-transform:uppercase;letter-spacing:0.7px">{row_label}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    cols = st.columns(3)
+                    for idx, col in enumerate(cols):
+                        card = cards[idx] if idx < len(cards) else {"value": "", "label": "", "sub": "", "color": "#1F2257"}
+                        with col:
+                            st.markdown(_summary_glance_card(
+                                card.get("value", ""),
+                                card.get("label", ""),
+                                card.get("sub", ""),
+                                color=card.get("color", "#1F2257"),
+                                bg=card.get("bg", "#fff"),
+                            ), unsafe_allow_html=True)
+
+                _dark_blue = "#1F2257"
+                _teal_blue = "#3B7F8C"
+                _green = "#677848"
+                _orange = "#DD7B45"
+                _gray = "#636569"
                 _latest_str = _latest_month.strftime("%b %Y") if _latest_month else "N/A"
                 _use_avg = st.session_state.get("use_avg_lift_toggle", False)
 
-                # Compute post-launch average across comparable properties
+                _has_comparable = bool(_comparable)
+                _comp_current_rev = sum(
+                    _monthly_by_prop[p].get(_latest_month, 0)
+                    for p in _comparable
+                ) if (_comparable and _latest_month) else 0
+                _headline_current = _comp_current_rev if _has_comparable else _current_monthly_rev
+                _headline_pre = _pre_baseline_total
                 _comp_post_avg_sum = sum(
                     a.get("post_recent_avg", a.get("post_monthly_avg", 0))
                     for a in _comparable.values()
                 ) if _comparable else 0
-
-                # Methodology-appropriate values
-                _simple_lift_mo = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
-                _display_rev = _comp_post_avg_sum if (_use_avg and _comp_post_avg_sum > 0) else _current_monthly_rev
-                _display_rev_label = "Post-PS Avg Pet Revenue" if _use_avg else "Current Monthly Pet-Related Revenue"
-                _display_rev_sub = f"Avg across {len(_comparable)} properties" if _use_avg else _latest_str
-                _display_lift = _t1_mo if _use_avg else _simple_lift_mo
-                _display_lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
-
-                st.markdown(
-                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
-                    'color:#1F2257;margin:24px 0 12px 0">Value Created</p>',
-                    unsafe_allow_html=True,
+                _display_current = _comp_post_avg_sum if (_use_avg and _comp_post_avg_sum > 0) else _headline_current
+                _display_current_label = "Post-PS Avg Revenue" if (_use_avg and _comp_post_avg_sum > 0) else "Current Revenue"
+                _display_current_sub = (
+                    f"Avg across {len(_comparable)} properties, post-launch months"
+                    if (_use_avg and _comp_post_avg_sum > 0 and _has_comparable)
+                    else (f"Same {len(_comparable)} properties, latest month" if _has_comparable else _latest_str)
                 )
+                _simple_lift_mo = _headline_current - _headline_pre if _headline_pre > 0 else 0
+                _active_lift = _t1_mo if _use_avg else _simple_lift_mo
+                _lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
+                _simple_pct = (_simple_lift_mo / _headline_pre * 100) if _headline_pre > 0 else 0
 
-                _vc1, _vc2, _vc3 = st.columns(3)
-                with _vc1:
-                    st.markdown(_summary_card(
-                        f"${_display_rev:,.0f}",
-                        _display_rev_label,
-                        _display_rev_sub,
-                        color="#677848",
-                    ), unsafe_allow_html=True)
-                with _vc2:
-                    if _comparable and _display_lift != 0:
-                        _sign = "+" if _display_lift > 0 else ""
-                        st.markdown(_summary_card(
-                            f"{_sign}${_display_lift:,.0f}/mo",
-                            _display_lift_label,
-                            f"Across {len(_comparable)} comparable properties",
-                            color="#677848" if _display_lift > 0 else "#DD7B45",
-                        ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "N/A",
-                            _display_lift_label,
-                            "Requires launch dates and pre-launch data",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-                with _vc3:
-                    # Show asset value impact instead of cumulative when using avg lift
-                    if _use_avg:
-                        _annual = _display_lift * 12
-                        _avi = _annual / 0.05 if _annual > 0 else 0
-                        if _avi > 0:
-                            if _avi >= 1_000_000:
-                                _avi_str = f"${_avi / 1_000_000:,.1f}M"
-                            else:
-                                _avi_str = f"${_avi:,.0f}"
-                            st.markdown(_summary_card(
-                                _avi_str,
-                                "Est. Asset Value Impact",
-                                "At 5% cap rate",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "N/A",
-                                "Est. Asset Value Impact",
-                                "Requires positive lift",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
-                    else:
-                        if _comparable and _t1_total != 0:
-                            _sign = "+" if _t1_total > 0 else ""
-                            st.markdown(_summary_card(
-                                f"{_sign}${_t1_total:,.0f}",
-                                "Cumulative Pet Revenue Impact",
-                                f"Over {_t1_months} months",
-                                color="#677848" if _t1_total > 0 else "#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "N/A",
-                                "Cumulative Pet Revenue Impact",
-                                "Requires launch dates and pre-launch data",
-                                color="#636569",
-                            ), unsafe_allow_html=True)
+                _comparable_units = sum(
+                    _property_doors_by_name.get(p, 0)
+                    for p in _comparable
+                ) if _comparable and _property_doors_by_name else 0
+                _headline_units = _comparable_units if _comparable_units > 0 else _total_units
+                _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
+                _cap_rate = 0.05
+                _asset_value_impact = (_active_lift * 12 / _cap_rate) if _active_lift > 0 else 0
 
-                if _comparable and _display_lift != 0 and _pre_baseline_total > 0:
-                    _lift_pct = (_display_lift / _pre_baseline_total * 100)
-                    st.markdown(
-                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        f'text-align:center;margin:8px 0 28px 0">'
-                        f'Pre-PS baseline was ${_pre_baseline_total:,.0f}/mo across {len(_comparable)} properties'
-                        f'{f" -- a {_lift_pct:.1f}% increase" if _lift_pct > 0 else ""}.</p>',
-                        unsafe_allow_html=True,
-                    )
+                # Split confirmed missing rent into recurring monthly revenue for
+                # the At-a-Glance Opportunity row. This intentionally excludes
+                # one-time fees so the headline matches the PDF's monthly
+                # "Pet Revenue Found" card.
+                _s2_recurring_mo = 0
+                if _mr_data:
+                    for _v in _mr_data.values():
+                        _cnt = _v.get("missing_count", 0)
+                        if _cnt > 0:
+                            _s2_recurring_mo += _cnt * _v.get("avg_recurring", 0)
                 else:
-                    st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
+                    _s2_recurring_mo = _t2_mo
 
-                # ═══════════════════════════════════════════════════════════════
-                #  SECTION 2: REVENUE OPPORTUNITY
-                # ═══════════════════════════════════════════════════════════════
+                _found_mo = (_s2_recurring_mo or 0) + (_su_current_mo or 0)
+                _found_residents = (_t2_tenants or 0) + (_su_total_profiles or 0)
+                _units_for_found = _headline_units if _headline_units and _headline_units > 0 else _total_units
+                _found_per_unit = _found_mo / _units_for_found if _units_for_found and _units_for_found > 0 and _found_mo > 0 else 0
+                _combined_per_unit = (_lift_per_unit or 0) + (_found_per_unit or 0)
+                _found_asset_value = (_found_mo * 12 / _cap_rate) if _found_mo > 0 else 0
                 _has_missing_rent_data = any(
                     k.startswith("missing_rent_") and isinstance(st.session_state[k], dict)
                     for k in st.session_state.keys()
                 )
 
-                # ── Split recurring vs one-time from missing_rent_data ──
-                _s2_recurring_mo = 0
-                _s2_onetime_total = 0
-                if _mr_data:
-                    for _v in _mr_data.values():
-                        _cnt = _v.get("missing_count", 0)
-                        if _cnt == 0:
-                            continue
-                        _s2_recurring_mo += _cnt * _v.get("avg_recurring", 0)
-                        _s2_onetime_total += _cnt * _v.get("avg_onetime", 0)
-                else:
-                    _s2_recurring_mo = _t2_mo  # fallback
-
-                _s2_annual_recurring = _s2_recurring_mo * 12
-                _s2_annual_impact = _s2_annual_recurring + _s2_onetime_total
-                _s2_cap_rate = 0.05
-                _s2_value_impact = _s2_annual_impact / _s2_cap_rate if _s2_annual_impact > 0 else 0
-
                 st.markdown(
-                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
-                    'color:#1F2257;margin:0 0 12px 0">Revenue Opportunity</p>',
+                    '<p style="font-family:Lora,Georgia,serif;font-size:22px;font-weight:700;'
+                    'color:#1F2257;margin:24px 0 6px 0">At a Glance</p>'
+                    '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                    'margin:0 0 14px 0">Same headline card structure as the generated report: actual value created first, then pet revenue found, then operating context.</p>',
                     unsafe_allow_html=True,
                 )
 
-                # ── Single row: 3 cards ──
-                _ro1, _ro2, _ro3 = st.columns(3)
-                with _ro1:
-                    if _has_missing_rent_data:
-                        if _t2_tenants > 0:
-                            st.markdown(_summary_card(
-                                f"{_t2_tenants:,}",
-                                "Tenants Not Paying",
-                                f"Across {_t2_props} properties",
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "0",
-                                "Tenants Not Paying",
-                                "All profiled tenants are paying",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "Tenants Not Paying",
-                            "Enable on Charts tab to calculate",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-                with _ro2:
-                    if _has_missing_rent_data:
-                        if _s2_recurring_mo > 0:
-                            st.markdown(_summary_card(
-                                f"${_s2_recurring_mo:,.0f}/mo",
-                                "Missing Monthly Pet Rent",
-                                "Recurring monthly pet rent not collected",
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "$0",
-                                "Missing Monthly Pet Rent",
-                                "Fully collected",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "Missing Monthly Pet Rent",
-                            "Enable on Charts tab to calculate",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-                with _ro3:
-                    if _has_missing_rent_data:
-                        if _s2_annual_impact > 0:
-                            st.markdown(_summary_card(
-                                f"${_s2_annual_impact:,.0f}/yr",
-                                "Annual Revenue Impact",
-                                f"${_s2_recurring_mo:,.0f}/mo × 12" + (f" + ${_s2_onetime_total:,.0f} one-time" if _s2_onetime_total > 0 else ""),
-                                color="#DD7B45",
-                            ), unsafe_allow_html=True)
-                        else:
-                            st.markdown(_summary_card(
-                                "$0",
-                                "Annual Revenue Impact",
-                                "No revenue gap identified",
-                                color="#677848",
-                            ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "Annual Revenue Impact",
-                            "Enable on Charts tab to calculate",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-
-                # ── Narrative — tells the full story including cap rate ──
-                if _has_missing_rent_data and _t2_tenants > 0:
-                    _narrative_parts = [
-                        f'{_t2_tenants:,} tenants have completed PetScreening profiles but are not being charged pet rent — '
-                        f'that is <strong>${_s2_recurring_mo:,.0f}/mo</strong> in recurring pet rent'
-                    ]
-                    if _s2_onetime_total > 0:
-                        _narrative_parts.append(f' plus <strong>${_s2_onetime_total:,.0f}</strong> in uncollected one-time fees')
-                    _narrative_parts.append(f' across {_t2_props} properties.')
-                    if _s2_annual_impact > 0:
-                        _narrative_parts.append(
-                            f' On an annual basis, that is <strong>${_s2_annual_impact:,.0f}</strong> in revenue not being captured.'
-                        )
-                        _narrative_parts.append(
-                            f' At a 5% cap rate, collecting these fees would add '
-                            f'<strong>${_s2_value_impact:,.0f} in property value</strong>.'
-                        )
-                    _narrative_parts.append(' This is a billing correction, not a sales effort.')
-                    if _su_total_profiles > 0:
-                        _narrative_parts.append(
-                            f' Additionally, {_su_total_profiles:,} tenants show signals of undisclosed pets, '
-                            f'representing ~${_su_current_mo:,.0f}/mo in potential additional revenue.'
-                        )
-                    st.markdown(
-                        f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        f'text-align:center;margin:8px 0 4px 0">'
-                        f'{"".join(_narrative_parts)}</p>',
-                        unsafe_allow_html=True,
-                    )
-                elif _has_missing_rent_data and _t2_tenants == 0:
-                    st.markdown(
-                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#677848;'
-                        'text-align:center;margin:8px 0 4px 0">'
-                        'All tenants with active household profiles are paying pet rent. No gaps identified.</p>',
-                        unsafe_allow_html=True,
-                    )
+                _glance_row1 = []
+                if _has_comparable and _headline_units > 0:
+                    _glance_row1.append({
+                        "value": f"{_headline_units:,}",
+                        "label": "Comparable Units",
+                        "sub": f"{len(_comparable)} properties with pre & post data",
+                        "color": _dark_blue,
+                    })
+                elif _total_units > 0:
+                    _glance_row1.append({
+                        "value": f"{_total_units:,}",
+                        "label": "Live Units",
+                        "sub": f"Across {n_props_with_data} properties",
+                        "color": _dark_blue,
+                    })
                 else:
-                    st.markdown(
-                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        'text-align:center;margin:8px 0 4px 0">'
-                        'Enable "Show uncollected pet rent" on the Charts tab to populate this section.</p>',
-                        unsafe_allow_html=True,
+                    _glance_row1.append({
+                        "value": f"{n_props_with_data}",
+                        "label": "Properties Analyzed",
+                        "sub": f"of {n_props_total} selected properties",
+                        "color": _dark_blue,
+                    })
+                _glance_row1.append({
+                    "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
+                    "label": "Pre-PS Revenue",
+                    "sub": f"Avg baseline across {len(_comparable)} properties" if _has_comparable else "No pre-launch baseline",
+                    "color": _dark_blue if _headline_pre > 0 else _gray,
+                })
+                _glance_row1.append({
+                    "value": f"${_display_current:,.0f}/mo" if _display_current > 0 else "--",
+                    "label": _display_current_label,
+                    "sub": _display_current_sub,
+                    "color": _dark_blue if _display_current > 0 else _gray,
+                })
+                _render_summary_card_row(_glance_row1)
+
+                _glance_row2 = []
+                if _headline_pre <= 0:
+                    _glance_row2.extend([
+                        {"value": "--", "label": _lift_label, "sub": "No pre-launch baseline", "color": _gray},
+                        {"value": "--", "label": "Lift per Unit", "sub": "No pre-launch baseline", "color": _gray},
+                    ])
+                else:
+                    _lift_sign = "+" if _active_lift > 0 else ""
+                    _lift_sub = (
+                        f"${_comp_post_avg_sum:,.0f} avg - ${_headline_pre:,.0f} pre"
+                        if (_use_avg and _comp_post_avg_sum > 0)
+                        else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
                     )
+                    _glance_row2.append({
+                        "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
+                        "label": _lift_label,
+                        "sub": _lift_sub,
+                        "color": _teal_blue if _active_lift >= 0 else _orange,
+                    })
+                    _lpu_sign = "+" if _lift_per_unit > 0 else ""
+                    _glance_row2.append({
+                        "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo" if _headline_units > 0 else "--",
+                        "label": "Lift per Unit",
+                        "sub": f"${_active_lift:,.0f} / {_headline_units:,} units" if _headline_units > 0 else "Unit counts unavailable",
+                        "color": _teal_blue if _lift_per_unit >= 0 else _orange,
+                    })
+                _glance_row2.append({
+                    "value": _format_summary_large_currency(_asset_value_impact) if _asset_value_impact > 0 else "--",
+                    "label": "Est. Asset Value Impact",
+                    "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate" if _asset_value_impact > 0 else "Requires positive lift",
+                    "color": _teal_blue if _asset_value_impact > 0 else _gray,
+                })
+                _render_summary_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
 
-                # ── "Show the Math" expander ──
-                if _has_missing_rent_data and _t2_tenants > 0 and _s2_recurring_mo > 0:
-                    _avg_fee_s2 = _s2_recurring_mo / _t2_tenants if _t2_tenants > 0 else 0
-
-                    # Per-property fee ranges
-                    _fee_ranges_s2 = []
-                    for _v in _mr_data.values():
-                        if _v.get("missing_count", 0) > 0 and _v.get("avg_recurring", 0) > 0:
-                            _fee_ranges_s2.append(_v["avg_recurring"])
-                    _fee_min_s2 = min(_fee_ranges_s2) if _fee_ranges_s2 else 0
-                    _fee_max_s2 = max(_fee_ranges_s2) if _fee_ranges_s2 else 0
-
-                    with st.expander("How we calculate these numbers", expanded=False):
-                        _math_md = f"""**Monthly uncollected pet rent:**
-
-| | |
-|---|---|
-| Tenants with pets, not paying selected charges | **{_t2_tenants:,}** |
-| × Avg pet rent at their property | **${_avg_fee_s2:,.0f}/mo** |
-| **= Missing pet rent** | **${_s2_recurring_mo:,.0f}/mo** |
-"""
-                        if _s2_onetime_total > 0:
-                            _avg_ot_s2 = _s2_onetime_total / _t2_tenants if _t2_tenants > 0 else 0
-                            _math_md += f"""
-**One-time fees not collected:**
-
-| | |
-|---|---|
-| Same {_t2_tenants:,} tenants | × ${_avg_ot_s2:,.0f} avg one-time fee |
-| **= One-time fees** | **${_s2_onetime_total:,.0f}** |
-"""
-                        _math_md += f"""
-**Annual revenue impact:**
-
-| | |
-|---|---|
-| Monthly pet rent | ${_s2_recurring_mo:,.0f} × 12 = **${_s2_annual_recurring:,.0f}/yr** |
-| One-time fees | **${_s2_onetime_total:,.0f}** |
-| **Total annual impact** | **${_s2_annual_impact:,.0f}** |
-
-**Unrealized property value** (at 5% cap rate):
-
-| | |
-|---|---|
-| Annual impact | ${_s2_annual_impact:,.0f} |
-| ÷ 5% cap rate | |
-| **= Unrealized value** | **${_s2_value_impact:,.0f}** |
-
-> The avg fee varies by property (${_fee_min_s2:,.0f} – ${_fee_max_s2:,.0f}/mo). We use each property's actual average from paying tenants, not a flat number.
-"""
-                        st.markdown(_math_md)
-
-                        # Per-property example table
-                        _example_rows_s2 = []
-                        for _p, _v in sorted(_mr_data.items(), key=lambda x: -(x[1].get("missing_count", 0) * x[1].get("avg_recurring", 0))):
-                            if _v.get("missing_count", 0) == 0:
-                                continue
-                            _short = _p.split(" - ", 1)[-1] if " - " in _p else _p
-                            _rec = _v.get("avg_recurring", 0)
-                            _ot = _v.get("avg_onetime", 0)
-                            _cnt = _v["missing_count"]
-                            _mo_val = _cnt * _rec
-                            _ot_val = _cnt * _ot
-                            _ann = (_mo_val * 12) + _ot_val
-                            _val = _ann / _s2_cap_rate if _ann > 0 else 0
-                            _example_rows_s2.append({
-                                "Property": _short,
-                                "Tenants": _cnt,
-                                "Pet Rent/Mo": f"${_mo_val:,.0f}",
-                                "One-Time Fees": f"${_ot_val:,.0f}" if _ot_val > 0 else "--",
-                                "Annual Impact": f"${_ann:,.0f}",
-                                "Value Impact": f"${_val:,.0f}",
-                            })
-                        if _example_rows_s2:
-                            st.markdown("**Per-property breakdown:**")
-                            st.dataframe(
-                                pd.DataFrame(_example_rows_s2),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-
-                st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
-
-                # ═══════════════════════════════════════════════════════════════
-                #  SECTION 3: PORTFOLIO HEALTH
-                # ═══════════════════════════════════════════════════════════════
-                st.markdown(
-                    '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
-                    'color:#1F2257;margin:0 0 12px 0">Portfolio Health</p>',
-                    unsafe_allow_html=True,
+                _opportunity_sub = (
+                    f"{_found_residents:,} residents not paying pet fees"
+                    if _found_residents > 0
+                    else ("No missed pet-fee revenue detected" if _has_missing_rent_data else "Enable uncollected pet rent on Charts tab")
                 )
+                _glance_row3 = [
+                    {
+                        "value": f"${_found_mo:,.0f}/mo" if _found_mo > 0 else "--",
+                        "label": "Pet Revenue Found",
+                        "sub": _opportunity_sub,
+                        "color": _orange if _found_mo > 0 else _gray,
+                    },
+                    {
+                        "value": f"${_found_per_unit:,.2f}/unit/mo" if _found_per_unit > 0 else "--",
+                        "label": "Found per Unit",
+                        "sub": (
+                            f"${_found_mo:,.0f} / {_units_for_found:,} units | Combined: ${_combined_per_unit:,.2f}/unit/mo"
+                            if _found_per_unit > 0 else "Requires found revenue + unit counts"
+                        ),
+                        "color": _orange if _found_per_unit > 0 else _gray,
+                    },
+                    {
+                        "value": _format_summary_large_currency(_found_asset_value) if _found_asset_value > 0 else "--",
+                        "label": "Est. Value Impact (Found)",
+                        "sub": f"${_found_mo:,.0f}/mo x 12 / 5% cap rate" if _found_asset_value > 0 else "Requires found revenue",
+                        "color": _orange if _found_asset_value > 0 else _gray,
+                    },
+                ]
+                _render_summary_card_row(_glance_row3, row_label="Opportunity", row_label_color=_orange)
 
-                _ph1, _ph2, _ph3 = st.columns(3)
-                with _ph1:
-                    if _avg_adoption is not None:
-                        _adopt_color = "#677848" if _avg_adoption >= 70 else ("#E2AB58" if _avg_adoption >= 40 else "#DD7B45")
-                        st.markdown(_summary_card(
-                            f"{_avg_adoption:.1f}%",
-                            f"Average {_adopt_type_label} Adoption",
-                            f"Across {_n_proj_props} properties",
-                            color=_adopt_color,
-                        ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "--",
-                            "Average Adoption",
-                            "Enable adoption overlay on Charts tab",
-                            color="#636569",
-                        ), unsafe_allow_html=True)
-                with _ph2:
-                    st.markdown(_summary_card(
-                        f"{n_with_launch} of {n_props_total}",
-                        "Properties with Launch Date",
-                        f"{n_props_with_data} have charge data",
-                        color="#1F2257",
-                    ), unsafe_allow_html=True)
-                with _ph3:
-                    if _su_total_profiles > 0:
-                        st.markdown(_summary_card(
-                            f"{_su_total_profiles:,}",
-                            "Suspected Undisclosed",
-                            f"~${_su_current_mo:,.0f}/mo potential revenue",
-                            color="#DD7B45",
-                        ), unsafe_allow_html=True)
-                    else:
-                        st.markdown(_summary_card(
-                            "0",
-                            "Suspected Undisclosed",
-                            "No signals detected",
-                            color="#677848",
-                        ), unsafe_allow_html=True)
+                _adopt_color = _green if (_avg_adoption is not None and _avg_adoption >= 70) else (_orange if _avg_adoption is not None else _gray)
+                _context_row = [
+                    {
+                        "value": f"{_t2_tenants:,}" if _has_missing_rent_data else "--",
+                        "label": "Tenants Not Paying",
+                        "sub": f"Confirmed missing pet rent across {_t2_props} properties" if _has_missing_rent_data and _t2_tenants > 0 else ("None found" if _has_missing_rent_data else "Enable on Charts tab"),
+                        "color": _orange if _t2_tenants > 0 else (_green if _has_missing_rent_data else _gray),
+                    },
+                    {
+                        "value": f"{_su_total_profiles:,}" if _su_total_profiles > 0 else "0",
+                        "label": "Suspected Undisclosed",
+                        "sub": f"~${_su_current_mo:,.0f}/mo potential revenue" if _su_total_profiles > 0 else "No signals detected",
+                        "color": _orange if _su_total_profiles > 0 else _green,
+                    },
+                    {
+                        "value": f"{_avg_adoption:.1f}%" if _avg_adoption is not None else "--",
+                        "label": f"Average {_adopt_type_label} Adoption",
+                        "sub": f"Across {_n_proj_props} properties" if _avg_adoption is not None else "Enable adoption overlay on Charts tab",
+                        "color": _adopt_color,
+                    },
+                ]
+                _render_summary_card_row(_context_row, row_label="Portfolio Health", row_label_color=_dark_blue)
 
-                # ── Adoption narrative + Projected at 100% ──
+                _summary_parts = []
+                if _headline_pre > 0:
+                    _summary_parts.append(
+                        f'Pre-PS baseline was <strong>${_headline_pre:,.0f}/mo</strong> across {len(_comparable)} comparable properties. '
+                    )
+                    _summary_parts.append(
+                        f'Current same-property revenue is <strong>${_headline_current:,.0f}/mo</strong>, producing '
+                        f'<strong>{"+" if _active_lift > 0 else ""}${_active_lift:,.0f}/mo</strong> in {_lift_label.lower()}.'
+                    )
+                if _found_mo > 0:
+                    _summary_parts.append(
+                        f' Pet revenue found adds <strong>${_found_mo:,.0f}/mo</strong> from '
+                        f'<strong>{_t2_tenants:,}</strong> confirmed tenants not paying and '
+                        f'<strong>{_su_total_profiles:,}</strong> suspected undisclosed profiles.'
+                    )
                 if _avg_adoption is not None:
-                    _adopt_narrative = f'{_adopt_type_label} adoption averaged across properties with both revenue and adoption data.'
-                    if _t3_adoption is not None and _total_projected > 0:
-                        _adopt_narrative += (
-                            f' At 100% {_adopt_type_label.lower()} adoption, projected pet fee revenue would be '
-                            f'<strong>${_total_projected:,.0f}/mo</strong> — '
-                            f'an additional <strong>${_t3_additional:,.0f}/mo</strong> opportunity.'
-                        )
+                    _summary_parts.append(
+                        f' Selected adoption metric: <strong>{_avg_adoption:.1f}% average {_adopt_type_label.lower()} adoption</strong>.'
+                    )
+                if _summary_parts:
                     st.markdown(
                         f'<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
-                        f'text-align:center;margin:8px 0 28px 0">'
-                        f'{_adopt_narrative}</p>',
+                        f'text-align:center;margin:12px 0 24px 0;line-height:1.5">'
+                        f'{"".join(_summary_parts)}</p>',
                         unsafe_allow_html=True,
                     )
                 else:
-                    st.markdown('<div style="margin-bottom:28px"></div>', unsafe_allow_html=True)
+                    st.markdown('<div style="margin-bottom:24px"></div>', unsafe_allow_html=True)
 
                 # ── Detailed metrics (collapsed) ──
                 _quick_rows = []
-                _quick_rows.append({"Metric": "Pre-PS Baseline", "Value": f"${_pre_baseline_total:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                if _use_avg:
-                    _qr_comp_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in _comparable.values()) if _comparable else 0
-                    _quick_rows.append({"Metric": "Post-PS Avg Pet Revenue", "Value": f"${_qr_comp_post_avg:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                else:
-                    _quick_rows.append({"Metric": "Current Monthly Pet Fee Revenue", "Value": f"${_current_monthly_rev:,.0f}", "Period": _latest_str})
-                if _comparable:
-                    _qr_simple_lift = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
-                    _qr_lift = _t1_mo if _use_avg else _qr_simple_lift
-                    _qr_lift_label = "Average Monthly Lift" if _use_avg else "Monthly Lift"
-                    _qr_sign = "+" if _qr_lift > 0 else ""
-                    _quick_rows.append({"Metric": _qr_lift_label, "Value": f"{_qr_sign}${_qr_lift:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
-                if _t2_tenants > 0:
+                _quick_rows.append({"Metric": "Comparable Units" if _has_comparable else "Live Units", "Value": f"{_headline_units:,}" if _headline_units else "--", "Period": f"{len(_comparable)} comparable properties" if _has_comparable else f"across {n_props_with_data} properties"})
+                _quick_rows.append({"Metric": "Pre-PS Baseline", "Value": f"${_headline_pre:,.0f}/mo", "Period": f"across {len(_comparable)} properties"})
+                _quick_rows.append({"Metric": _display_current_label, "Value": f"${_display_current:,.0f}/mo", "Period": _display_current_sub})
+                _quick_rows.append({"Metric": _lift_label, "Value": f"{('+' if _active_lift > 0 else '')}${_active_lift:,.0f}/mo", "Period": f"across {len(_comparable)} properties" if _has_comparable else _latest_str})
+                if _headline_units > 0:
+                    _quick_rows.append({"Metric": "Lift per Unit", "Value": f"${_lift_per_unit:,.2f}/unit/mo", "Period": f"{_headline_units:,} units"})
+                if _asset_value_impact > 0:
+                    _quick_rows.append({"Metric": "Est. Asset Value Impact", "Value": _format_summary_large_currency(_asset_value_impact), "Period": "at 5% cap rate"})
+                _quick_rows.append({"Metric": "Pet Revenue Found", "Value": f"${_found_mo:,.0f}/mo", "Period": f"{_found_residents:,} residents not paying pet fees" if _found_residents else ""})
+                if _found_per_unit > 0:
+                    _quick_rows.append({"Metric": "Found per Unit", "Value": f"${_found_per_unit:,.2f}/unit/mo", "Period": f"Combined: ${_combined_per_unit:,.2f}/unit/mo"})
+                if _t2_tenants > 0 or _has_missing_rent_data:
                     _quick_rows.append({"Metric": "Tenants Not Paying", "Value": f"{_t2_tenants:,}", "Period": f"across {_t2_props} properties"})
-                    _quick_rows.append({"Metric": "Uncollected Revenue", "Value": f"${_t2_mo:,.0f}/mo", "Period": _latest_str})
+                _quick_rows.append({"Metric": "Suspected Undisclosed", "Value": f"{_su_total_profiles:,}", "Period": f"~${_su_current_mo:,.0f}/mo potential" if _su_total_profiles > 0 else "No signals detected"})
                 if _t3_adoption is not None:
-                    _quick_rows.append({"Metric": f"Current {_adopt_type_label} Adoption", "Value": f"{_t3_adoption:.1f}%", "Period": f"across {_n_proj_props} properties"})
-                if _t3_additional > 0:
-                    _quick_rows.append({"Metric": "Additional Opportunity at 100%", "Value": f"+${_t3_additional:,.0f}/mo", "Period": "at 100% adoption"})
-                if _su_total_profiles > 0:
-                    _quick_rows.append({"Metric": "Suspected Undisclosed Pets", "Value": f"{_su_total_profiles:,}", "Period": f"~${_su_current_mo:,.0f}/mo potential"})
-                if _total_units > 0:
-                    _quick_rows.append({"Metric": "Total Units", "Value": f"{_total_units:,}", "Period": f"across {n_props_with_data} properties"})
-                    if _current_monthly_rev > 0:
-                        _quick_rows.append({"Metric": "Pet Revenue per Unit", "Value": f"${_current_monthly_rev / _total_units:,.2f}/mo", "Period": ""})
+                    _quick_rows.append({"Metric": f"Average {_adopt_type_label} Adoption", "Value": f"{_t3_adoption:.1f}%", "Period": f"across {_n_proj_props} properties"})
                 _quick_rows.append({"Metric": "Properties with Launch Date", "Value": f"{n_with_launch} of {n_props_total}", "Period": ""})
                 _quick_rows.append({"Metric": "Properties with Charge Data", "Value": f"{n_props_with_data} of {n_props_total}", "Period": ""})
 

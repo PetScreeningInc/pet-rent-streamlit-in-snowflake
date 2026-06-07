@@ -122,3 +122,29 @@ def test_documentation_explains_current_baseline_and_monthly_lift_methodology():
     assert "Latest/current-month lift" in docs_source
     assert "missing months are not averaged as $0" in docs_source
     assert "Post-launch current lift" not in docs_source
+
+
+def test_summary_tab_uses_at_a_glance_cards_instead_of_old_three_section_layout():
+    summary_start = APP_SOURCE.index("# ─── TAB 2: Summary")
+    summary_end = APP_SOURCE.index("# ═══════════════════════════════════════════════════════════════\n                #  PROPERTY MANAGERS & EMAIL", summary_start)
+    summary_source = APP_SOURCE[summary_start:summary_end]
+
+    assert "At a Glance" in summary_source
+    assert "_summary_glance_card" in summary_source
+    assert "_render_summary_card_row" in summary_source
+    assert "Comparable Units" in summary_source
+    assert "Pre-PS Revenue" in summary_source
+    assert "Current Revenue" in summary_source
+    assert "Lift per Unit" in summary_source
+    assert "Est. Asset Value Impact" in summary_source
+    assert "Pet Revenue Found" in summary_source
+    assert "Found per Unit" in summary_source
+    assert "Est. Value Impact (Found)" in summary_source
+    assert "Tenants Not Paying" in summary_source
+    assert "Suspected Undisclosed" in summary_source
+    assert "Average {_adopt_type_label} Adoption" in summary_source
+
+    at_a_glance_source = summary_source[summary_source.index("#  SUMMARY AT A GLANCE"):]
+    assert "SECTION 1: VALUE CREATED" not in at_a_glance_source
+    assert "SECTION 2: REVENUE OPPORTUNITY" not in at_a_glance_source
+    assert "SECTION 3: PORTFOLIO HEALTH" not in at_a_glance_source
