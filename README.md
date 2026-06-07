@@ -203,12 +203,37 @@ Key difference: the app uses **selected charge codes** instead of the hardcoded 
 
 ---
 
+## Batch CSV Export
+
+Use `batch_csv.py` when you want the same downloadable CSV outputs as the app without opening Streamlit.
+It accepts comma-separated property IDs or parent company ancestry IDs, supports the same worker option as `batch_pdf.py`, and can export either report or both.
+
+```bash
+# Both app-style CSVs for property IDs
+python batch_csv.py --ids 94672,12345 --type property --report both
+
+# Missing Pet Rent only for parent company ancestry IDs, faster for large portfolios
+python batch_csv.py --ids 61610,98765 --type parent --report missing --workers 8
+
+# Suspected Undisclosed Pets only from a file of IDs
+python batch_csv.py --file ids.txt --type parent --report suspected --output ./batch_csvs
+
+# Force charge codes instead of auto-detecting pet/animal/petnr/concpet codes
+python batch_csv.py --ids 94672 --charge-codes PETRENT,PETFEE
+```
+
+Outputs are saved under `batch_csvs/<pmc_system>/` with a `batch_csv_log_YYYYMMDD_HHMMSS.csv` summary at the top level.
+
+---
+
 ## File Structure
 
 ```
 pet-rent/
 ├── app.py                  # Main Streamlit application (all logic)
-├── .env                    # Snowflake + Yardi credentials (gitignored)
+├── batch_csv.py            # Batch app-style Missing/Suspected CSV exporter
+├── batch_pdf.py            # Batch value-report PDF generator
+├── .env                    # Snowflake + PMC credentials (gitignored)
 ├── README.md               # This file
 └── *.md                    # Snowflake stored procedure references
     ├── SP_LOAD_YARDI_GETRENTROLL(...)   # GetRentroll SP variants
