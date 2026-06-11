@@ -1,4 +1,6 @@
 .env
+.streamlit
+.claude
 __pycache__/
 *.pyc
 *.pyo
