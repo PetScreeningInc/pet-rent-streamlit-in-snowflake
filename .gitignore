@@ -1,0 +1,12 @@
+.claude
+.env
+.streamlit
+.claude
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.png
+*.html
+auto_exports/
+*.PRE_REALPAGE_BACKUP
