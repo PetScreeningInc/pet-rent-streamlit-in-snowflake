@@ -311,7 +311,7 @@ def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookbac
         except requests.exceptions.Timeout:
             results_log.append({"property": prop_name, "code": prop_code, "status": "Error: Timeout", "charges": 0})
         except Exception as exc:
-            results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: {str(exc)[:50]}", "charges": 0})
+            results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: {str(exc)[:500]}", "charges": 0})
 
     progress_bar.progress(1.0)
     status_text.text("Done!")
