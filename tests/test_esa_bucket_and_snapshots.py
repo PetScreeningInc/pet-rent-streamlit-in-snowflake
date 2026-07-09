@@ -146,7 +146,7 @@ def test_unsafe_schema_rejected(snap, monkeypatch):
 
 def test_dedup_missing_rows_by_email():
     os.environ.setdefault("PET_VALUE_CACHE_BACKEND", "local")
-    from app import _dedup_missing_rows
+    from analytics.missing_pet_rent import _dedup_missing_rows
     df = pd.DataFrame([
         {"USER_EMAIL": "a@x.com", "TENANT_CODE": "t1"},
         {"USER_EMAIL": "a@x.com", "TENANT_CODE": "t2"},
@@ -169,8 +169,7 @@ def test_reclaim_reason_groups_keep_historical_esa_bucket():
 def test_missing_rent_is_household_only():
     """Both profile queries are back to compliant + household + active —
     no assistance branch, no profile_bucket column."""
-    src = Path(__file__).resolve().parent.parent / "app.py"
-    text = src.read_text()
+    from app_source import APP_SOURCE as text
     assert "esa_non_responsive" not in text
     assert "profile_bucket" not in text
     assert "ESA_NonResponsive_No_Rent" not in text
@@ -180,8 +179,7 @@ def test_missing_rent_is_household_only():
 def test_suspected_includes_assistance_non_responsive():
     """Suspected Undisclosed again covers assistance non_responsive in both
     the reason CASE and the WHERE filter of both suspected functions."""
-    src = Path(__file__).resolve().parent.parent / "app.py"
-    text = src.read_text()
+    from app_source import APP_SOURCE as text
     assert text.count(
         "AND ue.user_pet_status IN ('draft','non_responsive','declined','not_recommended','returned')"
     ) >= 2

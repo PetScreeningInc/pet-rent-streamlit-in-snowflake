@@ -10,7 +10,7 @@ import types
 from collections import defaultdict
 from pathlib import Path
 
-APP_SOURCE = Path("app.py").read_text()
+from app_source import APP_SOURCE  # modular layout: ordered source concatenation
 
 
 class _Dummy:

@@ -24,6 +24,43 @@ APIs, the external access integration, and the `ALTER STREAMLIT ... SET
 SECRETS` mapping. Re-run the relevant section when adding a new Yardi host
 or credential.
 
+## Architecture
+
+The app follows the modular layout this repo introduced (the monolithic
+`app.py` from the pet-rent repo is split along the same seams as the
+original modularization — every relocated function is AST-identical to its
+pet-rent original):
+
+```
+app.py                        Streamlit UI orchestration only (tabs, sidebar, session state)
+config.py                     Shared constants (JUNK_EMAILS)
+services/
+  snowflake_io.py             Connection (SiS active-session OR local keypair) + secrets
+  yardi.py                    Yardi property/parent queries + GetRentroll SOAP fetch
+  entrata.py                  Entrata property/parent queries + getLeases REST fetch
+  realpage.py                 RealPage staging queries + staging/live hybrid fetch
+  appfolio.py                 AppFolio staging-backed provider
+analytics/
+  launch_analysis.py          Before/after launch analysis, health checks, QBR adoption
+  missing_pet_rent.py         Missing Pet Rent engine (household-active only)
+  suspected_undisclosed.py    Suspected Undisclosed engine (incl. assistance non-responsive)
+components/
+  ui_helpers.py               Brand CSS, logo, password gate, table/funnel widgets
+  charts.py                   Plotly chart builders
+reports/
+  pdf_report.py               Branded executive PDF (fpdf2)
+  html_report.py              Branded HTML report + exec summary HTML
+snowflake_auth.py             Back-compat shim → services.snowflake_io (used by batch tools)
+realpage_live_api.py          OneSite live SOAP client (used by services.realpage)
+fetch_cache.py                Append-only Snowflake fetch cache
+snapshot_tables.py            RAW.MISC PET_VALUE_* auto-append
+batch_pdf.py / batch_csv.py   Local batch tools (import from app's namespace)
+```
+
+Source-level regression tests assert against the ordered concatenation of
+these files (`tests/app_source.py`), so "the app contains X" keeps meaning
+what it meant in the monolith.
+
 ## How the app adapts to Streamlit-in-Snowflake
 
 All handled in `snowflake_auth.py` — the rest of the codebase is identical
