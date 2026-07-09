@@ -1,83 +1,8280 @@
-"""Pet Rent Analysis -- Streamlit Application (refactored)"""
+"""
+Pet Rent Analysis — Streamlit Application
+Connects to Snowflake, fetches Yardi GetRentroll data, and visualizes
+pet/fee collection over time per property and parent company.
+"""
 
 import os
 import io
 import json
+import xml.etree.ElementTree as ET
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import numpy as np
+import requests
+import snowflake.connector
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv()
 
-# Snowflake (Snowpark)
-from services.snowflake_io import run_query
-
-# PMC services
-from services.yardi import (
-    load_parent_companies, load_all_properties,
-    load_properties_for_selection, fetch_rentroll_for_properties,
-)
-from services.entrata import (
-    load_entrata_parent_companies, load_entrata_all_properties,
-    load_entrata_properties_for_selection, fetch_entrata_for_properties,
-)
-from services.realpage import (
-    load_realpage_parent_companies, load_realpage_all_properties,
-    load_realpage_properties_for_selection, fetch_realpage_for_properties,
-)
-from services.appfolio import (
-    load_appfolio_parent_companies, load_appfolio_all_properties,
-    load_appfolio_properties_for_selection, fetch_appfolio_for_properties,
-)
-
-# Analytics
-from analytics.launch_analysis import (
-    parse_date, compute_launch_analysis, _launch_analysis_is_comparable,
-    fetch_compliance_data, _build_property_id_lookup,
-)
-from analytics.missing_pet_rent import (
-    _build_paying_sets, _apply_paying_flag,
-    fetch_property_manager_emails,
-    generate_missing_pet_rent_report,
-    fetch_missing_pet_rent_by_property,
-)
-from analytics.suspected_undisclosed import (
-    fetch_suspected_undisclosed_by_property,
-    generate_suspected_undisclosed_report,
-)
-
-# Components
-from components.ui_helpers import (
-    inject_brand_css, _render_table, _render_property_funnel,
-    _PS_LOGO_WHITE_URI, _PS_LOGO_DARK_URI,
-)
-from components.charts import (
-    build_portfolio_chart, build_stacked_area_chart,
-    build_current_snapshot_chart, build_individual_property_charts,
-)
-
-# Reports
-from reports.html_report import generate_html_report, generate_exec_summary_html
-from reports.pdf_report import generate_tranche_pdf
-
-# Config
-from config import JUNK_EMAILS
-
-# Page config
+# ─── Page config ─────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PetScreening Value Report",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-inject_brand_css()
+
+
+def require_app_password():
+    """Gate the app behind a simple shared password when configured.
+
+    Set PET_RENT_APP_PASSWORD in the deployment environment. Local dev remains
+    unlocked if the variable is absent.
+    """
+    expected_password = os.getenv("PET_RENT_APP_PASSWORD")
+    if not expected_password:
+        return
+
+    if st.session_state.get("password_ok"):
+        return
+
+    st.markdown("## PetScreening Value Report")
+    st.caption("Password protected")
+    entered_password = st.text_input("Password", type="password")
+
+    if entered_password:
+        if entered_password == expected_password:
+            st.session_state["password_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+
+    st.stop()
+
+
+require_app_password()
+
+
+def _auto_export_dir() -> str:
+    """Directory for crash-safe CSV auto-exports.
+
+    Prefers `auto_exports/` next to app.py (local dev). In
+    Streamlit-in-Snowflake the app stage is read-only, so fall back to the
+    runtime temp dir — those exports are a local-crash convenience only;
+    the Snowflake fetch cache is the durable record.
+    """
+    _preferred = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+    try:
+        os.makedirs(_preferred, exist_ok=True)
+        _probe = os.path.join(_preferred, ".write_probe")
+        with open(_probe, "w") as _pf:
+            _pf.write("ok")
+        os.remove(_probe)
+        return _preferred
+    except OSError:
+        import tempfile
+        _fallback = os.path.join(tempfile.gettempdir(), "pet_rent_auto_exports")
+        os.makedirs(_fallback, exist_ok=True)
+        return _fallback
+
+
+# ─── PetScreening Brand Assets ───────────────────────────────────────
+import base64 as _b64
+
+def _load_logo_b64(fill_color=None):
+    """Load logo SVG, optionally recolor, return base64 data URI."""
+    try:
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.svg")
+        with open(_logo_path, "r") as _f:
+            _svg = _f.read()
+        if fill_color:
+            _svg = _svg.replace('fill="white"', f'fill="{fill_color}"')
+        return "data:image/svg+xml;base64," + _b64.b64encode(_svg.encode()).decode()
+    except FileNotFoundError:
+        return ""
+
+_PS_LOGO_WHITE_URI = _load_logo_b64()           # white for dark backgrounds
+_PS_LOGO_DARK_URI  = _load_logo_b64("#1F2257")  # Pack Blue for light backgrounds
+
+# ─── PetScreening Brand CSS ──────────────────────────────────────────
+# Force light theme and apply warm brand palette matching the HTML report
+st.markdown("""
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:wght@700&display=swap" rel="stylesheet">
+<style>
+    /* ══════════════════════════════════════════════════════════════
+       FORCE LIGHT MODE — override Streamlit dark theme entirely.
+       Must match the HTML report warm off-white aesthetic.
+       ══════════════════════════════════════════════════════════════ */
+
+    /* ── Force light color-scheme globally ── */
+    :root, html, body {
+        color-scheme: light !important;
+    }
+
+    /* ── Glide Data Grid (Streamlit table renderer) — MUST be on :root ──
+       glide-data-grid reads CSS custom properties at init time from
+       the closest ancestor.  Placing them on :root guarantees they
+       are found before the canvas is painted. */
+    :root {
+        --gdg-text-dark: #4F5155 !important;
+        --gdg-text-medium: #636569 !important;
+        --gdg-text-light: #AFB2B3 !important;
+        --gdg-text-bubble: #1F2257 !important;
+        --gdg-bg-cell: #ffffff !important;
+        --gdg-bg-cell-medium: #FAFAF8 !important;
+        --gdg-bg-header: #F9F4E6 !important;
+        --gdg-bg-header-has: #F0EBD8 !important;
+        --gdg-bg-header-hovered: #EDE8D5 !important;
+        --gdg-text-header: #1F2257 !important;
+        --gdg-text-header-selected: #1F2257 !important;
+        --gdg-border-color: #E8E6E0 !important;
+        --gdg-accent-color: #B17455 !important;
+        --gdg-accent-light: rgba(177,116,85,0.15) !important;
+        --gdg-accent-fg: #ffffff !important;
+        --gdg-link-color: #B17455 !important;
+        --gdg-cell-horizontal-padding: 8px !important;
+        --gdg-cell-vertical-padding: 3px !important;
+    }
+
+    /* ── ROOT: global background & text color ── */
+    .stApp, [data-testid="stAppViewContainer"],
+    .main, [data-testid="stMain"],
+    [data-testid="stAppViewBlockContainer"],
+    [data-testid="stVerticalBlock"],
+    [data-testid="stHorizontalBlock"],
+    [data-testid="column"] {
+        background-color: #FAFAF8 !important;
+        color: #4F5155 !important;
+    }
+    [data-testid="stHeader"] {
+        background-color: #FAFAF8 !important;
+    }
+    [data-testid="stBottomBlockContainer"] {
+        background-color: #FAFAF8 !important;
+    }
+
+    /* ── Typography — Poppins everywhere, readable dark grey ── */
+    /* IMPORTANT: exclude Streamlit's Material icon spans, or their ligature
+       names render as literal text ("keyboard_double_arrow_right",
+       "arrow_right" on expanders). Newer Streamlit marks them with
+       data-testid="stIconMaterial" / stExpanderToggleIcon — the class no
+       longer contains "material", so testid exclusions are required. */
+    html, body, [class*="css"], .stMarkdown, .stText,
+    [data-testid="stMetricLabel"], .streamlit-expanderHeader,
+    .stRadio label, [data-baseweb="select"],
+    p, li, td, th, label,
+    span:not([class*="material"]):not([data-testid="stIconMaterial"]):not([data-testid="stExpanderToggleIcon"]),
+    div:not([data-testid="stIconMaterial"]) {
+        font-family: 'Poppins', Arial, sans-serif !important;
+    }
+    /* Preserve Material Symbols font for Streamlit's built-in icons */
+    span[class*="material"],
+    [data-testid="stIconMaterial"],
+    [data-testid="stExpanderToggleIcon"],
+    button[kind="headerNoPadding"] span,
+    [data-testid="stSidebarCollapseButton"] span,
+    [data-testid="stSidebarCollapsedControl"] span {
+        font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', sans-serif !important;
+        font-size: 1.2em !important;
+    }
+    /* Default text color — NOT on td/th (dataframe handled separately) */
+    html, body, p, li, label,
+    span:not([class*="material"]):not([data-testid="stIconMaterial"]):not([data-testid="stExpanderToggleIcon"]),
+    div:not([data-testid="stIconMaterial"]),
+    .stMarkdown, .stMarkdown *:not([class*="material"]):not([data-testid="stIconMaterial"]), .stText,
+    [class*="css"]:not([class*="material"]) {
+        color: #4F5155 !important;
+    }
+    h1, h1 * {
+        font-family: 'Poppins', Arial, sans-serif !important;
+        color: #1F2257 !important;
+        font-weight: 600 !important;
+        letter-spacing: -0.3px !important;
+    }
+    h2, h3, h2 *, h3 * {
+        font-family: 'Poppins', Arial, sans-serif !important;
+        color: #1F2257 !important;
+    }
+    strong, b {
+        color: #1F2257 !important;
+    }
+    /* Captions — use Smokey Gray (not lighter) */
+    .stCaption, [data-testid="stCaptionContainer"],
+    [data-testid="stCaptionContainer"] * {
+        color: #636569 !important;
+    }
+
+    /* ── Tabs: sticky, full-width pill navigation ──
+       The four main tabs previously rendered as small links floating
+       mid-page. Now: evenly spread pills that stick below the header
+       while scrolling, with a clear active state. */
+    .stTabs [data-baseweb="tab-list"] {
+        position: sticky;
+        top: 3.75rem;
+        z-index: 99;
+        background: #FAFAF8;
+        gap: 8px;
+        padding: 10px 0;
+        border-bottom: 1px solid #E4E0D3;
+        width: 100%;
+    }
+    .stTabs [data-baseweb="tab"] {
+        flex: 1;
+        justify-content: center;
+        background: #F1EDE0;
+        border-radius: 10px;
+        padding: 10px 16px;
+        font-weight: 600 !important;
+        font-size: 15px !important;
+        border: 1.5px solid transparent;
+        transition: background 0.15s ease;
+    }
+    .stTabs [data-baseweb="tab"] p {
+        color: #4F5155 !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background: #E7E1CD;
+    }
+    /* Active tab: white card with a navy border — dark text on light
+       background in every state, so contrast can never break. */
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        background: #FFFFFF !important;
+        border: 1.5px solid #1F2257 !important;
+    }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] p {
+        color: #1F2257 !important;
+        font-weight: 700 !important;
+    }
+    /* Pill style replaces the default underline indicator */
+    .stTabs [data-baseweb="tab-highlight"],
+    .stTabs [data-baseweb="tab-border"] {
+        display: none;
+    }
+
+    /* ── Sidebar — Dog Bone White bg, dark readable text ── */
+    section[data-testid="stSidebar"],
+    section[data-testid="stSidebar"] > div,
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+        background-color: #F9F4E6 !important;
+        overflow-x: hidden !important;
+    }
+    section[data-testid="stSidebar"] *:not([class*="material"]) {
+        color: #4F5155 !important;
+    }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 {
+        color: #1F2257 !important;
+    }
+    /* Sidebar collapse/expand button — let Streamlit handle its own icon */
+    button[data-testid="stSidebarCollapseButton"],
+    button[data-testid="baseButton-headerNoPadding"] {
+        color: #4F5155 !important;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       INPUT WIDGETS — white backgrounds, warm borders
+       ══════════════════════════════════════════════════════════════ */
+    [data-baseweb="select"] > div,
+    [data-baseweb="input"] > div,
+    .stTextInput > div > div,
+    .stSelectbox > div > div > div,
+    .stMultiSelect > div > div > div,
+    .stNumberInput > div > div {
+        background-color: #ffffff !important;
+        border-color: #D3CEBD !important;
+        color: #4F5155 !important;
+    }
+    /* Widget labels */
+    [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] *,
+    .stSelectbox label, .stMultiSelect label,
+    .stTextInput label, .stNumberInput label, .stSlider label {
+        color: #4F5155 !important;
+    }
+    /* Dropdown menus */
+    [data-baseweb="menu"], [data-baseweb="popover"],
+    [data-baseweb="menu"] *, [data-baseweb="popover"] * {
+        background-color: #ffffff !important;
+        color: #4F5155 !important;
+    }
+    [data-baseweb="menu"] li:hover,
+    [data-baseweb="popover"] li:hover {
+        background-color: #F9F4E6 !important;
+    }
+
+    /* ── Multiselect pills (charge codes) — warm brand colors ── */
+    [data-baseweb="tag"] {
+        background-color: #B17455 !important;
+        color: white !important;
+        border-radius: 6px !important;
+    }
+    [data-baseweb="tag"] span {
+        color: white !important;
+    }
+    [data-baseweb="tag"] [role="presentation"] {
+        color: white !important;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       DATAFRAMES / TABLES — force white background, dark text
+       This is the critical section for Streamlit's Arrow dataframe.
+       We blast every wrapper, iframe, and canvas container white.
+       ══════════════════════════════════════════════════════════════ */
+    [data-testid="stDataFrame"],
+    .stDataFrame,
+    [data-testid="stDataFrame"] > div,
+    [data-testid="stDataFrame"] iframe,
+    [data-testid="stDataFrameResizable"],
+    [data-testid="stDataFrame"] [class*="glideDataEditor"],
+    [data-testid="stDataFrame"] canvas + div,
+    [data-testid="stDataFrame"] > div > div > div,
+    .dvn-scroller,
+    [data-testid="stDataFrame"] [class*="dvn-underlay"] {
+        border-color: #E8E6E0 !important;
+        background-color: #ffffff !important;
+        color-scheme: light !important;
+    }
+
+    /* Reinforce --gdg-* on every dataframe element as fallback
+       (primary definition is on :root above, this catches iframes) */
+    [data-testid="stDataFrame"],
+    [data-testid="stDataFrame"] *,
+    [data-testid="stDataFrame"] iframe {
+        --gdg-text-dark: #4F5155 !important;
+        --gdg-text-medium: #636569 !important;
+        --gdg-text-light: #AFB2B3 !important;
+        --gdg-text-bubble: #1F2257 !important;
+        --gdg-bg-cell: #ffffff !important;
+        --gdg-bg-cell-medium: #FAFAF8 !important;
+        --gdg-bg-header: #F9F4E6 !important;
+        --gdg-bg-header-has: #F0EBD8 !important;
+        --gdg-bg-header-hovered: #EDE8D5 !important;
+        --gdg-text-header: #1F2257 !important;
+        --gdg-text-header-selected: #1F2257 !important;
+        --gdg-border-color: #E8E6E0 !important;
+        --gdg-accent-color: #B17455 !important;
+        --gdg-accent-light: rgba(177,116,85,0.15) !important;
+        --gdg-accent-fg: #ffffff !important;
+        --gdg-link-color: #B17455 !important;
+        --gdg-cell-horizontal-padding: 8px !important;
+        --gdg-cell-vertical-padding: 3px !important;
+    }
+
+    /* ── Metric cards ── */
+    [data-testid="stMetricValue"], [data-testid="stMetricValue"] * {
+        font-family: 'Poppins', Arial, sans-serif !important;
+        color: #1F2257 !important;
+    }
+    [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * {
+        color: #4F5155 !important;
+    }
+    [data-testid="stMetricDelta"], [data-testid="stMetricDelta"] * {
+        color: #677848 !important;
+    }
+
+    /* ── Expanders — white bg ── */
+    .streamlit-expanderHeader, [data-testid="stExpander"] summary {
+        color: transparent !important;
+        background-color: #ffffff !important;
+    }
+    /* Hide ligature text in ALL spans/divs inside summary
+       (overrides the global span color rule) */
+    [data-testid="stExpander"] summary span,
+    [data-testid="stExpander"] summary div {
+        color: transparent !important;
+    }
+    /* Restore visible color for the actual title text (always in <p>) */
+    [data-testid="stExpander"] summary p,
+    [data-testid="stExpander"] summary strong {
+        color: #4F5155 !important;
+        font-family: 'Poppins', Arial, sans-serif !important;
+    }
+    /* Right-pointing CSS triangle on summary itself (collapsed) */
+    [data-testid="stExpander"] summary::before {
+        content: '' !important;
+        display: inline-block !important;
+        flex-shrink: 0 !important;
+        width: 0 !important;
+        height: 0 !important;
+        border-top: 5px solid transparent !important;
+        border-bottom: 5px solid transparent !important;
+        border-left: 7px solid #4F5155 !important;
+        border-right: none !important;
+        margin-right: 8px !important;
+    }
+    /* Down-pointing triangle (expanded) */
+    [data-testid="stExpander"] details[open] > summary::before,
+    details[open] > summary::before {
+        border-top: 7px solid #4F5155 !important;
+        border-bottom: none !important;
+        border-left: 5px solid transparent !important;
+        border-right: 5px solid transparent !important;
+    }
+    [data-testid="stExpander"],
+    [data-testid="stExpander"] > div {
+        border-color: #E8E6E0 !important;
+        background-color: #ffffff !important;
+    }
+    [data-testid="stExpanderDetails"] {
+        background-color: #ffffff !important;
+    }
+    /* Ensure dataframe text is visible inside expanders */
+    [data-testid="stExpanderDetails"] [data-testid="stDataFrame"],
+    [data-testid="stExpanderDetails"] [data-testid="stDataFrame"] * {
+        --gdg-text-dark: #4F5155 !important;
+        --gdg-text-header: #1F2257 !important;
+        --gdg-bg-cell: #ffffff !important;
+        --gdg-bg-header: #F9F4E6 !important;
+    }
+    [data-testid="stExpanderDetails"] table,
+    [data-testid="stTable"] table {
+        color: #4F5155 !important;
+        width: 100% !important;
+    }
+    [data-testid="stExpanderDetails"] table td,
+    [data-testid="stExpanderDetails"] table th,
+    [data-testid="stTable"] table td,
+    [data-testid="stTable"] table th {
+        color: #4F5155 !important;
+        padding: 8px 12px !important;
+    }
+    [data-testid="stExpanderDetails"] table th,
+    [data-testid="stTable"] table th {
+        background-color: #F9F4E6 !important;
+        color: #1F2257 !important;
+        font-weight: 600 !important;
+    }
+
+    /* ── Info / Warning / Error banners ── */
+    .stAlert, [data-testid="stAlert"] {
+        background-color: #DAEBF5 !important;
+        color: #1F2257 !important;
+        border-color: #7D9BC1 !important;
+    }
+    [data-testid="stAlert"] * {
+        color: #1F2257 !important;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       BUTTONS
+       ══════════════════════════════════════════════════════════════ */
+    .stButton > button[kind="primary"],
+    button[data-testid="stBaseButton-primary"] {
+        background-color: #B17455 !important;
+        border-color: #B17455 !important;
+        color: white !important;
+        font-weight: 500 !important;
+        border-radius: 8px !important;
+        transition: all 0.15s ease !important;
+    }
+    .stButton > button[kind="primary"]:hover,
+    button[data-testid="stBaseButton-primary"]:hover {
+        background-color: #9A6349 !important;
+        border-color: #9A6349 !important;
+    }
+    .stButton > button:not([kind="primary"]),
+    button[data-testid="stBaseButton-secondary"] {
+        background-color: #ffffff !important;
+        border-color: #D3CEBD !important;
+        color: #4F5155 !important;
+        border-radius: 8px !important;
+    }
+    .stButton > button:not([kind="primary"]):hover,
+    button[data-testid="stBaseButton-secondary"]:hover {
+        background-color: #F9F4E6 !important;
+        border-color: #B17455 !important;
+    }
+    /* Download button — warm orange, matches brand */
+    .stDownloadButton > button {
+        background-color: #B17455 !important;
+        border-color: #B17455 !important;
+        color: white !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        transition: all 0.15s ease !important;
+    }
+    .stDownloadButton > button:hover {
+        background-color: #9A6349 !important;
+        border-color: #9A6349 !important;
+    }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] {
+        background-color: transparent !important;
+    }
+    .stTabs [data-baseweb="tab-list"] button {
+        color: #636569 !important;
+        background-color: transparent !important;
+    }
+    .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {
+        color: #B17455 !important;
+        border-bottom-color: #B17455 !important;
+    }
+    .stTabs [data-baseweb="tab-panel"] {
+        background-color: transparent !important;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       TOGGLE — make it visible with a warm highlight
+       ══════════════════════════════════════════════════════════════ */
+    .stToggle, [data-testid="stToggle"] {
+        background-color: #F9F4E6 !important;
+        border: 1px solid #D3CEBD !important;
+        border-radius: 8px !important;
+        padding: 8px 12px !important;
+    }
+    .stToggle label span, .stCheckbox label span,
+    [data-testid="stToggle"] label span {
+        color: #1F2257 !important;
+        font-weight: 500 !important;
+    }
+
+    /* ── Radio buttons ── */
+    .stRadio > div > label, .stRadio label {
+        color: #4F5155 !important;
+    }
+
+    /* ── Slider ── */
+    .stSlider label, .stSlider [data-testid="stTickBarMin"],
+    .stSlider [data-testid="stTickBarMax"],
+    .stSlider [data-testid="stThumbValue"] {
+        color: #4F5155 !important;
+    }
+
+    /* ── Spinner ── */
+    .stSpinner > div, .stSpinner > div * {
+        color: #4F5155 !important;
+    }
+
+    /* ── Plotly chart backgrounds — transparent so page bg shows ── */
+    .js-plotly-plot .plotly .main-svg {
+        background: transparent !important;
+    }
+
+    /* ── Dividers ── */
+    hr { border-color: #D3CEBD !important; }
+
+    /* ── Scrollbar — subtle warm ── */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #F9F4E6; }
+    ::-webkit-scrollbar-thumb { background: #D3CEBD; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #AFB2B3; }
+
+    /* ── Container borders (scrollable chart block) ── */
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: #E8E6E0 !important;
+        background-color: #FAFAF8 !important;
+    }
+
+    /* ── Toast messages ── */
+    [data-testid="stToast"], [data-testid="stToast"] * {
+        background-color: #ffffff !important;
+        color: #4F5155 !important;
+    }
+
+    /* ══════════════════════════════════════════════════════════════
+       HTML TABLES — replaces st.dataframe() for guaranteed visibility.
+       White background, dark text, visible grid lines, branded headers.
+       ══════════════════════════════════════════════════════════════ */
+    .ps-table-wrap {
+        width: 100%;
+        border: 1px solid #E8E6E0;
+        border-radius: 8px;
+        overflow: auto;
+        background: #ffffff;
+        margin-bottom: 0.5rem;
+    }
+    .ps-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: 'Poppins', Arial, sans-serif;
+        font-size: 13px;
+        color: #4F5155;
+        background: #ffffff;
+    }
+    .ps-table thead th {
+        background: #F9F4E6 !important;
+        color: #1F2257 !important;
+        font-weight: 600;
+        font-size: 12px;
+        padding: 10px 12px;
+        border-bottom: 2px solid #D3CEBD;
+        text-align: left;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        white-space: nowrap;
+    }
+    .ps-table tbody td {
+        padding: 8px 12px;
+        border-bottom: 1px solid #F0EDE5;
+        color: #4F5155 !important;
+        background: #ffffff;
+        font-size: 13px;
+    }
+    .ps-table tbody tr:nth-child(even) td {
+        background: #FEFDFB;
+    }
+    .ps-table tbody tr:hover td {
+        background: #F9F4E6;
+    }
+
+    /* ── Nuclear: force light on Streamlit's internal theme attribute ── */
+    [data-testid="stAppViewContainer"][data-theme="dark"],
+    .stApp[data-theme="dark"] {
+        background-color: #FAFAF8 !important;
+        color: #4F5155 !important;
+    }
+
+    /* ── Force prefers-color-scheme: light within iframes ── */
+    iframe {
+        color-scheme: light !important;
+    }
+</style>
+<script>
+    // Force Streamlit to use light theme by setting localStorage
+    // and removing any dark-theme data attributes
+    (function() {
+        try {
+            localStorage.setItem('stActiveTheme-/-v1',
+                JSON.stringify({name:"Light", themeInput:{
+                    primaryColor:"#B17455",
+                    backgroundColor:"#FAFAF8",
+                    secondaryBackgroundColor:"#F9F4E6",
+                    textColor:"#4F5155",
+                    base:"light",
+                    font:"sans serif"
+                }}));
+            // Remove dark theme attributes if present
+            document.querySelectorAll('[data-theme="dark"]').forEach(
+                el => el.setAttribute('data-theme', 'light'));
+            // Also set on documentElement
+            document.documentElement.setAttribute('data-theme', 'light');
+            document.documentElement.style.colorScheme = 'light';
+        } catch(e) {}
+    })();
+</script>
+""", unsafe_allow_html=True)
+
+# ─── Styled HTML table helper (replaces st.dataframe for visibility) ─
+def _render_table(df, height=None, hide_index=True, max_rows=1000):
+    """Render a DataFrame as a styled HTML table with guaranteed white bg + dark text.
+
+    Large DataFrames are automatically truncated to *max_rows* for display.
+    The full dataset is untouched — only the browser rendering is capped.
+    """
+    truncated = False
+    display_df = df
+    if max_rows and len(df) > max_rows:
+        display_df = df.head(max_rows)
+        truncated = True
+
+    html = display_df.to_html(
+        index=not hide_index,
+        classes="ps-table",
+        border=0,
+        escape=False,
+        na_rep="—",
+    )
+    wrapper_style = ""
+    if height:
+        wrapper_style = f' style="max-height:{height}px;overflow-y:auto;"'
+    st.markdown(
+        f'<div class="ps-table-wrap"{wrapper_style}>{html}</div>',
+        unsafe_allow_html=True,
+    )
+    if truncated:
+        st.caption(f"Showing first {max_rows:,} of {len(df):,} rows. Download CSV/Excel for full data.")
+
+
+# ─── Property Funnel — consistent cascade across all tabs ────────────
+def _render_property_funnel(
+    n_total=None,
+    n_api=None,
+    n_with_charges=None,
+    n_with_adoption=None,
+    n_comparable=None,
+    n_with_launch=None,
+):
+    """Render a one-line property cascade/funnel showing the filtering steps.
+
+    Shows the chain:  Total → API access → Charge data → [Adoption data] → [Comparable]
+    Each step only appears if its count is provided.
+    """
+    steps = []
+    if n_total is not None:
+        steps.append(f"<strong>{n_total}</strong> total")
+    if n_api is not None:
+        steps.append(f"<strong>{n_api}</strong> with API")
+    if n_with_charges is not None:
+        steps.append(f"<strong>{n_with_charges}</strong> with charge data")
+    if n_with_launch is not None:
+        steps.append(f"<strong>{n_with_launch}</strong> with launch date")
+    if n_with_adoption is not None:
+        steps.append(f"<strong>{n_with_adoption}</strong> with adoption data")
+    if n_comparable is not None:
+        steps.append(f"<strong>{n_comparable}</strong> comparable")
+
+    if not steps:
+        return
+
+    chain = ' <span style="color:#B17455;font-weight:600">→</span> '.join(steps)
+    st.markdown(
+        f'<div style="background:#F9F4E6;border:1px solid #E8E4DA;border-radius:8px;'
+        f'padding:10px 16px;margin-bottom:16px;font-family:Poppins,Arial,sans-serif;'
+        f'font-size:13px;color:#4F5155">'
+        f'<span style="color:#636569;font-size:11px;text-transform:uppercase;'
+        f'letter-spacing:0.5px;font-weight:600">Properties: </span>'
+        f'{chain}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─── Snowflake connection (cached, with auto-reconnect) ─────────────
+from snowflake_auth import get_snowflake_connection as _build_sf_conn
+from snowflake_auth import get_app_secret as _get_app_secret
+
+@st.cache_resource
+def _create_snowflake_connection():
+    # Prefers keypair auth (SNOWFLAKE_PRIVATE_KEY_PATH); falls back to password.
+    return _build_sf_conn()
+
+
+def get_snowflake_connection():
+    """Return a live Snowflake connection, reconnecting if the token expired."""
+    conn = _create_snowflake_connection()
+    try:
+        conn.cursor().execute("SELECT 1")
+    except Exception:
+        # Token expired or connection lost — clear cache and reconnect
+        _create_snowflake_connection.clear()
+        conn = _create_snowflake_connection()
+    return conn
+
+
+# In Streamlit-in-Snowflake these come from Snowflake SECRETs attached to
+# the STREAMLIT object; locally from .env (see snowflake_auth.get_app_secret).
+YARDI_LICENSE_TOKEN = _get_app_secret("YARDI_LICENSE_TOKEN", "")
+ENTRATA_API_KEY = _get_app_secret("ENTRATA_API_KEY", "")
+ENTRATA_BASE_URL = "https://apis.entrata.com/ext/orgs"
+
+# ─── SOAP / API helpers ─────────────────────────────────────────────
+SOAP_ACTION = "http://tempuri.org/YSI.Interfaces.WebServices/ItfResidentData/GetRentroll"
+SOAP_HEADERS = {
+    "Content-Type": "text/xml; charset=utf-8",
+    "SOAPAction": SOAP_ACTION,
+}
+
+
+def build_soap_payload(row: dict, license_token: str,
+                       move_date: str, charge_from: str, charge_to: str) -> str:
+    """Build SOAP XML for GetRentroll.
+
+    Parameters
+    ----------
+    move_date : str   – earliest MoveIn/MoveOut date (tenant filter)
+    charge_from : str – earliest lease-charge FromDate to return
+    charge_to : str   – latest date for lease-charge range (usually today)
+    """
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetRentroll xmlns="http://tempuri.org/YSI.Interfaces.WebServices/ItfResidentData">
+        <UserName>{row['USER_NAME']}</UserName>
+        <Password>{row['PASSWORD']}</Password>
+        <ServerName>{row['SERVER_NAME']}</ServerName>
+        <Database>{row['DATABASE_NAME']}</Database>
+        <Platform>Yardi</Platform>
+        <InterfaceEntity>PetScreening</InterfaceEntity>
+        <InterfaceLicense>{license_token}</InterfaceLicense>
+        <YardiPropertyId>{row['PROPERTY_CODE']}</YardiPropertyId>
+        <MoveIn>{move_date}</MoveIn>
+        <MoveOut>{move_date}</MoveOut>
+        <LeaseChgFrom>{charge_from}</LeaseChgFrom>
+        <LeaseChgTo>{charge_to}</LeaseChgTo>
+    </GetRentroll>
+  </soap:Body>
+</soap:Envelope>"""
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _etree_to_obj(elem):
+    children = list(elem)
+    if not children:
+        return (elem.text or "").strip()
+    obj = {}
+    for child in children:
+        tag = _strip_ns(child.tag)
+        val = _etree_to_obj(child)
+        if tag in obj:
+            if not isinstance(obj[tag], list):
+                obj[tag] = [obj[tag]]
+            obj[tag].append(val)
+        else:
+            obj[tag] = val
+    return obj
+
+
+def xml_to_dict(xml_text: str):
+    root = ET.fromstring(xml_text)
+    return {_strip_ns(root.tag): _etree_to_obj(root)}
+
+
+def extract_property(parsed_payload):
+    try:
+        docs = (
+            parsed_payload
+            .get("Envelope", {})
+            .get("Body", {})
+            .get("GetRentrollResponse", {})
+            .get("GetRentrollResult", {})
+            .get("XmlDocument", [])
+        )
+        if not isinstance(docs, list):
+            docs = [docs]
+        for doc in docs:
+            props = doc.get("Properties")
+            if isinstance(props, dict):
+                prop = props.get("Property")
+                if prop:
+                    return prop
+        return None
+    except Exception:
+        return None
+
+
+def extract_charges_from_property(prop_data, property_row):
+    """Extract ALL lease charges (flat rows) from a property's rent roll."""
+    rows = []
+    if not isinstance(prop_data, dict):
+        return rows
+
+    units = prop_data.get("Units", {})
+    if not isinstance(units, dict):
+        return rows
+    unit_list = units.get("Unit", [])
+    if not isinstance(unit_list, list):
+        unit_list = [unit_list]
+
+    for unit in unit_list:
+        if not isinstance(unit, dict):
+            continue
+        unit_code = unit.get("UnitCode", "")
+        unit_type = unit.get("UnitType", "")
+        market_rent = unit.get("MarketRent", "")
+
+        tenants_raw = unit.get("Tenants", {})
+        if not isinstance(tenants_raw, dict):
+            continue
+        tenant_list = tenants_raw.get("Tenant", [])
+        if not isinstance(tenant_list, list):
+            tenant_list = [tenant_list]
+
+        for tenant in tenant_list:
+            if not isinstance(tenant, dict):
+                continue
+            tenant_code = tenant.get("TenantCode", "")
+            first_name = tenant.get("FirstName", "")
+            last_name = tenant.get("LastName", "")
+            tenant_status = tenant.get("TenantStatus", "")
+            lease_from = tenant.get("LeaseFrom", "")
+            lease_to = tenant.get("LeaseTo", "")
+            move_in = tenant.get("MoveIn", "")
+            move_out = tenant.get("MoveOut", "")
+            email = tenant.get("Email", "")
+
+            charges = tenant.get("LeaseCharges", "")
+            if not charges or not isinstance(charges, dict):
+                continue
+            charge_list = charges.get("LeaseCharge", [])
+            if not isinstance(charge_list, list):
+                charge_list = [charge_list]
+
+            for charge in charge_list:
+                if not isinstance(charge, dict):
+                    continue
+                rows.append({
+                    "parent_company": property_row["PARENT_COMPANY_NAME"],
+                    "property_id": property_row["PROPERTY_ID"],
+                    "property_name": property_row["PROPERTY_NAME"],
+                    "property_code": property_row["PROPERTY_CODE"],
+                    "launch_date": property_row.get("PROPERTY_LAUNCH_DATE"),
+                    "unit_code": unit_code,
+                    "unit_type": unit_type,
+                    "market_rent": market_rent,
+                    "tenant_code": tenant_code,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "tenant_status": tenant_status,
+                    "lease_from": lease_from,
+                    "lease_to": lease_to,
+                    "move_in": move_in,
+                    "move_out": move_out,
+                    "email": email,
+                    "charge_code": charge.get("ChargeCode", ""),
+                    "charge_type": charge.get("ChargeType", ""),
+                    "charge_amount": charge.get("ChargeAmount", ""),
+                    "charge_from_date": charge.get("FromDate", ""),
+                    "charge_to_date": charge.get("ToDate", ""),
+                })
+    return rows
+
+
+# ─── Snowflake queries ───────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_parent_companies():
+    """Count ALL properties per parent company from d_properties (total + yardi-integrated)."""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT
+            p.parent_company_name,
+            MAX(p.parent_company_ancestry_id)    AS ancestry_id,
+            MAX(p.parent_company_ancestry_name)   AS ancestry_name,
+            COUNT(DISTINCT p.property_id)         AS total_props,
+            COUNT(DISTINCT CASE
+                WHEN i.integration_id IS NOT NULL AND i.system = 'yardi'
+                THEN p.property_id
+            END) AS api_props
+        FROM PROD.COMMON.D_PROPERTIES p
+        LEFT JOIN PROD.STAGING.STG_PETSCREENING__INTEGRATIONS i
+            ON p.integration_id = i.integration_id
+           AND i.system = 'yardi'
+        WHERE p.parent_company_name IS NOT NULL
+        GROUP BY 1
+        HAVING api_props > 0
+        ORDER BY 1
+    """)
+    return cur.fetchall()
+
+
+@st.cache_data(ttl=300)
+def load_all_properties():
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT DISTINCT
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            p.parent_company_ancestry_id
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.property_source_name = 'yardi'
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def load_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    where_clause = """
+        WHERE i.system = 'yardi'
+          AND p.property_source_name = 'yardi'
+    """
+    if parent_company_name:
+        where_clause += f" AND p.parent_company_name = '{parent_company_name}'"
+    if property_id:
+        where_clause += f" AND p.property_id = {property_id}"
+    if ancestry_id:
+        where_clause += f" AND p.parent_company_ancestry_id = '{ancestry_id}'"
+
+    cur.execute(f"""
+        SELECT DISTINCT
+            i.integration_id,
+            PARSE_JSON(i.settings):"resident_data_url"::STRING AS resident_data_url,
+            PARSE_JSON(i.settings):"user_name"::STRING         AS user_name,
+            PARSE_JSON(i.settings):"password"::STRING           AS password,
+            PARSE_JSON(i.settings):"server_name"::STRING        AS server_name,
+            PARSE_JSON(i.settings):"database_name"::STRING      AS database_name,
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            COALESCE(
+                PARSE_JSON(u.SOURCE_EXTERNAL_ID):"property_code"::STRING,
+                PARSE_JSON(p.PROPERTY_SOURCE_ID):"code"::STRING
+            ) AS property_code,
+            kf.property_launch_date
+        FROM PROD.COMMON.D_PROPERTIES p
+        JOIN PROD.STAGING.STG_PETSCREENING__INTEGRATIONS i
+            ON p.integration_id = i.integration_id
+        LEFT JOIN PROD.STAGING.STG_PETSCREENING__UNITS u
+            ON PARSE_JSON(u.SOURCE_EXTERNAL_ID):"property_code"::STRING =
+               PARSE_JSON(p.property_source_id):"code"::STRING
+        LEFT JOIN PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS kf
+            ON p.property_id = kf.property_id
+        {where_clause}
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+# ─── Entrata Snowflake queries ────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_entrata_parent_companies():
+    """Count ALL properties per parent company that have Entrata integrations.
+
+    total_props = every property under the parent company in d_properties
+    api_props   = only those with active Entrata API integrations
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT
+            p.parent_company_name,
+            MAX(p.parent_company_ancestry_id)    AS ancestry_id,
+            MAX(p.parent_company_ancestry_name)   AS ancestry_name,
+            COUNT(DISTINCT p.property_id)         AS total_props,
+            COUNT(DISTINCT CASE
+                WHEN i.integration_id IS NOT NULL AND i.system = 'entrata'
+                     AND i.state = 'enabled'
+                     AND p.integration_status = 'enabled'
+                     AND p.property_status = 'active'
+                THEN p.property_id
+            END) AS api_props
+        FROM PROD.COMMON.D_PROPERTIES p
+        LEFT JOIN PROD.STAGING.STG_PETSCREENING__INTEGRATIONS i
+            ON p.integration_id = i.integration_id
+           AND i.system = 'entrata'
+        WHERE p.parent_company_name IS NOT NULL
+        GROUP BY 1
+        HAVING api_props > 0
+        ORDER BY 1
+    """)
+    return cur.fetchall()
+
+
+@st.cache_data(ttl=300)
+def load_entrata_all_properties():
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT DISTINCT
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            p.parent_company_ancestry_id
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.property_source_name = 'entrata'
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def load_entrata_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    where_clause = """
+        WHERE i.system = 'entrata'
+          AND p.property_source_name = 'entrata'
+          AND i.state = 'enabled'
+          AND p.integration_status = 'enabled'
+          AND p.property_status = 'active'
+          AND PARSE_JSON(p.property_source_id):"property_id"::STRING IS NOT NULL
+          AND PARSE_JSON(i.settings):"corp_id"::STRING IS NOT NULL
+    """
+    if parent_company_name:
+        where_clause += f" AND p.parent_company_name = '{parent_company_name}'"
+    if property_id:
+        where_clause += f" AND p.property_id = {property_id}"
+    if ancestry_id:
+        where_clause += f" AND p.parent_company_ancestry_id = '{ancestry_id}'"
+
+    cur.execute(f"""
+        SELECT DISTINCT
+            i.integration_id,
+            PARSE_JSON(i.settings):"corp_id"::STRING AS corp_id,
+            PARSE_JSON(p.property_source_id):"property_id"::STRING AS entrata_property_id,
+            p.property_id          AS property_id,
+            p.property_name        AS property_name,
+            p.parent_company_name  AS parent_company_name,
+            PARSE_JSON(p.property_source_id):"property_id"::STRING AS property_code,
+            kf.property_launch_date AS property_launch_date
+        FROM PROD.COMMON.D_PROPERTIES p
+        JOIN PROD.STAGING.STG_PETSCREENING__INTEGRATIONS i
+            ON p.integration_id = i.integration_id
+        LEFT JOIN PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS kf
+            ON p.property_id = kf.property_id
+        {where_clause}
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+# ─── Entrata API fetch ────────────────────────────────────────────────
+def _extract_charges_from_entrata_lease(lease_obj, property_row):
+    """Flatten an Entrata lease JSON into rows matching the Yardi all_charges_df shape.
+
+    Key Entrata-specific handling vs Yardi:
+
+    1. **Interval filtering** — Entrata leases can contain multiple intervals
+       (original, renewals, cancelled attempts). We only include charges from
+       intervals with status Current / Past / Notice.  Cancelled / Applicant /
+       Future intervals are dropped so we don't count revenue from leases that
+       never went live.
+
+    2. **Charge→interval linkage** — Each scheduledCharge carries a
+       leaseIntervalId that ties it to a specific interval.  We use this to
+       skip charges attached to cancelled renewal attempts.
+
+    3. **Deduplication key** — Charges belong to the *lease*, not an individual
+       customer.  Every customer row for the same lease has identical charges.
+       We still emit one row per customer×charge (so all customers appear in
+       the paying-set for missing-pet-rent matching), but stamp each row with
+       ``_entrata_charge_dedup_key`` so downstream revenue aggregation can
+       ``drop_duplicates`` before summing.
+
+    4. **Frequency-based end-date logic** — Entrata provides a ``frequency``
+       field on each charge.  One-Time charges get charge_to = charge_from
+       (same day) so they don't get spread across months.  Monthly charges
+       with no endDate fall back to the interval's lease_to.
+
+    5. **Status field choice** — We filter on ``leaseIntervalStatus`` (did the
+       lease go live?) NOT ``leaseCustomerStatus`` (is this person still on
+       the lease?).  A guarantor with customerStatus="Cancelled" on a
+       "Notice" lease should not cause us to drop the lease's charges.
+    """
+    rows = []
+
+    # ── Parse customers ────────────────────────────────────────────────
+    customers_data = lease_obj.get("customers", {})
+    customers = customers_data.get("customer", [])
+    if isinstance(customers, dict):
+        customers = [customers]
+    if not customers:
+        return rows
+
+    # ── Parse lease intervals — find valid ones ────────────────────────
+    VALID_INTERVAL_STATUSES = {"current", "past", "notice"}
+    INVALID_INTERVAL_STATUSES = {"cancelled", "applicant", "denied", "future"}
+
+    intervals_data = lease_obj.get("leaseIntervals", {})
+    intervals = intervals_data.get("leaseInterval", [])
+    if isinstance(intervals, dict):
+        intervals = [intervals]
+
+    valid_interval_ids = set()
+    interval_info = {}  # interval_id → {status, startDate, endDate}
+    for iv in intervals:
+        iv_id = str(iv.get("id", ""))
+        iv_status = str(iv.get("status", "")).strip().lower()
+        if iv_status not in INVALID_INTERVAL_STATUSES:
+            valid_interval_ids.add(iv_id)
+            interval_info[iv_id] = {
+                "status": iv_status,
+                "start": iv.get("startDate", ""),
+                "end": iv.get("endDate", ""),
+            }
+
+    # Fallback: if no detailed intervals, check top-level lease fields
+    top_level_status = str(lease_obj.get("leaseIntervalStatus", "")).strip().lower()
+    top_level_interval_id = str(lease_obj.get("leaseIntervalId", ""))
+    if not valid_interval_ids and top_level_status not in INVALID_INTERVAL_STATUSES:
+        valid_interval_ids.add(top_level_interval_id)
+        interval_info[top_level_interval_id] = {
+            "status": top_level_status,
+            "start": "",
+            "end": "",
+        }
+
+    if not valid_interval_ids:
+        return rows
+
+    # ── Parse lease activities for date fallbacks ──────────────────────
+    activities_data = lease_obj.get("leaseActivities", {})
+    activities = activities_data.get("leasesActivity", [])
+    if isinstance(activities, dict):
+        activities = [activities]
+    act_dates = {}
+    for act in activities:
+        et = act.get("eventType", "")
+        dt = act.get("date", "")
+        if et and dt:
+            act_dates[et] = dt
+
+    lease_from_fallback = act_dates.get("Lease From", "")
+    lease_to_fallback = act_dates.get("Lease To", "")
+
+    lease_id = str(lease_obj.get("id", ""))
+    unit_number = lease_obj.get("unitNumberSpace", "")
+    unit_id = lease_obj.get("unitId", "")
+
+    # ── Parse scheduled charges — keep only valid-interval charges ─────
+    charges_data = lease_obj.get("scheduledCharges", {})
+    charges = charges_data.get("scheduledCharge", [])
+    if isinstance(charges, dict):
+        charges = [charges]
+
+    valid_charges = []
+    for ch in charges:
+        ch_interval_id = str(ch.get("leaseIntervalId", ""))
+
+        # If the charge has an interval ID, skip unless that interval is valid
+        if ch_interval_id and ch_interval_id not in valid_interval_ids:
+            continue
+
+        iv = interval_info.get(ch_interval_id, {})
+        iv_lease_from = iv.get("start", "") or lease_from_fallback
+        iv_lease_to = iv.get("end", "") or lease_to_fallback
+
+        frequency = ch.get("frequency", "")
+        charge_from = ch.get("startDate", "")
+        charge_to = ch.get("endDate", "")
+
+        # ── Frequency-based end-date logic ──
+        freq_lower = (frequency or "").strip().lower()
+        if freq_lower == "one-time":
+            # One-time charges: same day, do NOT spread across months
+            charge_to = charge_from
+        elif not charge_to or str(charge_to).strip() == "":
+            # Monthly charges missing endDate → fall back to interval lease_to
+            charge_to = iv_lease_to
+
+        valid_charges.append({
+            "charge_code": ch.get("chargeCode", ""),
+            "charge_type": ch.get("chargeType", ""),
+            "charge_amount": ch.get("amount", ""),
+            "charge_from_date": charge_from,
+            "charge_to_date": charge_to,
+            "frequency": frequency,
+            "lease_interval_id": ch_interval_id,
+            "iv_lease_from": iv_lease_from,
+            "iv_lease_to": iv_lease_to,
+        })
+
+    # ── Emit rows: every customer × every valid charge ─────────────────
+    #
+    # WHY emit for all customers (not just primary)?
+    # Charges belong to the lease, but downstream _build_paying_sets needs
+    # every customer's email/tenant_code in the paying set so roommates
+    # aren't flagged as "missing pet rent".  Revenue dedup happens later
+    # via _entrata_charge_dedup_key.
+    for cust in customers:
+        first_name = cust.get("firstName", "")
+        last_name = cust.get("lastName", "")
+        customer_id = cust.get("id", "")
+        customer_type = cust.get("customerType", "")
+        customer_status = cust.get("leaseCustomerStatus", "")
+        move_in = cust.get("moveInDate", "") or act_dates.get("Actual Move In", "")
+        move_out = cust.get("moveOutDate", "") or act_dates.get("Actual Move Out", "")
+
+        # Email: try direct field, then addresses.address
+        email = cust.get("email", "")
+        if not email:
+            addrs = cust.get("addresses", {})
+            if isinstance(addrs, dict):
+                addr = addrs.get("address", {})
+                if isinstance(addr, dict):
+                    email = addr.get("email", "") or addr.get("additionalEmail", "")
+
+        base_row = {
+            "parent_company": property_row["PARENT_COMPANY_NAME"],
+            "property_id": property_row["PROPERTY_ID"],
+            "property_name": property_row["PROPERTY_NAME"],
+            "property_code": property_row["PROPERTY_CODE"],
+            "launch_date": property_row.get("PROPERTY_LAUNCH_DATE"),
+            "unit_code": unit_number or unit_id,
+            "unit_type": "",
+            "market_rent": "",
+            "lease_id": lease_id,
+            "tenant_code": customer_id,
+            "first_name": first_name,
+            "last_name": last_name,
+            "tenant_status": customer_status,
+            "move_in": move_in,
+            "move_out": move_out,
+            "email": email,
+        }
+
+        if not valid_charges:
+            # Tenant-only row (for reports, even when no charges)
+            rows.append({
+                **base_row,
+                "lease_from": lease_from_fallback,
+                "lease_to": lease_to_fallback,
+                "charge_code": "",
+                "charge_type": "",
+                "charge_amount": "",
+                "charge_from_date": "",
+                "charge_to_date": "",
+                "frequency": "",
+                "lease_interval_id": "",
+                "_entrata_charge_dedup_key": "",
+            })
+            continue
+
+        for ch in valid_charges:
+            dedup_key = (
+                f"{lease_id}|{ch['lease_interval_id']}|"
+                f"{ch['charge_code']}|{ch['charge_from_date']}|{ch['charge_amount']}"
+            )
+            rows.append({
+                **base_row,
+                "lease_from": ch["iv_lease_from"],
+                "lease_to": ch["iv_lease_to"],
+                "charge_code": ch["charge_code"],
+                "charge_type": ch["charge_type"],
+                "charge_amount": ch["charge_amount"],
+                "charge_from_date": ch["charge_from_date"],
+                "charge_to_date": ch["charge_to_date"],
+                "frequency": ch["frequency"],
+                "lease_interval_id": ch["lease_interval_id"],
+                "_entrata_charge_dedup_key": dedup_key,
+            })
+
+    return rows
+
+
+def _extract_ar_charges_from_entrata_lease(lease_obj, property_row):
+    """Extract AR (actual posted) transactions from an Entrata lease.
+
+    Returns a list of dicts with actual posted charges including amount paid.
+    Only pet-related charge codes are kept (matched case-insensitively against
+    common pet charge code names).
+    """
+    PET_KEYWORDS = {
+        'pet rent', 'pet fee', 'pet deposit', 'pet damage',
+        'animal rent', 'animal fee', 'animal deposit',
+        'pet', 'pet charge', 'monthly pet', 'pet premium',
+        'companion animal', 'esa fee', 'esa rent',
+    }
+    rows = []
+    ar_data = lease_obj.get("arTransactions", {})
+    if not ar_data:
+        return rows
+    transactions = ar_data.get("arTransaction", [])
+    if isinstance(transactions, dict):
+        transactions = [transactions]
+
+    lease_id = str(lease_obj.get("id", ""))
+    unit_number = lease_obj.get("unitNumberSpace", "")
+
+    PARTIAL_KEYWORDS = {'pet', 'animal', 'companion'}
+    for txn in transactions:
+        code_name = str(txn.get("chargeCodeName", "")).strip()
+        if not code_name:
+            continue
+        code_lower = code_name.lower()
+        # Match exact keywords OR any partial substring match
+        if code_lower not in PET_KEYWORDS and not any(kw in code_lower for kw in PARTIAL_KEYWORDS):
+            continue
+        rows.append({
+            "property_id": property_row["PROPERTY_ID"],
+            "property_name": property_row["PROPERTY_NAME"],
+            "launch_date": property_row.get("PROPERTY_LAUNCH_DATE"),
+            "lease_id": lease_id,
+            "unit": unit_number,
+            "charge_code_name": code_name,
+            "charge_code_id": txn.get("chargeCodeId", ""),
+            "amount": txn.get("amount", 0),
+            "amount_paid": txn.get("amountPaid", 0),
+            "balance_due": txn.get("balanceDue", 0),
+            "post_date": txn.get("postDate", ""),
+            "post_month": txn.get("postMonth", ""),
+            "transaction_date": txn.get("transactionDate", ""),
+            "description": txn.get("description", ""),
+        })
+    return rows
+
+
+def _fetch_entrata_leases_for_property(prop, api_key):
+    """Call Entrata getLeases for a single property with pagination. Returns (leases_list, error_msg)."""
+    corp_id = prop.get("CORP_ID")
+    entrata_pid = prop.get("ENTRATA_PROPERTY_ID") or prop.get("PROPERTY_CODE")
+
+    if not corp_id or not entrata_pid:
+        return [], "Missing corp_id or entrata_property_id"
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": api_key,
+    }
+
+    all_leases = []
+    page_no = 1
+    per_page = 500
+    max_pages = 200
+
+    while page_no <= max_pages:
+        api_url = f"{ENTRATA_BASE_URL}/{corp_id}/v1/leases?page_no={page_no}&per_page={per_page}"
+
+        request_body = {
+            "auth": {"type": "apikey"},
+            "requestId": page_no,
+            "method": {
+                "name": "getLeases",
+                "version": "r1",
+                "params": {
+                    "propertyId": entrata_pid,
+                    "includeArTransactions": 1,
+                    "includeLeaseHistory": 1,
+                    "includeScheduledCharges": 1,  # Explicitly request scheduled charges
+                    "leaseStatusTypeIds": "1,2,3,4,5,6",  # All statuses for full history
+                },
+            },
+        }
+
+        try:
+            resp = requests.post(api_url, json=request_body, headers=headers, timeout=120)
+            if resp.status_code == 401:
+                return [], "401 Unauthorized — check API key"
+            if resp.status_code == 403:
+                return [], f"403 Forbidden — corp_id={corp_id}"
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            return all_leases, f"Timeout on page {page_no}" if all_leases else "Timeout"
+        except requests.exceptions.HTTPError as e:
+            return all_leases, str(e)[:80]
+        except Exception as e:
+            return all_leases, str(e)[:80]
+
+        data = resp.json()
+        response_obj = data.get("response", {})
+        if response_obj.get("code") != 200:
+            err = response_obj.get("message", f"API code {response_obj.get('code')}")
+            return all_leases, err if not all_leases else None
+
+        result = response_obj.get("result", {})
+        leases_data = result.get("leases", {})
+        leases = leases_data.get("lease", [])
+        if isinstance(leases, dict):
+            leases = [leases]
+
+        all_leases.extend(leases)
+
+        if len(leases) < per_page:
+            break
+        meta = result.get("meta", {})
+        last_page = meta.get("lastPage", 0)
+        if last_page > 0 and meta.get("currentPage", 0) >= last_page:
+            break
+        page_no += 1
+
+    return all_leases, None
+
+
+def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months=24):
+    """Call Entrata getLeases API for each property, return normalized charge rows.
+
+    Returns (all_charges, results_log, all_ar_charges) tuple.  The first two
+    match the Yardi equivalent so downstream code works unchanged.
+    all_ar_charges contains actual posted AR transactions for comparison.
+    """
+    all_charges = []
+    all_ar_charges = []
+    all_raw_lease_arrays = []
+    results_log = []
+
+    for i, prop in enumerate(properties):
+        prop_name = prop['PROPERTY_NAME']
+        prop_code = prop.get('ENTRATA_PROPERTY_ID') or prop.get('PROPERTY_CODE', '')
+        progress = (i + 1) / len(properties)
+        progress_bar.progress(progress)
+        status_text.text(f"[{i+1}/{len(properties)}] Fetching {prop_name} (Entrata {prop_code})...")
+
+        leases, error_msg = _fetch_entrata_leases_for_property(prop, ENTRATA_API_KEY)
+        status_text.text(f"[{i+1}/{len(properties)}] {prop_name}: {len(leases)} leases, extracting charges...")
+
+        if error_msg and not leases:
+            results_log.append({
+                "property": prop_name, "code": prop_code,
+                "status": f"Error: {error_msg}", "charges": 0,
+            })
+            continue
+
+        charges = []
+        ar_charges_prop = []
+        for lease in leases:
+            charges.extend(_extract_charges_from_entrata_lease(lease, prop))
+            ar_charges_prop.extend(_extract_ar_charges_from_entrata_lease(lease, prop))
+
+            # Capture raw arrays for export
+            lease_id = str(lease.get("id", ""))
+            unit = lease.get("unitNumberSpace", "")
+            # Get primary customer name
+            _custs = lease.get("customers", {}).get("customer", [])
+            if isinstance(_custs, dict):
+                _custs = [_custs]
+            _primary = _custs[0] if _custs else {}
+            _tenant_name = f"{_primary.get('firstName', '')} {_primary.get('lastName', '')}".strip()
+            _tenant_status = _primary.get("leaseCustomerStatus", "")
+
+            # Raw scheduled charges array
+            _sched_raw = lease.get("scheduledCharges", {}).get("scheduledCharge", [])
+            if isinstance(_sched_raw, dict):
+                _sched_raw = [_sched_raw]
+            # Raw AR transactions array
+            _ar_raw = lease.get("arTransactions", {}).get("arTransaction", [])
+            if isinstance(_ar_raw, dict):
+                _ar_raw = [_ar_raw]
+
+            all_raw_lease_arrays.append({
+                "property_name": prop_name,
+                "property_code": prop_code,
+                "lease_id": lease_id,
+                "unit": unit,
+                "tenant": _tenant_name,
+                "tenant_status": _tenant_status,
+                "n_scheduled_charges": len(_sched_raw),
+                "n_ar_transactions": len(_ar_raw),
+                "scheduled_charges_json": json.dumps(_sched_raw, default=str),
+                "ar_transactions_json": json.dumps(_ar_raw, default=str),
+            })
+
+        if charges:
+            all_charges.extend(charges)
+            all_ar_charges.extend(ar_charges_prop)
+            status = f"Success ({len(leases)} leases)"
+            if error_msg:
+                status += f" (partial: {error_msg})"
+            results_log.append({
+                "property": prop_name, "code": prop_code,
+                "status": status, "charges": len(charges),
+            })
+        else:
+            all_ar_charges.extend(ar_charges_prop)
+            results_log.append({
+                "property": prop_name, "code": prop_code,
+                "status": "Warning: No charges found", "charges": 0,
+            })
+
+    progress_bar.progress(1.0)
+    status_text.text("Done!")
+    return all_charges, results_log, all_ar_charges, all_raw_lease_arrays
+
+
+
+# ─── RealPage / OneSite (Snowflake-backed) ───────────────────────────
+# Read from staging tables populated daily by EKS jobs. No live SOAP.
+# pmc_system value: 'real_page' (with underscore)
+# tenant_code = lease_id (from f_leases.lease_source_external_id:lease_id)
+
+@st.cache_data(ttl=300)
+def load_realpage_parent_companies():
+    """Count RealPage properties per parent company.
+
+    NOTE: RealPage uses global credentials — there's no integration_id check.
+    A property is "API-accessible" iff it's enabled + active in d_properties
+    AND its property_source_id has both pmcid and siteid populated.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT
+            p.parent_company_name,
+            MAX(p.parent_company_ancestry_id)    AS ancestry_id,
+            MAX(p.parent_company_ancestry_name)   AS ancestry_name,
+            COUNT(DISTINCT p.property_id)         AS total_props,
+            COUNT(DISTINCT CASE
+                WHEN p.property_status = 'active'
+                     AND p.integration_status = 'enabled'
+                     AND PARSE_JSON(p.property_source_id):"pmcid"::STRING IS NOT NULL
+                     AND PARSE_JSON(p.property_source_id):"siteid"::STRING IS NOT NULL
+                THEN p.property_id
+            END) AS api_props
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.parent_company_name IS NOT NULL
+          AND p.property_source_name = 'real_page'
+        GROUP BY 1
+        HAVING api_props > 0
+        ORDER BY 1
+    """)
+    return cur.fetchall()
+
+
+@st.cache_data(ttl=300)
+def load_realpage_all_properties():
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT DISTINCT
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            p.parent_company_ancestry_id
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.property_source_name = 'real_page'
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def load_realpage_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    """Load RealPage properties matching the selection criteria.
+
+    Returns rows with PMC_ID, SITE_ID, PROPERTY_ID, PROPERTY_NAME, etc.
+    No integration credential lookup — RealPage uses global creds.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    where_clause = """
+        WHERE p.property_source_name = 'real_page'
+          AND p.property_status = 'active'
+          AND p.integration_status = 'enabled'
+          AND PARSE_JSON(p.property_source_id):"pmcid"::STRING IS NOT NULL
+          AND PARSE_JSON(p.property_source_id):"siteid"::STRING IS NOT NULL
+    """
+    if parent_company_name:
+        _safe = parent_company_name.replace("'", "''")
+        where_clause += f" AND p.parent_company_name = '{_safe}'"
+    if property_id:
+        where_clause += f" AND p.property_id = {int(property_id)}"
+    if ancestry_id:
+        _safe = str(ancestry_id).replace("'", "''")
+        where_clause += f" AND p.parent_company_ancestry_id = '{_safe}'"
+
+    cur.execute(f"""
+        SELECT DISTINCT
+            PARSE_JSON(p.property_source_id):"pmcid"::STRING  AS pmc_id,
+            PARSE_JSON(p.property_source_id):"siteid"::STRING AS site_id,
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            PARSE_JSON(p.property_source_id):"siteid"::STRING AS property_code,
+            kf.property_launch_date AS property_launch_date
+        FROM PROD.COMMON.D_PROPERTIES p
+        LEFT JOIN PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS kf
+            ON p.property_id = kf.property_id
+        {where_clause}
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+# ─── RealPage charge fetch (Snowflake-backed, not live SOAP) ─────────
+def fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months=24):
+    """Read RealPage scheduled charges + residents from Snowflake staging,
+    join in SQL, and emit charge rows in the same shape as Yardi/Entrata.
+
+    Returns (all_charges, results_log) — same tuple shape as
+    fetch_rentroll_for_properties (Yardi) for downstream parity.
+
+    Single SQL roundtrip. The join logic mirrors the canonical pattern from
+    the standardized pet-signals SQL (see realpage-query-analysis.md):
+    direct match on (pmc_id, site_id, lease_id, resident_member_id), with
+    HOH-priority fallback to any resident on the same lease when direct match
+    misses. Lease_id is required because RealPage resident_member_id values are
+    not unique enough by themselves within a site.
+
+    The lookback_months argument is kept for interface compat but does not
+    constrain the data — BillStart/BillEnd carry the full charge lifespan
+    inside each row, and downstream display logic clips to the user's window.
+    """
+    if not properties:
+        return [], []
+
+    progress_bar.progress(0.05)
+    status_text.text(f"Reading RealPage data from Snowflake for {len(properties)} properties...")
+
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # Build a VALUES list for the property scope. We carry pmc_id, site_id,
+    # property_id (PetScreening), property_name, property_code, parent_company,
+    # and launch_date so the final SELECT can stamp every charge row.
+    def _esc(s):
+        return str(s if s is not None else "").replace("'", "''")
+
+    select_rows = []
+    for p in properties:
+        pmc = _esc(p.get("PMC_ID") or p.get("pmc_id") or "")
+        site = _esc(p.get("SITE_ID") or p.get("site_id") or "")
+        pid = int(p.get("PROPERTY_ID") or p.get("property_id") or 0)
+        pname = _esc(p.get("PROPERTY_NAME") or p.get("property_name") or "")
+        pcode = _esc(p.get("PROPERTY_CODE") or p.get("property_code") or site)
+        parent = _esc(p.get("PARENT_COMPANY_NAME") or p.get("parent_company_name") or "")
+        launch = p.get("PROPERTY_LAUNCH_DATE") or p.get("property_launch_date")
+        if launch:
+            try:
+                launch_str = launch.strftime("%Y-%m-%d") if hasattr(launch, "strftime") else str(launch)[:10]
+            except Exception:
+                launch_str = ""
+        else:
+            launch_str = ""
+        launch_sql = "NULL" if not launch_str else f"TO_DATE('{launch_str}')"
+        select_rows.append(
+            f"SELECT '{pmc}'::STRING AS pmc_id, '{site}'::STRING AS site_id, "
+            f"{pid}::NUMBER AS property_id, '{pname}'::STRING AS property_name, "
+            f"'{pcode}'::STRING AS property_code, '{parent}'::STRING AS parent_company_name, "
+            f"{launch_sql} AS property_launch_date"
+        )
+    values_sql = "\n        UNION ALL ".join(select_rows)
+
+    # Junk emails to filter out — must match the JUNK_EMAILS constant in app.py.
+    # Reusing it directly via Python f-string isn't ideal because this lives
+    # inside app.py once spliced; we reference JUNK_EMAILS at call time.
+    junk_email_clause = f"AND LOWER(TRIM(j.email)) NOT IN ({JUNK_EMAILS})"
+
+    sql = f"""
+    WITH props AS (
+        {values_sql}
+    ),
+    latest_charges AS (
+        SELECT
+            c.pmc_id, c.site_id, c.resh_id, c.lease_id, c.unit_id,
+            c.transaction_name, c.description, c.amount,
+            c.bill_start, c.bill_end, c.category_code, c.sub_journal,
+            TRY_TO_DATE(c.post_month) AS post_month,
+            c.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES c
+        JOIN props p ON c.pmc_id = p.pmc_id AND c.site_id = p.site_id
+        WHERE c.category_code = 'C'  -- skip P=Payment/Reimbursement
+          AND TRY_TO_DATE(c.post_month) IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (
+            -- RealPage scheduled charges are snapshots by requested PostMonth.
+            -- BillStart can be years earlier, but the API/raw table only proves
+            -- the charge existed for the post_month snapshot. Keep one row per
+            -- observed month instead of deduping to latest and back-projecting
+            -- BillStart history before the first available post_month.
+            PARTITION BY c.pmc_id, c.site_id, c.unit_id, c.lease_id,
+                         c.resh_id, c.transaction_name, TRY_TO_DATE(c.post_month)
+            ORDER BY c.ingested_at DESC
+        ) = 1
+    ),
+    all_residents AS (
+        SELECT
+            r.pmc_id, r.site_id, r.resident_member_id, r.lease_id, r.unit_id,
+            r.first_name, r.last_name, r.email, r.lease_status,
+            r.move_out_date, r.unit_number,
+            r.hoh_bit, r.signer_bit, r.active_bit, r.contact_status,
+            r.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+        JOIN props p ON r.pmc_id = p.pmc_id AND r.site_id = p.site_id
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY r.pmc_id, r.site_id, r.lease_id, r.resident_member_id
+            ORDER BY r.ingested_at DESC
+        ) = 1
+    ),
+    -- Pick the representative resident per (pmc, site, lease) using
+    -- HOH > signer > active > contact_status priority. This handles
+    -- the common case where ReshID on the charge does NOT directly match
+    -- a residentmemberid (in our spot-check, 0 of 169 (resh_id, lease_id)
+    -- pairs matched directly while 212 matched via lease_id only).
+    -- Lease-id is the canonical join key — same as the standardized
+    -- pet-signals SQL across PMCs.
+    lease_resident_pick AS (
+        SELECT
+            r.pmc_id, r.site_id, r.lease_id,
+            r.first_name, r.last_name, r.email,
+            r.lease_status, r.move_out_date, r.unit_number, r.hoh_bit
+        FROM all_residents r
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY r.pmc_id, r.site_id, r.lease_id
+            ORDER BY
+                CASE WHEN r.hoh_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.signer_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.active_bit = 'TRUE' THEN 0 ELSE 1 END,
+                CASE WHEN r.contact_status = 'Lease signer' THEN 0 ELSE 1 END,
+                COALESCE(r.last_name, ''),
+                COALESCE(r.first_name, '')
+        ) = 1
+    ),
+    -- Also pick a direct resident match by (pmc, site, lease_id, resh_id) when it
+    -- exists.  RealPage resident_member_id/ReshID values are not globally unique
+    -- within a site; joining only on resident_member_id can attribute a pet
+    -- charge to an unrelated historical resident and prevent the actual lease
+    -- from being recognized as paying.  If the lease does not line up, the join
+    -- intentionally misses and the lease-level fallback below is used.
+    direct_resident AS (
+        SELECT
+            r.pmc_id, r.site_id, r.lease_id, r.resident_member_id,
+            r.first_name, r.last_name, r.email,
+            r.lease_status, r.move_out_date, r.unit_number
+        FROM all_residents r
+    ),
+    joined AS (
+        SELECT
+            c.*,
+            COALESCE(dr.first_name,    lp.first_name)    AS resolved_first_name,
+            COALESCE(dr.last_name,     lp.last_name)     AS resolved_last_name,
+            COALESCE(dr.email,         lp.email)         AS resolved_email,
+            COALESCE(dr.lease_status,  lp.lease_status)  AS resolved_lease_status,
+            COALESCE(dr.move_out_date, lp.move_out_date) AS resolved_move_out_date,
+            COALESCE(dr.unit_number,   lp.unit_number)   AS resolved_unit_number,
+            CASE
+                WHEN dr.email IS NOT NULL THEN 'resh_id'
+                WHEN lp.email IS NOT NULL THEN 'lease_id'
+                ELSE 'no_match'
+            END AS match_type
+        FROM latest_charges c
+        LEFT JOIN direct_resident dr
+            ON dr.pmc_id = c.pmc_id
+           AND dr.site_id = c.site_id
+           AND dr.lease_id = c.lease_id
+           AND dr.resident_member_id = c.resh_id
+        LEFT JOIN lease_resident_pick lp
+            ON lp.pmc_id = c.pmc_id
+           AND lp.site_id = c.site_id
+           AND lp.lease_id = c.lease_id
+    )
+    SELECT
+        p.parent_company_name AS parent_company,
+        p.property_id          AS property_id,
+        p.property_name        AS property_name,
+        p.property_code        AS property_code,
+        p.property_launch_date AS launch_date,
+        COALESCE(j.resolved_unit_number, j.unit_id) AS unit_code,
+        ''                     AS unit_type,
+        ''                     AS market_rent,
+        j.lease_id::STRING     AS lease_id,
+        j.lease_id::STRING     AS tenant_code,
+        j.resolved_first_name  AS first_name,
+        j.resolved_last_name   AS last_name,
+        CASE j.resolved_lease_status
+            WHEN 'Current'                  THEN 'Current'
+            WHEN 'Former'                   THEN 'Past'
+            WHEN 'Future Lease'             THEN 'Future'
+            WHEN 'Applicant'                THEN 'Applicant'
+            WHEN 'Applicant - Lease Signed' THEN 'Applicant'
+            WHEN 'Former Applicant'         THEN 'Past'
+            WHEN 'Pending'                  THEN 'Future'
+            ELSE COALESCE(j.resolved_lease_status, '')
+        END AS tenant_status,
+        ''                     AS lease_from,
+        ''                     AS lease_to,
+        ''                     AS move_in,
+        TO_CHAR(j.resolved_move_out_date, 'YYYY-MM-DD') AS move_out,
+        j.resolved_email       AS email,
+        j.transaction_name     AS charge_code,
+        j.description          AS charge_type,
+        j.amount::STRING       AS charge_amount,
+        -- RealPage scheduled-charge rows are monthly snapshots. Do NOT use
+        -- BillStart/BillEnd as the app-visible date range; BillStart often
+        -- predates our first available PostMonth by years and would fabricate
+        -- pre-2025 history. Count each observed PostMonth as one monthly charge.
+        TO_CHAR(j.post_month, 'YYYY-MM-DD') AS charge_from_date,
+        TO_CHAR(
+            LEAST(
+                LAST_DAY(j.post_month),
+                COALESCE(j.resolved_move_out_date::DATE, LAST_DAY(j.post_month)),
+                CURRENT_DATE
+            ),
+            'YYYY-MM-DD'
+        )                       AS charge_to_date,
+        j.match_type           AS _realpage_match_type
+    FROM joined j
+    JOIN props p ON p.pmc_id = j.pmc_id AND p.site_id = j.site_id
+    WHERE j.resolved_email IS NOT NULL
+      AND TRIM(j.resolved_email) <> ''
+      -- Drop charges for residents who are Future/Applicant/Pending —
+      -- they haven't started paying yet and would inflate revenue.
+      -- Past tenants ARE kept (with clipped charge_to_date) so historical
+      -- revenue is preserved. Current/Notice/Former all flow through.
+      AND (j.resolved_lease_status IS NULL
+           OR j.resolved_lease_status NOT IN (
+               'Future Lease', 'Applicant',
+               'Applicant - Lease Signed', 'Pending'
+           ))
+      -- Drop charges where the entire bill window is after move-out
+      -- (defensive — the LEAST() above would clip charge_to to before
+      -- charge_from in this case, producing zero spread).
+      AND (j.resolved_move_out_date IS NULL
+           OR j.bill_start::DATE <= j.resolved_move_out_date)
+      {junk_email_clause.replace("j.email", "j.resolved_email")}
+    """
+
+    progress_bar.progress(0.30)
+    status_text.text("Querying Snowflake staging tables...")
+    cur.execute(sql)
+    rows = cur.fetchall()
+    progress_bar.progress(0.85)
+
+    # Filter out test/model residents (data hygiene — model units are common in OneSite)
+    test_words = {'model', 'test', 'sample', 'unknown', 'noname', 'tba', 'vacant', '*', ''}
+    def _is_test(fn, ln):
+        f = (fn or "").lower().strip()
+        l = (ln or "").lower().strip()
+        if f in test_words or l in test_words:
+            return True
+        if 'model' in f or 'model' in l:
+            return True
+        return False
+
+    # Build per-property fetch summary
+    by_prop = {}
+    test_filtered = 0
+    for r in rows:
+        # DictCursor returns uppercase keys in this codebase
+        fn = r.get("FIRST_NAME", "")
+        ln = r.get("LAST_NAME", "")
+        if _is_test(fn, ln):
+            test_filtered += 1
+            continue
+        pid = r.get("PROPERTY_ID")
+        by_prop.setdefault(pid, {
+            "property_name": r.get("PROPERTY_NAME"),
+            "property_code": r.get("PROPERTY_CODE"),
+            "charges": 0,
+            "resh_matches": 0,
+            "lease_matches": 0,
+            "no_matches": 0,
+        })
+        by_prop[pid]["charges"] += 1
+        mt = r.get("_REALPAGE_MATCH_TYPE", "no_match")
+        if mt == "resh_id":
+            by_prop[pid]["resh_matches"] += 1
+        elif mt == "lease_id":
+            by_prop[pid]["lease_matches"] += 1
+        else:
+            by_prop[pid]["no_matches"] += 1
+
+    # Strip the internal _REALPAGE_MATCH_TYPE field from the returned rows
+    # (it's diagnostic, not part of the unified schema)
+    all_charges = []
+    for r in rows:
+        if _is_test(r.get("FIRST_NAME", ""), r.get("LAST_NAME", "")):
+            continue
+        # Lowercase keys for parity with extract_charges_from_property /
+        # _extract_charges_from_entrata_lease (which return lowercase dicts)
+        all_charges.append({
+            "parent_company": r.get("PARENT_COMPANY"),
+            "property_id":    r.get("PROPERTY_ID"),
+            "property_name":  r.get("PROPERTY_NAME"),
+            "property_code":  r.get("PROPERTY_CODE"),
+            "launch_date":    r.get("LAUNCH_DATE"),
+            "unit_code":      r.get("UNIT_CODE", ""),
+            "unit_type":      r.get("UNIT_TYPE", ""),
+            "market_rent":    r.get("MARKET_RENT", ""),
+            "lease_id":       r.get("LEASE_ID", ""),
+            "tenant_code":    r.get("TENANT_CODE", ""),
+            "first_name":     r.get("FIRST_NAME", ""),
+            "last_name":      r.get("LAST_NAME", ""),
+            "tenant_status":  r.get("TENANT_STATUS", ""),
+            "lease_from":     r.get("LEASE_FROM", ""),
+            "lease_to":       r.get("LEASE_TO", ""),
+            "move_in":        r.get("MOVE_IN", ""),
+            "move_out":       r.get("MOVE_OUT", ""),
+            "email":          r.get("EMAIL", ""),
+            "charge_code":    r.get("CHARGE_CODE", ""),
+            "charge_type":    r.get("CHARGE_TYPE", ""),
+            "charge_amount":  r.get("CHARGE_AMOUNT", ""),
+            "charge_from_date": r.get("CHARGE_FROM_DATE", ""),
+            "charge_to_date":   r.get("CHARGE_TO_DATE", ""),
+        })
+
+    # Build results_log — one entry per property (matches Yardi/Entrata shape)
+    results_log = []
+    for prop in properties:
+        pid = prop.get("PROPERTY_ID") or prop.get("property_id")
+        info = by_prop.get(pid)
+        if info is None:
+            results_log.append({
+                "property": prop.get("PROPERTY_NAME") or prop.get("property_name", ""),
+                "code": prop.get("PROPERTY_CODE") or prop.get("property_code", ""),
+                "status": "Warning: No charges found in Snowflake",
+                "charges": 0,
+            })
+        else:
+            status_str = f"Success ({info['charges']} charges; "
+            status_str += f"{info['resh_matches']} resh-match / {info['lease_matches']} lease-match"
+            if info['no_matches'] > 0:
+                status_str += f" / {info['no_matches']} unmatched"
+            status_str += ")"
+            # Surface a clear warning when the no_match count is non-trivial.
+            if info['no_matches'] > 0 and info['no_matches'] > info['charges'] * 0.05:
+                status_str = status_str.replace("Success", "Warning")
+            results_log.append({
+                "property": info["property_name"],
+                "code":     info["property_code"],
+                "status":   status_str,
+                "charges":  info["charges"],
+            })
+
+    cur.close()
+    progress_bar.progress(1.0)
+    if test_filtered > 0:
+        status_text.text(f"Done — {len(all_charges):,} charge rows ({test_filtered} test/model residents filtered).")
+    else:
+        status_text.text(f"Done — {len(all_charges):,} charge rows.")
+
+    return all_charges, results_log
+
+
+def fetch_realpage_hybrid(properties, progress_bar, status_text, lookback_months=24):
+    """Best-of-both RealPage fetch: staging history + live current snapshot.
+
+    Evidence (docs/realpage-accuracy-audit.md, 2026-07-05):
+      - The live OneSite API returns only the CURRENT scheduled-charge
+        snapshot: the `postmonth` parameter is ignored (identical data for
+        any requested month) and Former-resident charges are unreachable
+        (residentstatus=F returns zero rows). Its "history" is synthesized
+        by expanding each charge across BillStart→BillEnd, which misses any
+        charge that ended before today.
+      - Snowflake staging accumulates real monthly snapshots (including
+        residents who have since moved out) but can lag weeks behind — the
+        audit found a property whose ingestion stopped 5 weeks earlier —
+        and some properties have no usable staging rows at all.
+
+    Stitching rule, per property and month: an OBSERVED staging snapshot
+    wins; live rows fill months staging never observed (typically the most
+    recent weeks, future scheduled charges, and whole properties staging
+    misses). Live rows for months staging covers are dropped — they are
+    synthetic back-projection, not observations.
+    """
+    stg_charges, stg_log = fetch_realpage_for_properties(
+        properties, progress_bar, status_text, lookback_months
+    )
+
+    from realpage_live_api import fetch_realpage_live
+    live_charges, live_log = fetch_realpage_live(
+        properties, progress_bar, status_text, lookback_months,
+        junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
+    )
+
+    # Months observed by staging, per property
+    stg_months = defaultdict(set)
+    for r in stg_charges:
+        m = str(r.get("charge_from_date") or "")[:7]
+        if m:
+            stg_months[r.get("property_id")].add(m)
+
+    combined = list(stg_charges)
+    live_fill = defaultdict(int)
+    for r in live_charges:
+        m = str(r.get("charge_from_date") or "")[:7]
+        if m and m in stg_months.get(r.get("property_id"), set()):
+            continue
+        combined.append(r)
+        live_fill[r.get("property_id")] += 1
+
+    # Merge the two logs into one entry per property
+    _stg_by_name = {row.get("property"): row for row in stg_log}
+    merged_log = []
+    for row in live_log:
+        name = row.get("property")
+        stg_row = _stg_by_name.pop(name, None)
+        stg_n = stg_row.get("charges", 0) if stg_row else 0
+        pid = next(
+            (p.get("PROPERTY_ID") or p.get("property_id") for p in properties
+             if (p.get("PROPERTY_NAME") or p.get("property_name")) == name),
+            None,
+        )
+        fill_n = live_fill.get(pid, 0)
+        total = stg_n + fill_n
+        if total > 0:
+            status = (
+                f"Success ({total} charges: {stg_n} staging history "
+                f"+ {fill_n} live fill)"
+            )
+            if stg_row and str(stg_row.get("status", "")).startswith("Warning") and fill_n == 0:
+                status = status.replace("Success", "Warning")
+        else:
+            stg_status = stg_row.get("status", "") if stg_row else "no staging rows"
+            status = f"Warning: no usable rows (staging: {stg_status}; live: {row.get('status', '')})"[:400]
+        merged_log.append({
+            "property": name,
+            "code": row.get("code", ""),
+            "status": status,
+            "charges": total,
+        })
+    # Properties present only in the staging log
+    merged_log.extend(_stg_by_name.values())
+
+    try:
+        status_text.text(
+            f"RealPage hybrid done — {len(combined):,} charge rows "
+            f"({len(stg_charges):,} staging + {len(combined) - len(stg_charges):,} live fill)."
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return combined, merged_log
+
+
+# ─── AppFolio (Snowflake-backed) ─────────────────────────────────────
+# Read from staging tables populated by the AppFolio ingestion job. Live
+# Developer Space/API access is intentionally deferred behind a disabled
+# sidebar toggle until MFA + direct endpoint probing are available.
+# pmc_system value: 'appfolio'
+
+def _format_appfolio_date(value):
+    """Return YYYY-MM-DD for Snowflake date/datetime values, else blank."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if not text or text.lower() in ("none", "nan", "nat"):
+        return ""
+    return text[:10]
+
+
+def _normalize_appfolio_snowflake_charge_row(row):
+    """Normalize one AppFolio Snowflake recurring-charge row to app schema.
+
+    AppFolio's staged `getrecurringcharges` data often has NULL FREQUENCY even
+    though the endpoint itself is recurring-charge data. Treat blank frequency
+    as recurring by endpoint semantics so monthly pet rent does not get
+    misclassified as one-time just because the field is empty.
+    """
+    def _get(key, default=""):
+        value = row.get(key, default)
+        return default if value is None else value
+
+    occupancy_id = _get("OCCUPANCY_ID") or _get("LEASE_ID")
+    tenant_code = _get("TENANT_CODE") or occupancy_id
+    frequency = str(_get("FREQUENCY") or "").strip().lower() or "recurring"
+
+    return {
+        "parent_company": _get("PARENT_COMPANY"),
+        "property_id": _get("PROPERTY_ID"),
+        "property_name": _get("PROPERTY_NAME"),
+        "property_code": _get("PROPERTY_CODE"),
+        "launch_date": _format_appfolio_date(_get("LAUNCH_DATE")),
+        "unit_code": _get("UNIT_CODE") or _get("APPFOLIO_UNIT_ID"),
+        "unit_type": "",
+        "market_rent": "",
+        "lease_id": occupancy_id,
+        "tenant_code": tenant_code,
+        "first_name": _get("FIRST_NAME"),
+        "last_name": _get("LAST_NAME"),
+        "tenant_status": _get("TENANT_STATUS"),
+        "lease_from": _format_appfolio_date(_get("LEASE_FROM")),
+        "lease_to": _format_appfolio_date(_get("LEASE_TO")),
+        "move_in": _format_appfolio_date(_get("MOVE_IN")),
+        "move_out": _format_appfolio_date(_get("MOVE_OUT")),
+        "email": _get("EMAIL"),
+        "charge_code": _get("CHARGE_CODE"),
+        "charge_type": _get("CHARGE_TYPE"),
+        "charge_amount": _get("CHARGE_AMOUNT"),
+        "charge_from_date": _format_appfolio_date(_get("CHARGE_FROM_DATE")),
+        "charge_to_date": _format_appfolio_date(_get("CHARGE_TO_DATE")),
+        "frequency": frequency,
+        "tenant_type": _get("TENANT_TYPE"),
+        "primary_tenant": _get("PRIMARY_TENANT"),
+        "_appfolio_charge_id": _get("RECURRING_CHARGE_ID"),
+        "_appfolio_database_id": _get("DATABASE_ID"),
+        "_appfolio_occupancy_id": occupancy_id,
+        "_appfolio_unit_id": _get("APPFOLIO_UNIT_ID"),
+    }
+
+
+@st.cache_data(ttl=300)
+def load_appfolio_parent_companies():
+    """Count AppFolio properties per parent company with staged Snowflake data."""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT
+            p.parent_company_name,
+            MAX(p.parent_company_ancestry_id)    AS ancestry_id,
+            MAX(p.parent_company_ancestry_name)   AS ancestry_name,
+            COUNT(DISTINCT p.property_id)         AS total_props,
+            COUNT(DISTINCT CASE
+                WHEN p.property_status = 'active'
+                     AND p.integration_status = 'enabled'
+                     AND PARSE_JSON(p.property_source_id):"property_id"::STRING IS NOT NULL
+                THEN p.property_id
+            END) AS api_props
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.parent_company_name IS NOT NULL
+          AND p.property_source_name = 'appfolio'
+        GROUP BY 1
+        HAVING api_props > 0
+        ORDER BY 1
+    """)
+    return cur.fetchall()
+
+
+@st.cache_data(ttl=300)
+def load_appfolio_all_properties():
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
+        SELECT DISTINCT
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            p.parent_company_ancestry_id
+        FROM PROD.COMMON.D_PROPERTIES p
+        WHERE p.property_source_name = 'appfolio'
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def load_appfolio_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    """Load AppFolio properties matching the selection criteria.
+
+    AppFolio uses the staged property_source_id:property_id as the provider
+    property key. We also require active/enabled metadata so the user sees the
+    same integration-ready portfolio semantics as RealPage.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    where_clause = """
+        WHERE p.property_source_name = 'appfolio'
+          AND p.property_status = 'active'
+          AND p.integration_status = 'enabled'
+          AND PARSE_JSON(p.property_source_id):"property_id"::STRING IS NOT NULL
+    """
+    if parent_company_name:
+        _safe = parent_company_name.replace("'", "''")
+        where_clause += f" AND p.parent_company_name = '{_safe}'"
+    if property_id:
+        where_clause += f" AND p.property_id = {int(property_id)}"
+    if ancestry_id:
+        _safe = str(ancestry_id).replace("'", "''")
+        where_clause += f" AND p.parent_company_ancestry_id = '{_safe}'"
+
+    cur.execute(f"""
+        SELECT DISTINCT
+            PARSE_JSON(p.property_source_id):"property_id"::STRING AS appfolio_property_id,
+            p.property_id,
+            p.property_name,
+            p.parent_company_name,
+            PARSE_JSON(p.property_source_id):"property_id"::STRING AS property_code,
+            kf.property_launch_date AS property_launch_date
+        FROM PROD.COMMON.D_PROPERTIES p
+        LEFT JOIN PROD.PETSCREENING.PETSCREENING__PROPERTY_KEY_FACTS kf
+            ON p.property_id = kf.property_id
+        {where_clause}
+        ORDER BY p.property_name
+    """)
+    return cur.fetchall()
+
+
+def fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months=24):
+    """Read AppFolio recurring charges from Snowflake and emit unified rows.
+
+    Returns (all_charges, results_log), matching Yardi/RealPage downstream shape.
+    `lookback_months` is kept for interface parity; staged recurring charges
+    carry their own effective START_DATE/END_DATE and the UI clips display later.
+    """
+    if not properties:
+        return [], []
+
+    progress_bar.progress(0.05)
+    status_text.text(f"Reading AppFolio recurring-charge data from Snowflake for {len(properties)} properties...")
+
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    def _esc(s):
+        return str(s if s is not None else "").replace("'", "''")
+
+    select_rows = []
+    for p in properties:
+        appfolio_pid = _esc(p.get("APPFOLIO_PROPERTY_ID") or p.get("appfolio_property_id") or p.get("PROPERTY_CODE") or p.get("property_code") or "")
+        pid = int(p.get("PROPERTY_ID") or p.get("property_id") or 0)
+        pname = _esc(p.get("PROPERTY_NAME") or p.get("property_name") or "")
+        pcode = _esc(p.get("PROPERTY_CODE") or p.get("property_code") or appfolio_pid)
+        parent = _esc(p.get("PARENT_COMPANY_NAME") or p.get("parent_company_name") or "")
+        launch = p.get("PROPERTY_LAUNCH_DATE") or p.get("property_launch_date")
+        launch_str = _format_appfolio_date(launch)
+        launch_sql = "NULL" if not launch_str else f"TO_DATE('{launch_str}')"
+        select_rows.append(
+            f"SELECT '{appfolio_pid}'::STRING AS appfolio_property_id, "
+            f"{pid}::NUMBER AS property_id, '{pname}'::STRING AS property_name, "
+            f"'{pcode}'::STRING AS property_code, '{parent}'::STRING AS parent_company_name, "
+            f"{launch_sql} AS property_launch_date"
+        )
+    values_sql = "\n        UNION ALL ".join(select_rows)
+
+    junk_email_clause = f"AND LOWER(TRIM(t.email)) NOT IN ({JUNK_EMAILS})"
+
+    sql = f"""
+    WITH props AS (
+        {values_sql}
+    ),
+    latest_charges AS (
+        SELECT
+            c.recurring_charge_id,
+            c.database_id,
+            c.amount,
+            c.description,
+            c.frequency,
+            c.start_date,
+            c.end_date,
+            c.occupancy_id,
+            c.gl_account_id,
+            c.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_APPFOLIO__GETRECURRINGCHARGES c
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY c.recurring_charge_id
+            ORDER BY c.ingested_at DESC
+        ) = 1
+    ),
+    latest_tenants AS (
+        SELECT
+            t.tenant_id,
+            t.property_id AS appfolio_property_id,
+            t.occupancy_id,
+            t.unit_id,
+            t.first_name,
+            t.last_name,
+            t.email,
+            t.status,
+            t.tenant_type,
+            t.primary_tenant,
+            t.lease_start_date,
+            t.lease_end_date,
+            t.move_in_on,
+            t.move_out_on,
+            t.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_APPFOLIO__GETTENANTS t
+        JOIN props p ON p.appfolio_property_id = t.property_id
+        WHERE COALESCE(t.status, '') NOT IN ('Future')
+          AND t.email IS NOT NULL
+          AND TRIM(t.email) <> ''
+          {junk_email_clause}
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY t.tenant_id, t.occupancy_id
+            ORDER BY t.ingested_at DESC
+        ) = 1
+    ),
+    tenant_pick AS (
+        SELECT *
+        FROM latest_tenants
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY occupancy_id
+            ORDER BY
+                CASE WHEN primary_tenant THEN 0 ELSE 1 END,
+                CASE WHEN tenant_type = 'Financially Responsible' THEN 0 ELSE 1 END,
+                CASE status WHEN 'Current' THEN 0 WHEN 'Notice' THEN 1 WHEN 'Past' THEN 2 ELSE 3 END,
+                COALESCE(last_name, ''), COALESCE(first_name, '')
+        ) = 1
+    ),
+    latest_units AS (
+        SELECT
+            u.unit_id,
+            u.appfolio_property_id,
+            u.name AS unit_name,
+            u.current_occupancy_id,
+            u.ingested_at
+        FROM PROD.STAGING.STG_PMC_INTEGRATIONS_APPFOLIO__GETUNITS u
+        JOIN props p ON p.appfolio_property_id = u.appfolio_property_id
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY u.unit_id
+            ORDER BY u.ingested_at DESC
+        ) = 1
+    ),
+    joined AS (
+        SELECT
+            c.*,
+            t.tenant_id,
+            t.appfolio_property_id,
+            t.unit_id AS tenant_unit_id,
+            t.first_name,
+            t.last_name,
+            t.email,
+            t.status AS tenant_status,
+            t.tenant_type,
+            t.primary_tenant,
+            t.lease_start_date,
+            t.lease_end_date,
+            t.move_in_on,
+            t.move_out_on,
+            u.unit_id AS appfolio_unit_id,
+            u.unit_name,
+            CASE WHEN t.occupancy_id IS NOT NULL THEN 'occupancy_id' ELSE 'no_match' END AS match_type
+        FROM latest_charges c
+        LEFT JOIN tenant_pick t ON t.occupancy_id = c.occupancy_id
+        LEFT JOIN latest_units u ON u.unit_id = t.unit_id
+    )
+    SELECT
+        p.parent_company_name AS parent_company,
+        p.property_id          AS property_id,
+        p.property_name        AS property_name,
+        p.property_code        AS property_code,
+        p.property_launch_date AS launch_date,
+        COALESCE(j.unit_name, j.appfolio_unit_id, j.tenant_unit_id) AS unit_code,
+        j.occupancy_id::STRING AS lease_id,
+        COALESCE(j.tenant_id::STRING, j.occupancy_id::STRING) AS tenant_code,
+        j.first_name           AS first_name,
+        j.last_name            AS last_name,
+        j.tenant_status        AS tenant_status,
+        j.tenant_type          AS tenant_type,
+        j.primary_tenant       AS primary_tenant,
+        j.lease_start_date     AS lease_from,
+        j.lease_end_date       AS lease_to,
+        j.move_in_on           AS move_in,
+        j.move_out_on          AS move_out,
+        j.email                AS email,
+        j.description          AS charge_code,
+        j.gl_account_id        AS charge_type,
+        j.amount               AS charge_amount,
+        j.start_date           AS charge_from_date,
+        j.end_date             AS charge_to_date,
+        COALESCE(NULLIF(j.frequency, ''), 'recurring') AS frequency,
+        j.recurring_charge_id  AS recurring_charge_id,
+        j.database_id          AS database_id,
+        j.occupancy_id         AS occupancy_id,
+        COALESCE(j.appfolio_unit_id, j.tenant_unit_id) AS appfolio_unit_id,
+        j.match_type           AS _appfolio_match_type
+    FROM joined j
+    JOIN props p ON p.appfolio_property_id = j.appfolio_property_id
+    WHERE j.tenant_id IS NOT NULL
+      AND j.email IS NOT NULL
+      AND TRIM(j.email) <> ''
+      AND COALESCE(j.tenant_status, '') NOT IN ('Future')
+    """
+
+    progress_bar.progress(0.30)
+    status_text.text("Querying AppFolio Snowflake staging tables...")
+    cur.execute(sql)
+    rows = cur.fetchall()
+    progress_bar.progress(0.85)
+
+    by_prop = {}
+    for r in rows:
+        pid = r.get("PROPERTY_ID")
+        by_prop.setdefault(pid, {
+            "property_name": r.get("PROPERTY_NAME"),
+            "property_code": r.get("PROPERTY_CODE"),
+            "charges": 0,
+            "matched": 0,
+            "unmatched": 0,
+        })
+        by_prop[pid]["charges"] += 1
+        if r.get("_APPFOLIO_MATCH_TYPE") == "occupancy_id":
+            by_prop[pid]["matched"] += 1
+        else:
+            by_prop[pid]["unmatched"] += 1
+
+    all_charges = [_normalize_appfolio_snowflake_charge_row(r) for r in rows]
+
+    results_log = []
+    for prop in properties:
+        pid = prop.get("PROPERTY_ID") or prop.get("property_id")
+        info = by_prop.get(pid)
+        if info is None:
+            results_log.append({
+                "property": prop.get("PROPERTY_NAME") or prop.get("property_name", ""),
+                "code": prop.get("PROPERTY_CODE") or prop.get("property_code", ""),
+                "status": "Warning: No AppFolio recurring charges found in Snowflake",
+                "charges": 0,
+            })
+        else:
+            status_str = f"Success ({info['charges']} recurring charges; {info['matched']} occupancy matches"
+            if info["unmatched"] > 0:
+                status_str += f" / {info['unmatched']} unmatched"
+            status_str += ")"
+            if info["unmatched"] > 0 and info["unmatched"] > info["charges"] * 0.05:
+                status_str = status_str.replace("Success", "Warning")
+            results_log.append({
+                "property": info["property_name"],
+                "code": info["property_code"],
+                "status": status_str,
+                "charges": info["charges"],
+            })
+
+    cur.close()
+    progress_bar.progress(1.0)
+    status_text.text(f"Done — {len(all_charges):,} AppFolio recurring-charge rows.")
+    return all_charges, results_log
+
+# ─── Yardi API fetch ─────────────────────────────────────────────────
+def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months=24):
+    """Call GetRentroll API for each property, return all charge rows.
+
+    IMPORTANT: The API date parameters are ALWAYS set to the widest useful
+    range (10 years back) regardless of the display lookback slider.
+    This guarantees that the same charge rows are returned no matter what
+    display window the user picks, so numbers stay consistent.
+    The ``lookback_months`` argument is kept for interface compat but is
+    NOT used for the API call dates.
+    """
+    today = datetime.now(timezone.utc).date()
+
+    # Always fetch the widest useful window from Yardi so the data never
+    # changes when the user adjusts the display slider.
+    move_date    = (today - timedelta(days=10 * 365)).strftime("%Y-%m-%d")   # 10 years
+    charge_from  = "2000-01-01"                                               # very early
+    charge_to    = today.strftime("%Y-%m-%d")                                 # today
+
+    all_charges = []
+    results_log = []
+
+    for i, prop in enumerate(properties):
+        prop_name = prop['PROPERTY_NAME']
+        prop_code = prop['PROPERTY_CODE']
+        progress = (i + 1) / len(properties)
+        progress_bar.progress(progress)
+        status_text.text(f"[{i+1}/{len(properties)}] Fetching {prop_name} ({prop_code})...")
+
+        try:
+            payload = build_soap_payload(prop, YARDI_LICENSE_TOKEN, move_date, charge_from, charge_to)
+            resp = requests.post(
+                prop['RESIDENT_DATA_URL'],
+                data=payload,
+                headers=SOAP_HEADERS,
+                timeout=120,
+            )
+
+            if resp.status_code != 200:
+                results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: HTTP {resp.status_code}", "charges": 0})
+                continue
+
+            parsed = xml_to_dict(resp.text)
+            extracted = extract_property(parsed)
+
+            if not extracted:
+                error_msg = "No data"
+                for m in ET.fromstring(resp.text).iter():
+                    if "Message" in m.tag and m.text:
+                        error_msg = m.text.strip()[:60]
+                        break
+                results_log.append({"property": prop_name, "code": prop_code, "status": f"Warning: {error_msg}", "charges": 0})
+                continue
+
+            charges = extract_charges_from_property(extracted, prop)
+            all_charges.extend(charges)
+            results_log.append({"property": prop_name, "code": prop_code, "status": "Success", "charges": len(charges)})
+
+        except requests.exceptions.Timeout:
+            results_log.append({"property": prop_name, "code": prop_code, "status": "Error: Timeout", "charges": 0})
+        except Exception as exc:
+            results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: {str(exc)[:50]}", "charges": 0})
+
+    progress_bar.progress(1.0)
+    status_text.text("Done!")
+    return all_charges, results_log
+
+
+# ─── Date parsing helper ─────────────────────────────────────────────
+def parse_date(d):
+    if pd.isna(d) or not d or str(d).strip() == "":
+        return None
+    for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+        try:
+            return datetime.strptime(str(d).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+# ─── Launch analysis ─────────────────────────────────────────────────
+def compute_launch_analysis(monthly_by_prop, months, launch_dates):
+    """
+    For each property with a launch date, compute:
+      - pre_avg             = average monthly revenue in up to 6 months BEFORE launch
+      - post_recent_avg     = average monthly revenue across all completed post-launch months
+      - diff_monthly        = cumulative impact ÷ completed post months  (average monthly uplift since launch)
+      - diff_total          = actual observed cumulative lift: total_post_revenue − (pre_avg × n_post_months)
+      - post_monthly_avg    = average of ALL post months (kept for backward compat / charts)
+
+    Methodology (updated 2026-07-14):
+      Pre-baseline:  up to 6 months before launch (uses whatever is available)
+      Post-current:  all completed post-launch months (excludes current partial month)
+      Monthly lift:  cumulative impact ÷ completed post months
+      Total lift:    sum(all post revenue) − (pre_avg × total post months)  [actual observed]
+
+    Returns dict keyed by property name.
+    """
+    today = datetime.now()
+    current_month = datetime(today.year, today.month, 1)
+
+    analysis = {}
+    for prop, prop_data in monthly_by_prop.items():
+        launch = launch_dates.get(prop)
+        if launch is None:
+            continue
+        # Skip NaT / NaN values
+        try:
+            if pd.isna(launch):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if isinstance(launch, str):
+            try:
+                launch = datetime.strptime(launch[:10], "%Y-%m-%d")
+            except:
+                continue
+        # Convert pandas Timestamp / numpy datetime to pure Python datetime
+        if hasattr(launch, 'to_pydatetime'):
+            launch = launch.to_pydatetime()
+        # Final guard: make sure year/month are valid numbers
+        try:
+            yr, mo = int(launch.year), int(launch.month)
+        except (ValueError, TypeError, OverflowError):
+            continue
+
+        # Snap launch to first-of-month; the launch month itself is "post"
+        # (PetScreening was active for at least part of this month)
+        launch_month = datetime(yr, mo, 1)
+        first_post_month = launch_month  # launch month = first post-launch month
+
+        pre_months = [m for m in months if m < first_post_month]
+        post_months = [m for m in months if m >= first_post_month]
+
+        if not post_months:
+            continue
+
+        n_post = len(post_months)
+
+        post_total = sum(prop_data.get(m, 0) for m in post_months)
+
+        # Pre-launch avg: use up to 6 OBSERVED months before launch.
+        # Important: `months` is the display calendar, not proof that a property
+        # has charge data for every month. Treating missing dict keys as $0 would
+        # fabricate a fake baseline (e.g. one real $50 pre-PS bar across a 6-month
+        # window becomes $8/mo). Only average months that are actually present in
+        # the property's revenue series; explicit zero values still count if the
+        # data source emitted them.
+        pre_baseline_months = pre_months[-6:] if len(pre_months) >= 1 else pre_months
+        pre_values = [prop_data[m] for m in pre_baseline_months if m in prop_data]
+        n_observed_pre = len(pre_values)
+        pre_avg = sum(pre_values) / len(pre_values) if pre_values else 0
+        baseline_month_label = (
+            f"{n_observed_pre} observed pre month"
+            if n_observed_pre == 1
+            else f"{n_observed_pre} observed pre months"
+        )
+
+        # Post-launch: all-time average (kept for charts and backward compat)
+        post_monthly_avg = post_total / n_post if n_post > 0 else 0
+
+        # Completed post months (excludes current partial month so we don't undercount)
+        completed_post = [m for m in post_months if m < current_month]
+        n_completed_post = len(completed_post)
+        completed_post_total = sum(prop_data.get(m, 0) for m in completed_post)
+
+        # Post-launch avg across all completed months (used for display & baseline check)
+        post_recent_avg = (
+            completed_post_total / n_completed_post
+            if n_completed_post > 0 else post_monthly_avg
+        )
+
+        # Total lift = actual observed cumulative difference
+        # (what they actually collected minus what they would have at the old rate)
+        diff_total = post_total - (pre_avg * n_post)
+
+        # Monthly lift = cumulative impact ÷ completed post months
+        # (average monthly uplift since launch — mathematically consistent: monthly × months ≈ cumulative)
+        diff_monthly = (completed_post_total - (pre_avg * n_completed_post)) / n_completed_post if n_completed_post > 0 else 0
+
+        # Baseline is "meaningful" if pre_avg is >= 2% of post_recent_avg.
+        # Properties with near-zero baselines (e.g. $8 vs $5,600 post) weren't
+        # really charging pet rent before PS — their "lift" is misleading.
+        _baseline_meaningful = (
+            post_recent_avg <= 0  # no post data — keep whatever we have
+            or pre_avg >= post_recent_avg * 0.02
+        )
+
+        # ADDITIONAL GUARD: detect properties whose CHARGE DATA HISTORY
+        # starts AFTER their launch date. This is the RealPage case — EKS
+        # job started backfilling Nov 2024, but properties may have launched
+        # well before that. Their pre-PS "baseline" of $0/mo is an artifact
+        # of missing data, not a real zero. Without this guard, those
+        # properties would inflate the aggregate lift (e.g. Drift at the
+        # Forum: launched Feb 2022, earliest pet charge Nov 2024, lift
+        # calculation treats 2021-2022 as $0 baseline = bogus).
+        first_data_month = next(
+            (m for m in months if prop_data.get(m, 0) > 0),
+            None,
+        )
+        _data_starts_after_launch = (
+            first_data_month is not None
+            and launch_month is not None
+            and first_data_month > launch_month
+            and (first_data_month.year - launch_month.year) * 12
+                + (first_data_month.month - launch_month.month) >= 3
+        )
+        if _data_starts_after_launch:
+            # The pre-launch "baseline" is fabricated from missing data.
+            # Mark the baseline as unmeaningful so downstream display +
+            # aggregate code excludes this property from lift attribution.
+            _baseline_meaningful = False
+
+        analysis[prop] = {
+            "n_post": n_post,
+            "n_pre": n_observed_pre,
+            "n_pre_calendar": len(pre_baseline_months),
+            "baseline_month_label": baseline_month_label,
+            "n_recent_post": n_completed_post,
+            "all_pre_months": len(pre_months),
+            "baseline_reliable": n_observed_pre >= 3,
+            "baseline_meaningful": _baseline_meaningful,
+            "data_starts_after_launch": _data_starts_after_launch,
+            "first_data_month": first_data_month,
+            "pre_avg": pre_avg,
+            "post_total": post_total,
+            "post_monthly_avg": post_monthly_avg,
+            "post_recent_avg": post_recent_avg,
+            "diff_monthly": diff_monthly,
+            "diff_total": diff_total,
+            "launch_month": launch_month,
+        }
+    return analysis
+
+
+def _run_data_health_checks(charges_df, monthly_by_prop, months, launch_dates):
+    """Automated sanity checks surfaced before presenting results.
+
+    Returns a list of {label, status: 'pass'|'warn', detail}. These catch
+    the data problems that erode trust when a client spots them first:
+    implausible launch dates, duplicate charges, tenants in two properties,
+    dead properties.
+    """
+    checks = []
+    now = datetime.now()
+
+    def _add(label, ok, detail_ok, detail_warn):
+        checks.append({
+            "label": label,
+            "status": "pass" if ok else "warn",
+            "detail": detail_ok if ok else detail_warn,
+        })
+
+    # 1. Launch dates plausible
+    bad_launch = []
+    for pname, ld in (launch_dates or {}).items():
+        try:
+            if ld is None or pd.isna(ld):
+                continue
+            y = int(getattr(ld, "year", 0))
+            if y and (y < 2018 or datetime(y, int(ld.month), 1) > now):
+                bad_launch.append(pname)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    _add("Launch dates plausible (2018 -> today)", not bad_launch,
+         "all within range",
+         f"{len(bad_launch)} suspicious: {', '.join(bad_launch[:3])}")
+
+    # 2. Charge data implies a launch date
+    no_launch = [p for p in (monthly_by_prop or {}) if p not in (launch_dates or {})]
+    _add("Every property with charge data has a launch date", not no_launch,
+         "no gaps",
+         f"{len(no_launch)} without launch date: {', '.join(no_launch[:3])}")
+
+    # 3. Same email active at multiple properties
+    multi_prop_emails = 0
+    if charges_df is not None and {"email", "property_id"}.issubset(charges_df.columns):
+        _em = charges_df[["email", "property_id"]].copy()
+        _em["email"] = _em["email"].astype(str).str.strip().str.lower()
+        _em = _em[~_em["email"].isin(("", "nan", "none"))]
+        if not _em.empty:
+            multi_prop_emails = int((_em.groupby("email")["property_id"].nunique() > 1).sum())
+    _add("Tenant emails unique to one property", multi_prop_emails == 0,
+         "no cross-property duplicates",
+         f"{multi_prop_emails} emails appear at 2+ properties (roommate moves or data issue)")
+
+    # 4. Exact duplicate charge rows
+    dup_rows = 0
+    if charges_df is not None and not charges_df.empty:
+        _dc = [c for c in ("property_id", "tenant_code", "charge_code",
+                           "charge_from_date", "charge_to_date", "charge_amount")
+               if c in charges_df.columns]
+        if _dc:
+            dup_rows = int(charges_df.duplicated(subset=_dc).sum())
+    _pct = (dup_rows / len(charges_df) * 100) if charges_df is not None and len(charges_df) else 0
+    _add("No duplicate charge rows", _pct < 1.0,
+         f"{dup_rows} exact duplicates ({_pct:.1f}%)",
+         f"{dup_rows} exact duplicates ({_pct:.1f}% of rows) -- check the source data")
+
+    # 5. Properties with $0 in every displayed month
+    zero_props = [p for p, d in (monthly_by_prop or {}).items()
+                  if d and not any(v > 0 for v in d.values())]
+    _add("No properties with $0 revenue in every month", not zero_props,
+         "all properties show revenue",
+         f"{len(zero_props)} all-zero: {', '.join(zero_props[:3])}")
+
+    # 6. Charge amounts parse as numbers
+    bad_amounts = 0
+    if charges_df is not None and "charge_amount" in charges_df.columns and len(charges_df):
+        bad_amounts = int(pd.to_numeric(charges_df["charge_amount"], errors="coerce").isna().sum())
+    _add("All charge amounts numeric", bad_amounts == 0,
+         "no parse failures",
+         f"{bad_amounts} rows with unparseable amounts (dropped from revenue)")
+
+    return checks
+
+
+def _launch_analysis_is_comparable(a):
+    """Return True when a property can contribute to pre/post lift metrics.
+
+    Comparable means we observed at least one real pre-PS revenue month and the
+    baseline is meaningful. A short 1-2 month baseline is still included, but it
+    remains flagged as low-data/insufficient in charts and tables. This keeps the
+    portfolio aggregate aligned with individual property lift badges.
+    """
+    return bool(a and a.get("n_pre", 0) > 0 and a.get("baseline_meaningful", True))
+
+
+# ─── Compliance / adoption data from QBR table ──────────────────────
+@st.cache_data(ttl=600)
+def fetch_compliance_data(property_ids_tuple):
+    """
+    Fetch per-property, per-month adoption rates from
+    PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING.
+
+    Returns a dict:
+      {
+        property_id: {
+          datetime(month): {
+            "unit_adoption": float 0-1,
+            "resident_adoption": float 0-1,
+            "active_units": int, "total_units": int,
+            "active_users": int, "total_users": int,
+          }, ...
+        }, ...
+      }
+    """
+    property_ids = list(property_ids_tuple)
+    if not property_ids:
+        return {}
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    ids_str = ", ".join(str(int(pid)) for pid in property_ids)
+    cur.execute(f"""
+        SELECT
+            PROPERTY_ID,
+            PROPERTY_NAME,
+            PERIOD_MONTH,
+            ACTIVE_UNITS,
+            TOTAL_UNITS,
+            ACTIVE_USERS,
+            TOTAL_USERS
+        FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
+        WHERE PROPERTY_ID IN ({ids_str})
+          AND AFTER_PROPERTY_LAUNCH_FLAG = TRUE
+          AND (TOTAL_UNITS > 0 OR TOTAL_USERS > 0)
+        ORDER BY PROPERTY_ID, PERIOD_MONTH
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    result = {}
+    for r in rows:
+        pid = int(r["PROPERTY_ID"])  # normalize to Python int
+        pm = r["PERIOD_MONTH"]
+        if hasattr(pm, 'to_pydatetime'):
+            pm = pm.to_pydatetime()
+        elif isinstance(pm, str):
+            try:
+                pm = datetime.strptime(pm[:10], "%Y-%m-%d")
+            except:
+                continue
+        month_key = datetime(pm.year, pm.month, 1)
+        au = r["ACTIVE_UNITS"] or 0
+        tu = r["TOTAL_UNITS"] or 0
+        ar = r["ACTIVE_USERS"] or 0
+        tr = r["TOTAL_USERS"] or 0
+
+        if pid not in result:
+            result[pid] = {}
+        result[pid][month_key] = {
+            "unit_adoption": au / tu if tu > 0 else None,
+            "resident_adoption": ar / tr if tr > 0 else None,
+            "active_units": au,
+            "total_units": tu,
+            "active_users": ar,
+            "total_users": tr,
+        }
+    return result
+
+
+def _build_property_id_lookup(parsed_charges):
+    """Build a property_name → property_id mapping from parsed charges."""
+    lookup = {}
+    for rec in parsed_charges:
+        pname = rec.get("property_name")
+        pid = rec.get("property_id")
+        if pname and pid and pname not in lookup:
+            try:
+                lookup[pname] = int(pid)
+            except (ValueError, TypeError):
+                lookup[pname] = pid
+    return lookup
+
+
+# ─── Chart builders ──────────────────────────────────────────────────
+def build_portfolio_chart(monthly_data, monthly_counts, months, title_prefix, cumulative=False, launch_analysis=None):
+    """Build the aggregated portfolio bar + line chart."""
+    portfolio_values = [monthly_data.get(m, 0) for m in months]
+    portfolio_counts = [monthly_counts.get(m, 0) for m in months]
+
+    if cumulative:
+        import itertools
+        portfolio_values = list(itertools.accumulate(portfolio_values))
+        portfolio_counts = list(itertools.accumulate(portfolio_counts))
+        mode_label = "Cumulative"
+    else:
+        mode_label = "Monthly"
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=(
+            f"{title_prefix}: {mode_label} Selected Fee Revenue (Total)",
+            f"{mode_label} Charge Count"
+        ),
+        row_heights=[0.65, 0.35],
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=months, y=portfolio_values,
+            marker_color='#B17455',
+            text=[f"${v:,.0f}" for v in portfolio_values],
+            textposition='outside',
+            textfont_size=9,
+            name="Revenue",
+        ),
+        row=1, col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=months, y=portfolio_counts,
+            mode='lines+markers',
+            line=dict(color='#B17455', width=2.5),
+            marker=dict(size=5),
+            fill='tozeroy',
+            fillcolor='rgba(177,116,85,0.1)',
+            name="# Charges",
+        ),
+        row=2, col=1,
+    )
+
+    fig.update_layout(
+        height=600,
+        showlegend=False,
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="#FAFAF8",
+        font=dict(family="Poppins, Arial, sans-serif", size=10, color="#4F5155"),
+    )
+    fig.update_yaxes(title_text=f"{mode_label} Revenue ($)", row=1, col=1, tickfont=dict(color="#4F5155"))
+    fig.update_yaxes(title_text=f"{'Total' if cumulative else '#'} Active Charges", row=2, col=1, tickfont=dict(color="#4F5155"))
+
+    return fig
+
+
+def build_stacked_area_chart(monthly_by_prop, months, title_prefix, cumulative=False):
+    """Build stacked area chart by property."""
+    import itertools
+    prop_totals = {p: sum(monthly_by_prop[p].values()) for p in monthly_by_prop}
+    sorted_props = sorted(prop_totals.keys(), key=lambda p: prop_totals[p], reverse=True)
+
+    mode_label = "Cumulative" if cumulative else "Monthly"
+
+    fig = go.Figure()
+    colors = px.colors.qualitative.Plotly + px.colors.qualitative.Set3 + px.colors.qualitative.Pastel
+
+    for i, prop in enumerate(sorted_props):
+        values = [monthly_by_prop[prop].get(m, 0) for m in months]
+        if cumulative:
+            values = list(itertools.accumulate(values))
+        short_name = prop.split(" - ", 1)[-1] if " - " in prop else prop
+        fig.add_trace(go.Scatter(
+            x=months, y=values,
+            mode='lines',
+            stackgroup='one',
+            name=short_name,
+            line=dict(width=0.5),
+            fillcolor=colors[i % len(colors)],
+        ))
+
+    fig.update_layout(
+        title=f"{title_prefix}: {mode_label} Fee Revenue by Property (Stacked)",
+        height=550,
+        template="plotly_white",
+        yaxis_title=f"{mode_label} Revenue ($)",
+        xaxis_title="Month",
+        legend=dict(font=dict(size=9, color="#4F5155")),
+        plot_bgcolor="white",
+        paper_bgcolor="#FAFAF8",
+        font=dict(family="Poppins, Arial, sans-serif", size=10, color="#4F5155"),
+    )
+    return fig
+
+
+def _resolve_launch_dt(launch):
+    """Parse a launch date value into a datetime or None."""
+    if not launch:
+        return None
+    if isinstance(launch, str):
+        try:
+            return datetime.strptime(launch[:10], "%Y-%m-%d")
+        except:
+            return None
+    if hasattr(launch, 'year'):
+        return launch
+    return None
+
+
+def _latest_observed_revenue_month(monthly_by_prop, months, property_names=None):
+    """Return the latest month with observed revenue data in the requested scope.
+
+    `months[-1]` is the display/calendar window, not proof that every provider has
+    loaded data for that month. RealPage scheduled-charge rows are monthly
+    PostMonth snapshots; if the latest loaded snapshot is last month, asking for
+    the current calendar month fabricates a false $0 current revenue. Prefer the
+    calendar latest month only when it is actually present in the scoped revenue
+    series, otherwise fall back to the latest observed month.
+    """
+    if not monthly_by_prop or not months:
+        return None
+    scoped_names = list(property_names) if property_names is not None else list(monthly_by_prop.keys())
+    scoped_data = [monthly_by_prop.get(name, {}) for name in scoped_names]
+    scoped_data = [data for data in scoped_data if data]
+    if not scoped_data:
+        return None
+
+    calendar_latest = months[-1]
+    if any(calendar_latest in data for data in scoped_data):
+        return calendar_latest
+
+    month_set = set(months)
+    observed = []
+    for data in scoped_data:
+        observed.extend(m for m in data.keys() if m in month_set)
+    return max(observed) if observed else calendar_latest
+
+
+def _current_monthly_revenue(monthly_by_prop, months, property_names=None):
+    """Return (current revenue, month used), using latest observed data when needed."""
+    revenue_month = _latest_observed_revenue_month(monthly_by_prop, months, property_names)
+    if revenue_month is None:
+        return 0, None
+    scoped_names = list(property_names) if property_names is not None else list(monthly_by_prop.keys())
+    return sum(monthly_by_prop.get(name, {}).get(revenue_month, 0) for name in scoped_names), revenue_month
+
+
+def _property_monthly_lift_for_display(prop_data, months, analysis):
+    """Return one property's default Monthly Lift: latest observed revenue minus pre-PS baseline.
+
+    The portfolio headline uses current/latest observed month revenue minus the
+    pre-PS baseline. Individual property trend badges should use the same
+    methodology property-by-property, not the post-launch average stored in
+    diff_monthly.
+    """
+    if not prop_data or not months or not analysis:
+        return 0
+    current_rev, _revenue_month = _current_monthly_revenue({"_property": prop_data}, months, ["_property"])
+    return current_rev - analysis.get("pre_avg", 0)
+
+
+def build_individual_property_charts(
+    monthly_by_prop, months, launch_dates, title_prefix,
+    launch_analysis=None,
+    overlay_mode=None, compliance_data=None, prop_id_lookup=None,
+    missing_rent_data=None, show_missing_rent=False,
+    suspected_data=None, show_suspected=False,
+):
+    """Build a grid of individual property charts — 2 per row for clarity.
+
+    Parameters
+    ----------
+    overlay_mode       : str or None – 'unit' or 'resident' to overlay adoption line on secondary y-axis
+    compliance_data    : dict – {property_id: {month: {unit_adoption, resident_adoption, ...}}}
+    prop_id_lookup     : dict – {property_name: property_id}
+    missing_rent_data  : dict – {property_name: {missing_count, avg_fee, estimated_missing_rev, ...}}
+    show_missing_rent  : bool – whether to show the confirmed missing rent bars
+    suspected_data     : dict – {property_name: {missing_count, monthly_missing, ...}}
+    show_suspected     : bool – whether to show the suspected undisclosed bars
+    """
+    prop_totals = {p: sum(monthly_by_prop[p].values()) for p in monthly_by_prop}
+    sorted_props = sorted(prop_totals.keys(), key=lambda p: prop_totals[p], reverse=True)
+
+    n_props = len(sorted_props)
+    if n_props == 0:
+        return None
+
+    la = launch_analysis or {}
+    mrd = missing_rent_data or {}
+    srd = suspected_data or {}
+    m0 = months[0]
+    mN = months[-1]
+
+    cols = 2
+    rows = (n_props + cols - 1) // cols
+
+    # Dynamic spacing — more generous with 2 columns
+    max_v = 1.0 / max(rows - 1, 1)
+    v_spacing = min(0.08, max_v * 0.75)
+    h_spacing = 0.08
+
+    has_overlay = (
+        overlay_mode in ("unit", "resident")
+        and compliance_data
+        and prop_id_lookup
+    )
+
+    # Secondary y-axis needed for adoption overlay
+    specs = None
+    if has_overlay:
+        specs = [[{"secondary_y": True} for _ in range(cols)] for _ in range(rows)]
+
+    def _fmt_dollar(val):
+        if abs(val) >= 1_000_000:
+            return f"${val/1_000_000:,.1f}M"
+        elif abs(val) >= 1_000:
+            return f"${val/1_000:,.1f}K"
+        else:
+            return f"${val:,.0f}"
+
+    subtitles = []
+    for p in sorted_props:
+        short = p.split(" - ", 1)[-1] if " - " in p else p
+        launch_dt = _resolve_launch_dt(launch_dates.get(p))
+        a = la.get(p)
+        if launch_dt:
+            launch_month = datetime(launch_dt.year, launch_dt.month, 1)
+            if launch_month < m0:
+                short += f" Live since {launch_dt.strftime('%b %Y')}"
+            elif a and a["n_pre"] > 0:
+                # Use the canonical baseline_meaningful flag computed in
+                # compute_launch_analysis. It now incorporates BOTH the 2%
+                # rule AND the data-history-after-launch guard, so we don't
+                # need to recompute the threshold here.
+                if a.get("baseline_meaningful", True):
+                    display_lift = _property_monthly_lift_for_display(monthly_by_prop.get(p, {}), months, a)
+                    sign = "+" if display_lift >= 0 else ""
+                    color = "#677848" if display_lift >= 0 else "#CF5A3F"
+                    arrow = "↑" if display_lift >= 0 else "↓"
+                    short += (
+                        f'  <b><span style="color:{color}">'
+                        f'{arrow} {sign}{_fmt_dollar(display_lift)}/mo'
+                        f'</span></b>'
+                    )
+                elif a.get("data_starts_after_launch", False):
+                    # Be specific about why we can't show lift — helps users
+                    # understand it's a data coverage issue, not a real zero.
+                    short += f'  <span style="color:#999;font-size:0.85em">data starts after launch</span>'
+                else:
+                    short += f'  <span style="color:#999;font-size:0.85em">no meaningful pre-PS baseline</span>'
+            else:
+                short += f' Launched {launch_dt.strftime("%b %Y")}'
+        else:
+            short += " No launch date"
+
+        # Add missing pet rent count as badge
+        mr = mrd.get(p)
+        if mr and mr["missing_count"] > 0:
+            short += (
+                f'  <span style="color:#DD7B45;font-size:0.85em">'
+                f'{mr["missing_count"]} unpaid'
+                f'</span>'
+            )
+        # Add suspected undisclosed count as badge
+        sr = srd.get(p)
+        if sr and sr["missing_count"] > 0:
+            short += (
+                f'  <span style="color:#CF5A3F;font-size:0.85em">'
+                f'{sr["missing_count"]} suspected'
+                f'</span>'
+            )
+        subtitles.append(short)
+
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=subtitles,
+        vertical_spacing=v_spacing,
+        horizontal_spacing=h_spacing,
+        specs=specs,
+    )
+
+    adoption_key = None
+    if has_overlay:
+        adoption_key = "unit_adoption" if overlay_mode == "unit" else "resident_adoption"
+
+    for idx, prop in enumerate(sorted_props):
+        r = idx // cols + 1
+        c = idx % cols + 1
+        values = [monthly_by_prop[prop].get(m, 0) for m in months]
+
+        launch_dt = _resolve_launch_dt(launch_dates.get(prop))
+        a = la.get(prop)
+        launch_info = f"Launch: {launch_dt.strftime('%b %d, %Y')}" if launch_dt else "No launch date"
+
+        if launch_dt:
+            launch_month = datetime(launch_dt.year, launch_dt.month, 1)
+            # Launch month itself = post-launch (green)
+            if launch_month <= m0:
+                bar_colors = '#677848'
+            else:
+                bar_colors = ['#677848' if m >= launch_month else '#7D9BC1' for m in months]
+        else:
+            bar_colors = '#AFB2B3'
+
+        # Custom hover text with month name and launch date
+        hover_texts = [
+            f"<b>{m.strftime('%B %Y')}</b><br>"
+            f"Revenue: ${v:,.0f}<br>"
+            f"{launch_info}"
+            for m, v in zip(months, values)
+        ]
+
+        fig.add_trace(
+            go.Bar(
+                x=months, y=values, marker_color=bar_colors, showlegend=False,
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hover_texts,
+                name="Collected",
+            ),
+            row=r, col=c,
+            secondary_y=False if has_overlay else None,
+        )
+
+        # ── Missing rent bars (stacked on top of collected) ──────
+        if show_missing_rent:
+            mr = mrd.get(prop)
+            if mr and mr.get("monthly_missing"):
+                mm = mr["monthly_missing"]
+                n_miss = mr["missing_count"]
+                cl = mr.get("charge_type_label", "")
+                missing_vals = [mm.get(m, 0) for m in months]
+
+                # Only add trace if there's any missing revenue in the window
+                if any(v > 0 for v in missing_vals):
+                    missing_hovers = [
+                        f"<b>{m.strftime('%B %Y')}</b><br>"
+                        f"<b>Uncollected: ${mm.get(m, 0):,.0f}</b><br>"
+                        f"{n_miss} tenants not paying<br>"
+                        f"Type: {cl}<br>"
+                        f"{launch_info}"
+                        for m in months
+                    ]
+                    fig.add_trace(
+                        go.Bar(
+                            x=months, y=missing_vals,
+                            marker_color="rgba(221, 123, 69, 0.65)",
+                            showlegend=False,
+                            hovertemplate="%{customdata}<extra></extra>",
+                            customdata=missing_hovers,
+                            name="Uncollected",
+                        ),
+                        row=r, col=c,
+                        secondary_y=False if has_overlay else None,
+                    )
+
+        # ── Suspected undisclosed bars (stacked on top) ──────────
+        if show_suspected:
+            sr = srd.get(prop)
+            if sr and sr.get("monthly_missing"):
+                sm = sr["monthly_missing"]
+                n_susp = sr["missing_count"]
+                suspected_vals = [sm.get(m, 0) for m in months]
+
+                if any(v > 0 for v in suspected_vals):
+                    suspected_hovers = [
+                        f"<b>{m.strftime('%B %Y')}</b><br>"
+                        f"<b>Suspected: ${sm.get(m, 0):,.0f}</b><br>"
+                        f"{n_susp} suspected undisclosed<br>"
+                        f"{launch_info}"
+                        for m in months
+                    ]
+                    fig.add_trace(
+                        go.Bar(
+                            x=months, y=suspected_vals,
+                            marker_color="rgba(207, 90, 63, 0.45)",
+                            showlegend=False,
+                            hovertemplate="%{customdata}<extra></extra>",
+                            customdata=suspected_hovers,
+                            name="Suspected",
+                        ),
+                        row=r, col=c,
+                        secondary_y=False if has_overlay else None,
+                    )
+
+        # ── Adoption line overlay (secondary y-axis) ─────────────
+        if has_overlay:
+            pid = prop_id_lookup.get(prop)
+            if pid:
+                prop_comp = compliance_data.get(pid, {})
+                adoption_vals = []
+                adoption_hovers = []
+                for m in months:
+                    entry = prop_comp.get(m)
+                    if entry and entry.get(adoption_key) is not None:
+                        val = round(entry[adoption_key] * 100, 1)
+                        adoption_vals.append(val)
+                        adoption_hovers.append(
+                            f"<b>{m.strftime('%B %Y')}</b><br>"
+                            f"Adoption: {val:.1f}%<br>"
+                            f"{launch_info}"
+                        )
+                    else:
+                        adoption_vals.append(None)
+                        adoption_hovers.append("")
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=months, y=adoption_vals,
+                        mode="lines+markers",
+                        line=dict(color="rgba(156, 39, 176, 0.9)", width=3),
+                        marker=dict(size=6, color="rgba(156, 39, 176, 0.9)"),
+                        showlegend=False,
+                        connectgaps=True,
+                        hovertemplate="%{customdata}<extra></extra>",
+                        customdata=adoption_hovers,
+                    ),
+                    row=r, col=c,
+                    secondary_y=True,
+                )
+
+                # Fix secondary y-axis range 0–110%
+                fig.update_yaxes(
+                    range=[0, 110],
+                    showgrid=False,
+                    ticksuffix="%",
+                    tickfont=dict(size=8, color="rgba(156, 39, 176, 0.7)"),
+                    row=r, col=c, secondary_y=True,
+                )
+
+        # ── Baseline (pre-launch avg) — use row/col so axis refs are correct ──
+        # Only show the canonical baseline if compute_launch_analysis marked it
+        # meaningful. Do not recompute here; that can bypass source-history guards.
+        _bl_meaningful = (
+            a
+            and a["pre_avg"] > 0
+            and a["n_pre"] > 0
+            and a.get("baseline_meaningful", True)
+        )
+        if _bl_meaningful and a:
+            fig.add_hline(
+                y=a["pre_avg"],
+                row=r, col=c,
+                line=dict(color="#E2AB58", width=1.5, dash="dot"),
+            )
+            _month_label = a.get("baseline_month_label", f"{a['n_pre']} observed pre months")
+            _baseline_label = f"Pre-PS baseline ${a['pre_avg']:,.0f}/mo ({_month_label})"
+            if not a.get("baseline_reliable", True):
+                _baseline_label += " -- insufficient data"
+            fig.add_annotation(
+                x=months[-1], y=a["pre_avg"],
+                row=r, col=c,
+                text=_baseline_label,
+                showarrow=False,
+                font=dict(size=8, color="#B17455"),
+                xanchor="right", yanchor="bottom",
+            )
+
+        # ── Red launch line — use row/col so it targets the correct subplot ──
+        if launch_dt:
+            launch_month_start = datetime(launch_dt.year, launch_dt.month, 1)
+            line_pos = launch_month_start - timedelta(days=1)
+            if m0 - timedelta(days=31) <= line_pos <= mN + timedelta(days=31):
+                fig.add_vline(
+                    x=line_pos,
+                    row=r, col=c,
+                    line=dict(color="#CF5A3F", width=2, dash="dash"),
+                )
+
+    # ── Legend line for overlay & missing rent ──
+    overlay_legend = ""
+    if has_overlay:
+        overlay_label = "Unit" if overlay_mode == "unit" else "Resident"
+        overlay_legend = (
+            f"  ·  <span style='color:rgba(156,39,176,0.85)'>━●━</span> "
+            f"{overlay_label} Adoption % (right axis)"
+        )
+    missing_legend = ""
+    if show_missing_rent:
+        missing_legend = (
+            "  ·  <span style='color:#DD7B45'>■</span> Confirmed uncollected (est.)"
+        )
+    suspected_legend = ""
+    if show_suspected:
+        suspected_legend = (
+            "  ·  <span style='color:#CF5A3F'>■</span> Suspected undisclosed (est.)"
+        )
+
+    # Stack bars when showing missing rent or suspected
+    if show_missing_rent or show_suspected:
+        fig.update_layout(barmode="stack")
+
+    row_height = 300 if rows <= 15 else (250 if rows <= 30 else 200)
+    # Use property name as title when only 1 property
+    _chart_title_prefix = title_prefix
+    if n_props == 1:
+        _single_prop_name = sorted_props[0]
+        _short_single = _single_prop_name.split(" - ", 1)[-1] if " - " in _single_prop_name else _single_prop_name
+        _chart_title_prefix = _short_single
+
+    fig.update_layout(
+        height=max(450, rows * row_height),
+        autosize=True,
+        template="plotly_white",
+        title=dict(
+            text=(
+                f"{_chart_title_prefix}: {'Pet Fee Trend' if n_props == 1 else f'Individual Property Fee Trends ({n_props} properties)'}<br>"
+                f"<sub style='font-size:11px;color:#636569'>"
+                f"<span style='color:#7D9BC1'>■</span> Before PetScreening  ·  "
+                f"<span style='color:#677848'>■</span> After PetScreening  ·  "
+                f"<span style='color:#AFB2B3'>■</span> No launch date  ·  "
+                f"<span style='color:#E2AB58'>---</span> Pre-launch avg  ·  "
+                f"<span style='color:#CF5A3F'>|</span> Launch date  ·  "
+                f"Already live before window"
+                f"{overlay_legend}{missing_legend}{suspected_legend}</sub>"
+            ),
+            font=dict(size=14, color="#1F2257"),
+        ),
+        showlegend=False,
+        plot_bgcolor="white",
+        paper_bgcolor="#FAFAF8",
+        font=dict(family="Poppins, Arial, sans-serif", size=10, color="#4F5155"),
+    )
+    # Make subplot title annotations (property names) dark, readable, and properly sized
+    for ann in fig.layout.annotations:
+        if ann.text and not ann.text.startswith("<"):
+            ann.font = dict(size=12, color="#1F2257", family="Poppins, Arial, sans-serif")
+    return fig
+
+
+
+def generate_html_report(
+    label, fig_individual, fig_snapshot, launch_analysis, monthly_by_prop, months,
+    launch_dates, projected_100=None, overlay_mode_label=None,
+    missing_rent_data=None, show_missing_rent=False, total_properties_fetched=0,
+    use_avg_lift=False,
+):
+    """Generate a self-contained interactive HTML report for client sharing.
+
+    Returns an HTML string with embedded Plotly charts (fully interactive —
+    hover, zoom, pan all work), KPI summary, impact table, uncollected pet
+    rent summary, and PetScreening branding.
+    """
+    import plotly.io as pio
+
+    today_str = datetime.now().strftime("%B %d, %Y")
+
+    # ── KPI summary ───────────────────────────────────────────────────
+    comparable = {}
+    if launch_analysis:
+        comparable = {p: a for p, a in launch_analysis.items()
+                      if _launch_analysis_is_comparable(a)}
+    agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
+    agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
+    _launch_in_data = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
+    n_with_launch = len(_launch_in_data)
+    n_props_total = total_properties_fetched if total_properties_fetched else len(monthly_by_prop)
+    n_comparable = len(comparable)
+
+    # Simple lift: current month - pre baseline (across comparable)
+    _html_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
+    _html_latest = _latest_observed_revenue_month(monthly_by_prop, months, comparable.keys()) if months else None
+    _html_current_rev = sum(monthly_by_prop[p].get(_html_latest, 0) for p in comparable.keys()) if comparable and _html_latest else 0
+    _html_simple_lift = _html_current_rev - _html_pre_baseline if _html_pre_baseline > 0 else 0
+
+    # Post avg
+    _html_post_avg = sum(a.get("post_recent_avg", a.get("post_monthly_avg", 0)) for a in comparable.values()) if comparable else 0
+
+    # Display based on toggle
+    _html_display_lift = agg_diff_mo if use_avg_lift else _html_simple_lift
+    _html_lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+    _html_lift_caption = f"Property-by-property post avg vs pre avg across {n_comparable} properties" if use_avg_lift else f"Current month minus pre-PS baseline across {n_comparable} properties"
+    _html_rev_val = _html_post_avg if (use_avg_lift and _html_post_avg > 0) else _html_current_rev
+    _html_rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Pet Revenue"
+
+    sign_mo = "+" if _html_display_lift >= 0 else ""
+    sign_t = "+" if agg_diff >= 0 else ""
+
+    # ── Impact table rows ─────────────────────────────────────────────
+    impact_rows_html = ""
+    if launch_analysis:
+        sorted_la = sorted(launch_analysis.items(), key=lambda x: -x[1].get("diff_monthly", 0))
+        for prop, a in sorted_la:
+            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+            if _launch_analysis_is_comparable(a):
+                s_m = "+" if a["diff_monthly"] >= 0 else ""
+                s_t = "+" if a["diff_total"] >= 0 else ""
+                color = "#677848" if a["diff_monthly"] >= 0 else "#CF5A3F"
+                impact_rows_html += f"""
+                <tr>
+                    <td>{short}</td>
+                    <td>{a["launch_month"].strftime("%b %Y")}</td>
+                    <td>${a["pre_avg"]:,.0f}</td>
+                    <td>${a["post_recent_avg"]:,.0f}</td>
+                    <td style="color:{color};font-weight:bold">{s_m}${a["diff_monthly"]:,.0f}/mo</td>
+                    <td style="color:{color};font-weight:bold">{s_t}${a["diff_total"]:,.0f}</td>
+                    <td>{a["n_pre"]}mo pre · {a.get("n_recent_post", 0)}mo completed post · {a["n_post"]}mo total</td>
+                </tr>"""
+            elif a["n_pre"] > 0 and not a.get("baseline_reliable", True):
+                impact_rows_html += f"""
+                <tr>
+                    <td>{short}</td>
+                    <td>{a["launch_month"].strftime("%b %Y")}</td>
+                    <td>${a["pre_avg"]:,.0f}</td>
+                    <td>${a.get("post_recent_avg", a["post_monthly_avg"]):,.0f}</td>
+                    <td colspan="2" style="text-align:center;color:#999">Insufficient baseline ({a["n_pre"]}mo)</td>
+                    <td>{a["n_pre"]}mo pre · {a["n_post"]}mo total <span style="color:#CF5A3F;font-size:0.8em">(low data)</span></td>
+                </tr>"""
+            else:
+                impact_rows_html += f"""
+                <tr>
+                    <td>{short}</td>
+                    <td>{a["launch_month"].strftime("%b %Y")}</td>
+                    <td colspan="4" style="text-align:center;color:#888">Live before lookback window</td>
+                    <td>{a["n_post"]}mo after</td>
+                </tr>"""
+
+    # ── Projected revenue table (if overlay active) ───────────────────
+    projected_section_html = ""
+    if projected_100 and overlay_mode_label:
+        total_current = sum(p["current_rev"] for p in projected_100.values())
+        total_projected = sum(p["projected_rev_100"] for p in projected_100.values())
+        total_additional = total_projected - total_current
+        avg_adoption = sum(p["current_adoption"] for p in projected_100.values()) / len(projected_100)
+        proj_rows_html = ""
+        for prop, p in sorted(projected_100.items(), key=lambda x: -x[1]["additional_rev"]):
+            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+            proj_rows_html += f"""
+            <tr>
+                <td>{short}</td>
+                <td>{p['current_adoption']:.1f}%</td>
+                <td>${p['current_rev']:,.0f}</td>
+                <td>${p['projected_rev_100']:,.0f}</td>
+                <td style="color:#677848;font-weight:bold">+${p['additional_rev']:,.0f}/mo</td>
+            </tr>"""
+        projected_section_html = f"""
+        <div class="section">
+            <h2>Revenue Opportunity at 100% {overlay_mode_label} Adoption</h2>
+            <div class="kpi-row">
+                <div class="kpi-card">
+                    <div class="kpi-label">Current Monthly Pet-Related Revenue</div>
+                    <div class="kpi-value">${total_current:,.0f}</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Projected at 100% {overlay_mode_label} Adoption</div>
+                    <div class="kpi-value">${total_projected:,.0f}</div>
+                    <div class="kpi-delta">+${total_additional:,.0f}/mo</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Avg {overlay_mode_label} Adoption Now</div>
+                    <div class="kpi-value">{avg_adoption:.1f}%</div>
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Property</th>
+                        <th>Current {overlay_mode_label} Adoption</th>
+                        <th>Current Revenue</th>
+                        <th>Projected (100%)</th>
+                        <th>Additional Rev</th>
+                    </tr>
+                </thead>
+                <tbody>{proj_rows_html}</tbody>
+            </table>
+        </div>"""
+
+    # ── Adoption methodology (when overlay active) ──────────────────────
+    adoption_methodology_html = ""
+    if projected_100 and overlay_mode_label:
+        _is_unit = overlay_mode_label.lower() == "unit"
+        _entity = "units" if _is_unit else "residents"
+        _metric_desc = "Active units ÷ Total units" if _is_unit else "Active users ÷ Total users"
+        adoption_methodology_html = f"""
+        <div class="methodology" style="margin-top:24px">
+            <h3>How We Calculate Revenue Opportunity at 100% {overlay_mode_label} Compliance</h3>
+            <p><b>What is {overlay_mode_label} Adoption?</b><br>
+            {"<b>Unit Adoption</b> = the percentage of units at a property that have at least one active PetScreening profile." if _is_unit else "<b>Resident Adoption</b> = the percentage of residents at a property that have created a PetScreening profile."}
+            This data comes from the <b>Quarterly Business Review (QBR) reporting table</b>.</p>
+
+            <p><b>How we calculate the projection</b><br>
+            For each property, we use two inputs from the <b>latest month</b>:</p>
+            <table style="margin:12px 0;font-size:12px;max-width:600px">
+              <thead><tr><th>Input</th><th>Source</th><th>Example</th></tr></thead>
+              <tbody>
+                <tr><td>Current Monthly Pet-Related Revenue</td><td>Selected pet fee charges (Yardi)</td><td>$5,000/mo</td></tr>
+                <tr><td>Current {overlay_mode_label} Adoption</td><td>{_metric_desc} (QBR)</td><td>65%</td></tr>
+              </tbody>
+            </table>
+            <p style="font-family:monospace;font-size:12px;background:#F9F4E6;padding:12px 16px;border-radius:6px;line-height:1.8">
+            Projected Revenue at 100% = Current Revenue ÷ (Current Adoption / 100)<br>
+            &nbsp;&nbsp;= $5,000 ÷ 0.65 = <b>$7,692/mo</b><br><br>
+            Additional Revenue = Projected − Current<br>
+            &nbsp;&nbsp;= $7,692 − $5,000 = <b>+$2,692/mo</b>
+            </p>
+            <p><b>Why this works:</b> If a property earns $5,000/mo when 65% of {_entity} have completed screening,
+            the avg revenue per compliant {"unit" if _is_unit else "resident"} is $5,000 ÷ 65% ≈ $76.92.
+            At 100% adoption, that same per-{"unit" if _is_unit else "resident"} rate → ~$7,692/mo.</p>
+            <p style="font-size:12px;color:var(--text-muted)"><b>Note:</b> This is a linear extrapolation.
+            The last {_entity} to comply may have fewer or no pets, so actual revenue may be lower.
+            Only properties with both fee revenue and adoption data are included.</p>
+        </div>"""
+
+    # ── Uncollected Pet Rent section (when toggle was on) ──────────────
+    uncollected_section_html = ""
+    if missing_rent_data and show_missing_rent:
+        _mr_total = sum(v["missing_count"] for v in missing_rent_data.values())
+        _mr_latest = months[-1]
+        _mr_current_mo = sum(v["monthly_missing"].get(_mr_latest, 0) for v in missing_rent_data.values())
+        _mr_total_window = sum(v.get("total_missing_in_window", 0) for v in missing_rent_data.values())
+        _mr_n_props = sum(1 for v in missing_rent_data.values() if v["missing_count"] > 0)
+        _mr_n_total = total_properties_fetched if total_properties_fetched else len(monthly_by_prop)
+
+        _mr_rows_html = ""
+        for pname, minfo in sorted(missing_rent_data.items(), key=lambda x: -x[1].get("total_missing_in_window", 0)):
+            if minfo["missing_count"] == 0:
+                continue
+            _short = pname.split(" - ", 1)[-1] if " - " in pname else pname
+            _mr_rows_html += f"""
+            <tr>
+                <td>{_short}</td>
+                <td>{minfo["missing_count"]}</td>
+                <td>{minfo.get("charge_type_label", "—")}</td>
+                <td>${minfo["monthly_missing"].get(_mr_latest, 0):,.0f}</td>
+                <td style="color:#DD7B45;font-weight:bold">${minfo.get("total_missing_in_window", 0):,.0f}</td>
+            </tr>"""
+
+        uncollected_section_html = f"""
+        <div class="section">
+            <h2>Uncollected Pet Rent</h2>
+            <div class="kpi-row">
+                <div class="kpi-card">
+                    <div class="kpi-label">Tenants Not Paying</div>
+                    <div class="kpi-value">{_mr_total:,}</div>
+                    <div class="kpi-caption">Tenants with active household pet screening who are not being charged pet rent</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Uncollected ({_mr_latest.strftime('%b %Y')})</div>
+                    <div class="kpi-value" style="color:#DD7B45">${_mr_current_mo:,.0f}</div>
+                    <div class="kpi-caption">Estimated uncollected revenue for the current month</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Uncollected ({len(months)}mo window)</div>
+                    <div class="kpi-value" style="color:#DD7B45">${_mr_total_window:,.0f}</div>
+                    <div class="kpi-caption">Total estimated uncollected revenue across the lookback window</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Properties Affected</div>
+                    <div class="kpi-value">{_mr_n_props} of {_mr_n_total}</div>
+                    <div class="kpi-caption">Properties with at least one unpaid tenant</div>
+                </div>
+            </div>
+            <div class="methodology" style="border-left-color:#DD7B45">
+                <h3>Why This Matters</h3>
+                <p>When adoption goes up but revenue stays flat, these are the tenants causing the gap — they've
+                completed their PetScreening screening but aren't being charged pet rent. The orange bars on the
+                charts show this uncollected revenue based on each tenant's <b>actual lease dates</b>
+                (only for months they were at the property, and only after PetScreening launched).</p>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Property</th>
+                        <th>Unpaid Tenants</th>
+                        <th>Charge Type</th>
+                        <th>Current Mo ({_mr_latest.strftime('%b %Y')})</th>
+                        <th>Total Uncollected ({len(months)}mo)</th>
+                    </tr>
+                </thead>
+                <tbody>{_mr_rows_html}</tbody>
+            </table>
+        </div>"""
+
+    # ── Convert Plotly figures to HTML divs ────────────────────────────
+    _plotly_config = {"responsive": True, "displayModeBar": True, "scrollZoom": False}
+    individual_html = pio.to_html(
+        fig_individual, full_html=False, include_plotlyjs=False,
+        config=_plotly_config, default_width="100%",
+    ) if fig_individual else ""
+    snapshot_html = pio.to_html(
+        fig_snapshot, full_html=False, include_plotlyjs=False,
+        config=_plotly_config, default_width="100%",
+    ) if fig_snapshot else ""
+
+    # ── Logo data URIs for embedding ──────────────────────────────────
+    _logo_white = _PS_LOGO_WHITE_URI
+    _logo_dark = _PS_LOGO_DARK_URI
+
+    # ── Assemble the full HTML ────────────────────────────────────────
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PetScreening Fee Collection Report — {label}</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:wght@700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --pack-blue: #1F2257;
+    --retriever-rust: #B17455;
+    --tabby-yellow: #E2AB58;
+    --sky-blue: #DAEBF5;
+    --succulent-green: #8DAEA7;
+    --catnip-green: #677848;
+    --dog-bone-white: #F9F4E6;
+    --whisker-beige: #D3CEBD;
+    --smokey-gray: #636569;
+    --great-dane-gray: #4F5155;
+    --cornflower-blue: #7D9BC1;
+    --chew-toy-orange: #DD7B45;
+    --fire-hydrant-red: #CF5A3F;
+    --bg: #FAFAF8;
+    --card-bg: #ffffff;
+    --text: #4F5155;
+    --text-heading: #1F2257;
+    --text-muted: #636569;
+    --border: #E8E6E0;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Poppins', Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }}
+
+  /* ── Header ── */
+  .header {{
+    background: var(--pack-blue);
+    color: white;
+    padding: 28px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }}
+  .header-left {{
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }}
+  .header-logo {{
+    height: 26px;
+    opacity: 0.95;
+  }}
+  .header-divider {{
+    width: 1px;
+    height: 32px;
+    background: rgba(255,255,255,0.2);
+  }}
+  .header h1 {{
+    font-family: 'Poppins', Arial, sans-serif;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    margin: 0;
+  }}
+  .header .subtitle {{
+    font-size: 13px;
+    color: rgba(255,255,255,0.6);
+    margin-top: 2px;
+  }}
+  .header-right {{
+    text-align: right;
+    font-size: 12px;
+    color: rgba(255,255,255,0.55);
+    line-height: 1.6;
+  }}
+
+  /* ── Container ── */
+  .container {{
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 32px 48px 64px;
+  }}
+
+  /* ── Sections ── */
+  .section {{
+    margin-bottom: 36px;
+  }}
+  .section h2 {{
+    font-family: 'Poppins', Arial, sans-serif;
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text-heading);
+    border-bottom: 2px solid var(--retriever-rust);
+    padding-bottom: 8px;
+    display: inline-block;
+    letter-spacing: -0.2px;
+  }}
+
+  /* ── KPI Cards ── */
+  .kpi-row {{
+    display: flex;
+    gap: 16px;
+    margin-bottom: 24px;
+  }}
+  .kpi-card {{
+    flex: 1;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 26px;
+    box-shadow: 0 1px 3px rgba(31,34,87,0.04);
+    transition: box-shadow 0.15s ease;
+  }}
+  .kpi-card:hover {{
+    box-shadow: 0 4px 12px rgba(31,34,87,0.08);
+  }}
+  .kpi-label {{
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+    font-weight: 500;
+  }}
+  .kpi-value {{
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-heading);
+    letter-spacing: -0.5px;
+  }}
+  .kpi-delta {{
+    font-size: 14px;
+    color: var(--catnip-green);
+    font-weight: 600;
+    margin-top: 4px;
+  }}
+  .kpi-caption {{
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 8px;
+    line-height: 1.5;
+  }}
+
+  /* ── Tables ── */
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card-bg);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(31,34,87,0.04);
+    font-size: 13px;
+  }}
+  thead {{
+    background: var(--dog-bone-white);
+  }}
+  th {{
+    padding: 11px 16px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-heading);
+    border-bottom: 2px solid var(--border);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }}
+  td {{
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }}
+  tr:last-child td {{
+    border-bottom: none;
+  }}
+  tr:hover td {{
+    background: #FAFAF5;
+  }}
+
+  /* ── Chart section ── */
+  .chart-section {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 24px;
+    box-shadow: 0 1px 3px rgba(31,34,87,0.04);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }}
+  .chart-section .plotly-graph-div {{
+    width: 100% !important;
+  }}
+
+  /* ── Methodology ── */
+  .methodology {{
+    background: #F7F5EE;
+    border: 1px solid var(--whisker-beige);
+    border-left: 3px solid var(--retriever-rust);
+    border-radius: 0 8px 8px 0;
+    padding: 18px 24px;
+    font-size: 13px;
+    margin-bottom: 28px;
+    line-height: 1.8;
+  }}
+  .methodology h3 {{
+    font-family: 'Poppins', Arial, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--text-heading);
+  }}
+  .methodology ul {{
+    margin-left: 20px;
+    margin-top: 6px;
+  }}
+  .methodology li {{
+    margin-bottom: 3px;
+  }}
+
+  /* ── Legend ── */
+  .legend {{
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    margin-bottom: 20px;
+    padding: 12px 16px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }}
+  .legend-item {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+  }}
+  .legend-dot {{
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    display: inline-block;
+  }}
+
+  /* ── Footer ── */
+  .footer {{
+    text-align: center;
+    padding: 28px 24px;
+    font-size: 11px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    margin-top: 56px;
+    letter-spacing: 0.2px;
+  }}
+  .footer-logo {{
+    height: 22px;
+    margin-bottom: 10px;
+    opacity: 0.7;
+  }}
+
+  /* ── Mobile notice (hidden on desktop) ── */
+  .mobile-chart-notice {{
+    display: none;
+    background: var(--sky-blue);
+    border: 1px solid var(--cornflower-blue);
+    border-left: 4px solid var(--pack-blue);
+    border-radius: 0 10px 10px 0;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    text-align: center;
+  }}
+  .mobile-chart-notice .notice-icon {{
+    font-size: 32px;
+    margin-bottom: 8px;
+  }}
+  .mobile-chart-notice .notice-title {{
+    font-family: 'Poppins', Arial, sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-heading);
+    margin-bottom: 6px;
+  }}
+  .mobile-chart-notice .notice-body {{
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }}
+
+  /* ── Mobile / Phone ── */
+  @media (max-width: 768px) {{
+    .header {{
+      padding: 20px 16px;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+    }}
+    .header-right {{ text-align: left; }}
+    .header h1 {{ font-size: 16px; }}
+    .container {{ padding: 16px; }}
+    .kpi-row {{
+      flex-direction: column;
+      gap: 10px;
+    }}
+    .kpi-card {{
+      padding: 16px;
+    }}
+    .kpi-value {{ font-size: 22px; }}
+    .kpi-label {{ font-size: 10px; }}
+    .section h2 {{ font-size: 14px; }}
+    table {{ font-size: 11px; }}
+    th, td {{ padding: 8px 10px; }}
+    .chart-section {{ display: none; }}
+    .mobile-chart-notice {{ display: block; }}
+    .methodology {{ padding: 14px 16px; font-size: 12px; }}
+    .legend {{ display: none; }}
+  }}
+  @media (max-width: 480px) {{
+    .header h1 {{ font-size: 14px; }}
+    .kpi-value {{ font-size: 18px; }}
+    table {{ font-size: 10px; display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+    .methodology {{ font-size: 11px; }}
+  }}
+
+  @media print {{
+    body {{ background: white; }}
+    .header {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .kpi-card {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: avoid; }}
+    .chart-section {{ break-inside: avoid; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <img src="{_logo_white}" alt="PetScreening" class="header-logo"
+         onerror="this.style.display='none'">
+    <div class="header-divider"></div>
+    <div>
+      <h1>Fee Collection Analysis</h1>
+      <div class="subtitle">{label}</div>
+    </div>
+  </div>
+  <div class="header-right">
+    Report generated {today_str}<br>
+    {months[0].strftime("%b %Y")} – {months[-1].strftime("%b %Y")} · {len(months)} months
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- KPI Summary -->
+  <div class="section">
+    <h2>PetScreening Revenue Impact</h2>
+    <div class="kpi-row">
+      <div class="kpi-card">
+        <div class="kpi-label">{_html_rev_label}</div>
+        <div class="kpi-value">${_html_rev_val:,.0f}/mo</div>
+        <div class="kpi-caption">Across {n_comparable} comparable properties</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">{_html_lift_label}</div>
+        <div class="kpi-value">{sign_mo}${_html_display_lift:,.0f}/mo</div>
+        <div class="kpi-caption">{_html_lift_caption}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Properties with Launch Date</div>
+        <div class="kpi-value">{n_with_launch} of {n_props_total}</div>
+        <div class="kpi-caption">{n_comparable} with pre &amp; post data for comparison</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Methodology -->
+  <div class="methodology">
+    <h3>How We Calculate PetScreening Impact</h3>
+    {"<p>This report uses <b>Average Monthly Lift</b>. For seasonal portfolios, comparing a single month can be misleading. Instead, each property's post-launch average is compared to its pre-launch baseline.</p>" if use_avg_lift else "<p>For each property, we compare the most recently completed month's pet fee revenue to the pre-launch baseline:</p>"}
+    <ul>
+      <li><b>Before PetScreening (avg/mo)</b> -- Average of up to 6 months before launch</li>
+      {"<li><b>After PetScreening (avg/mo)</b> -- Average of all completed post-launch months</li>" if use_avg_lift else "<li><b>Current Revenue</b> -- Most recently completed month's pet fee charges</li>"}
+      <li><b>{_html_lift_label}</b> = {"Post-launch average minus pre-launch average (property by property)" if use_avg_lift else "Current month revenue minus pre-launch baseline"}</li>
+    </ul>
+  </div>
+
+  <!-- Legend -->
+  <div class="legend">
+    <div class="legend-item"><span class="legend-dot" style="background:#7D9BC1"></span> Before PetScreening</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#677848"></span> After PetScreening</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#AFB2B3"></span> No launch date</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#E2AB58;height:3px;border-radius:0"></span> Pre-launch avg</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#CF5A3F;width:3px;height:14px;border-radius:0"></span> Launch date</div>
+    {"<div class='legend-item'><span class='legend-dot' style='background:#DD7B45'></span> Uncollected pet rent (est.)</div>" if show_missing_rent else ""}
+  </div>
+
+  <!-- Mobile-only notice (hidden on desktop) -->
+  <div class="mobile-chart-notice">
+    <div class="notice-icon"></div>
+    <div class="notice-title">Interactive Charts — Best Viewed on Desktop</div>
+    <div class="notice-body">
+      This report includes interactive charts with hover details, zoom, and pan.
+      These features require a desktop or laptop browser to render properly.<br>
+      <span style="margin-top:8px;display:inline-block;font-size:12px;color:var(--retriever-rust);font-weight:500">
+        All KPIs, tables, and data above &amp; below are fully readable on mobile.
+      </span>
+    </div>
+  </div>
+
+  <!-- Individual Property Charts -->
+  <div class="section">
+    <h2>Individual Property Fee Trends</h2>
+    <div class="chart-section">{individual_html}</div>
+  </div>
+
+  {projected_section_html}
+
+  {adoption_methodology_html}
+
+  {uncollected_section_html}
+
+  <!-- Current Snapshot -->
+  {"<div class='section'><h2>Current Monthly Fee Revenue by Property</h2><div class='chart-section'>" + snapshot_html + "</div></div>" if snapshot_html else ""}
+
+  <!-- Impact Breakdown Table -->
+  {"<div class='section'><h2>PetScreening Impact by Property</h2><table><thead><tr><th>Property</th><th>Launch</th><th>Pre-PS Avg ($/mo)</th><th>Current Avg ($/mo)</th><th>Monthly Lift</th><th>Cumulative Impact</th><th>Window</th></tr></thead><tbody>" + impact_rows_html + "</tbody></table></div>" if impact_rows_html else ""}
+
+  <div class="footer">
+    <img src="{_logo_dark}" alt="PetScreening" class="footer-logo"
+         onerror="this.style.display='none'"><br>
+    Powered by PetScreening · Report generated {today_str} · Charts are interactive on desktop — hover, zoom, and pan to explore
+  </div>
+
+</div>
+
+<script>
+// Resize Plotly charts when window size changes (e.g. tablet rotation).
+// On phones (<768px) charts are hidden via CSS, so this only fires for larger screens.
+function resizePlotlyCharts() {{
+    var plots = document.querySelectorAll('.plotly-graph-div');
+    plots.forEach(function(plot) {{
+        if (plot && plot.offsetParent !== null && typeof Plotly !== 'undefined') {{
+            Plotly.Plots.resize(plot);
+        }}
+    }});
+}}
+window.addEventListener('load', function() {{ setTimeout(resizePlotlyCharts, 400); }});
+window.addEventListener('resize', resizePlotlyCharts);
+</script>
+
+</body>
+</html>"""
+    return html
+
+
+def _n_props(n):
+    """'1 property' / '3 properties' — avoids '1 properties' in reports."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"{n} properties"
+    return f"{n} propert{'y' if n == 1 else 'ies'}"
+
+
+def _n_tenants(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"{n} tenants"
+    return f"{n:,} tenant{'' if n == 1 else 's'}"
+
+
+def generate_tranche_pdf(
+    label, today_str, pre_baseline, comparable_count,
+    t1_mo, t1_total, t1_pct, t1_months,
+    t2_tenants, t2_mo, t2_props, t1_t2_combined, t1_t2_pct,
+    t3_adoption, t3_additional, t3_total_impact, t3_pct,
+    adopt_type_label, current_monthly_rev,
+    n_props_total, n_with_launch, n_props_with_data,
+    include_pm=False, pm_rows=None,
+    su_total_profiles=0, su_current_mo=0, total_projected=0,
+    missing_rent_data=None, total_units=0,
+    comparable_data=None,
+    total_portfolio_units=0,
+    property_doors=None,
+    monthly_revenue_series=None,
+    comparable_current_rev=0,
+    pmc_system="yardi",
+    use_avg_lift=False,
+    asset_class="conventional",
+    monthly_by_prop=None,
+    latest_month=None,
+    selected_charge_codes=None,
+    avg_pet_fee=0,
+    include_property_charts=False,
+    realpage_prop_count=0,
+    benchmarks=None,
+    prev_snapshot=None,
+    prev_snapshot_ts=None,
+    current_snapshot=None,
+):
+    """Generate a branded PDF with card-based KPIs + narrative storytelling.
+
+    Matches the Summary tab visual style: big numbers in cards, short
+    narrative sentences, and the key metrics table Eduardo likes.
+
+    Returns PDF bytes ready for st.download_button.
+    """
+    # Auto-set use_avg_lift for student_housing and seasonal asset classes
+    if asset_class in ("student_housing", "seasonal"):
+        use_avg_lift = True
+
+    from fpdf import FPDF
+
+    class PDF(FPDF):
+        @staticmethod
+        def _safe_pdf_text(text):
+            """Convert Unicode punctuation to core-font-safe text for fpdf Helvetica."""
+            if text is None:
+                return ""
+            replacements = {
+                "\u2013": "-",      # en dash
+                "\u2014": "--",     # em dash
+                "\u2010": "-",      # hyphen
+                "\u2011": "-",      # non-breaking hyphen
+                "\u2012": "-",      # figure dash
+                "\u2212": "-",      # minus sign
+                "\u2018": "'",
+                "\u2019": "'",
+                "\u201a": ",",
+                "\u201c": '"',
+                "\u201d": '"',
+                "\u201e": '"',
+                "\u2026": "...",
+                "\u2022": "-",
+                "\u00a0": " ",
+            }
+            safe = str(text)
+            for src, dst in replacements.items():
+                safe = safe.replace(src, dst)
+            # Built-in PDF core fonts are Latin-1 only; replace anything else
+            # instead of failing the entire report download.
+            return safe.encode("latin-1", "replace").decode("latin-1")
+
+        def normalize_text(self, text):
+            return super().normalize_text(self._safe_pdf_text(text))
+
+        def header(self):
+            self.set_fill_color(31, 34, 87)  # #1F2257
+            self.rect(0, 0, 210, 38, 'F')
+            self.set_font('Helvetica', 'B', 18)
+            self.set_text_color(255, 255, 255)
+            self.set_xy(15, 6)
+            self.cell(0, 8, label, ln=True)
+            self.set_font('Helvetica', '', 11)
+            self.set_text_color(226, 171, 88)  # #E2AB58
+            self.set_xy(15, 15)
+            self.cell(0, 6, 'PetScreening Value Report', ln=True)
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(218, 235, 245)  # #DAEBF5
+            self.set_xy(15, 23)
+            self.cell(0, 6, today_str, ln=True)
+            self.ln(12)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(150, 150, 150)
+            _gen_ts = datetime.now().strftime("%B %d, %Y at %I:%M %p") + " ET"
+            self.cell(0, 10, f'PetScreening Value Report  |  {label}  |  Page {self.page_no()}  |  Generated {_gen_ts}', align='C')
+
+    pdf = PDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    # ── Brand colors ──
+    dark_blue = (31, 34, 87)
+    light_blue = (70, 130, 180)  # steel blue for actuals row
+    green = (103, 120, 72)
+    orange = (221, 123, 69)
+    warm = (177, 116, 85)
+    body_gray = (79, 81, 85)
+    light_gray = (99, 101, 105)
+    card_border = (232, 228, 218)
+    card_fill = (250, 250, 248)
+
+    # ── Layout constants ──
+    PAGE_L = 15          # left margin
+    PAGE_R = 195         # right edge
+    USABLE_W = PAGE_R - PAGE_L  # 180mm
+    CARD_GAP = 4
+    CARD_W = (USABLE_W - 2 * CARD_GAP) / 3  # ~57.3mm
+    CARD_H = 24          # compact cards to fit 4 rows + How This Scales on page 1
+
+    # ── Helper: sanitize text for fpdf (replace unicode dashes) ──
+    def _pdf_safe(text):
+        """Replace unicode dashes with ASCII equivalents for fpdf compatibility."""
+        if text is None:
+            return ""
+        return str(text).replace("\u2013", "-").replace("\u2014", "--").replace("\u2019", "'").replace("\u2018", "'")
+
+    # ── Helper: draw a row of 3 KPI cards ──
+    # Colors for styled rows
+    _sage_green_bg = (235, 243, 235)  # light sage/green for total row cards 2&3
+    _teal_blue = (58, 134, 155)  # teal/blue for actuals values
+    _actuals_pill_bg = (230, 242, 245)  # light blue pill background
+    _opportunity_pill_bg = (255, 240, 230)  # light orange pill background
+
+    def draw_rounded_rect(x, y, w, h, r, style='DF'):
+        """Draw a rectangle with rounded corners using arcs."""
+        # fpdf2 supports rounded_rect; fallback to regular rect if not available
+        try:
+            pdf.set_line_width(0.3)
+            pdf.rounded_rect(x, y, w, h, r, style=style)
+        except AttributeError:
+            pdf.rect(x, y, w, h, style)
+
+    def draw_pill_label(x, y, text, bg_color, text_color):
+        """Draw a small pill/badge with text."""
+        pdf.set_font('Helvetica', 'B', 5.5)
+        text_w = pdf.get_string_width(text) + 4
+        pill_h = 4
+        # Pill background
+        pdf.set_fill_color(*bg_color)
+        try:
+            pdf.rounded_rect(x, y, text_w, pill_h, 1, style='F')
+        except AttributeError:
+            pdf.rect(x, y, text_w, pill_h, 'F')
+        # Pill text
+        pdf.set_text_color(*text_color)
+        pdf.set_xy(x + 2, y + 0.5)
+        pdf.cell(text_w - 4, pill_h - 1, text, align='C')
+        return text_w
+
+    def draw_card_row(cards, row_label=None, row_label_color=None, row_style=None):
+        """Draw 3 cards side-by-side. Each card is a dict:
+        {value: str, label: str, sub: str|None, color: tuple, bg: tuple|None}
+        row_label: optional label in a pill above first card (e.g., 'ACTUALS')
+        row_label_color: color for the row label text
+        row_style: 'total' for combined row styling
+        """
+        start_y = pdf.get_y()
+        # Check if we need a page break (card row + narrative below ~50mm)
+        if start_y + CARD_H + 10 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+            start_y = pdf.get_y()
+
+        # Row label pill above first card
+        if row_label and row_style != "total":
+            pill_bg = _actuals_pill_bg if row_label_color == _teal_blue else _opportunity_pill_bg
+            draw_pill_label(PAGE_L + 2, start_y - 4, row_label.upper(), pill_bg, row_label_color or dark_blue)
+
+        for i, card in enumerate(cards):
+            x = PAGE_L + i * (CARD_W + CARD_GAP)
+            # Determine card background and text color
+            card_bg = card.get("bg", card_fill)
+            text_color = card.get("color", dark_blue)
+
+            # Special handling for 'total' row style — all cards get sage green bg
+            if row_style == "total":
+                card_bg = _sage_green_bg  # light sage/green for all total row cards
+                text_color = green
+
+            # Card background with rounded corners
+            pdf.set_fill_color(*card_bg)
+            pdf.set_draw_color(*card_border)
+            draw_rounded_rect(x, start_y, CARD_W, CARD_H, 2, 'DF')
+
+            # Big number
+            pdf.set_font('Helvetica', 'B', 16)
+            pdf.set_text_color(*text_color)
+            pdf.set_xy(x + 2, start_y + 2)
+            pdf.cell(CARD_W - 4, 7, card["value"], align='C')
+
+            # Label
+            pdf.set_font('Helvetica', '', 6.5)
+            pdf.set_text_color(*light_gray)
+            pdf.set_xy(x + 2, start_y + 10)
+            pdf.cell(CARD_W - 4, 4, card["label"].upper(), align='C')
+
+            # Sub-label OR pills for total row first card
+            if row_style == "total" and i == 0 and card.get("actuals_val") and card.get("found_val"):
+                # Draw colored pills: "$X actuals" + "+" + "$Y found"
+                pill_y = start_y + 14.5
+                actuals_text = f"${card['actuals_val']:,.0f} actuals"
+                found_text = f"${card['found_val']:,.0f} found"
+                actuals_w = pdf.get_string_width(actuals_text) + 6
+                found_w = pdf.get_string_width(found_text) + 6
+                plus_w = 6
+                total_w = actuals_w + plus_w + found_w
+                start_x = x + (CARD_W - total_w) / 2
+                # Actuals pill (teal/blue bg to match row 2)
+                draw_pill_label(start_x, pill_y, actuals_text, _actuals_pill_bg, _teal_blue)
+                # Plus sign
+                pdf.set_font('Helvetica', 'B', 6)
+                pdf.set_text_color(*green)
+                pdf.set_xy(start_x + actuals_w + 1, pill_y + 0.5)
+                pdf.cell(4, 3, "+", align='C')
+                # Found pill (orange bg)
+                draw_pill_label(start_x + actuals_w + plus_w, pill_y, found_text, _opportunity_pill_bg, orange)
+            elif card.get("sub"):
+                pdf.set_font('Helvetica', '', 5.5)
+                pdf.set_text_color(150, 150, 150)
+                pdf.set_xy(x + 2, start_y + 15)
+                pdf.cell(CARD_W - 4, 4, card["sub"], align='C')
+
+        pdf.set_y(start_y + CARD_H + 2)
+
+    def draw_separator_text(text):
+        """Draw a small centered separator text in a sage green pill with green text."""
+        pdf.set_font('Helvetica', 'B', 5)
+        # Measure text width AFTER setting font
+        text_upper = text.upper()
+        measured_w = pdf.get_string_width(text_upper)
+        pill_w = measured_w + 12  # generous padding
+        pill_h = 6
+        pill_x = PAGE_L + (USABLE_W - pill_w) / 2
+        start_y = pdf.get_y()
+        pdf.set_fill_color(*_sage_green_bg)  # same sage green as total row
+        try:
+            pdf.rounded_rect(pill_x, start_y, pill_w, pill_h, 1.5, style='F')
+        except AttributeError:
+            pdf.rect(pill_x, start_y, pill_w, pill_h, 'F')
+        pdf.set_text_color(*green)  # green text
+        pdf.set_xy(pill_x + 6, start_y + 1.5)
+        pdf.cell(measured_w, 3, text_upper, align='C')
+        pdf.set_y(start_y + pill_h + 2)
+
+    # ── Helper: highlighted callout box (for cap rate) ──
+    def callout_box(text, color=orange):
+        """Draw a prominent highlighted callout with colored left border."""
+        start_y = pdf.get_y()
+        box_x = PAGE_L + 4
+        box_w = USABLE_W - 8
+        # Measure text height
+        pdf.set_font('Helvetica', 'B', 10)
+        # Draw background
+        pdf.set_fill_color(255, 248, 240)  # warm cream
+        pdf.set_draw_color(*color)
+        box_h = 12
+        pdf.rect(box_x, start_y, box_w, box_h, 'F')
+        # Left accent bar
+        pdf.set_fill_color(*color)
+        pdf.rect(box_x, start_y, 2.5, box_h, 'F')
+        # Text
+        pdf.set_text_color(*color)
+        pdf.set_xy(box_x + 6, start_y + 2)
+        pdf.cell(box_w - 10, 8, text, align='C')
+        pdf.set_y(start_y + box_h + 3)
+
+    # ── Helper: section heading ──
+    def section_heading(title, color=dark_blue, min_space=45):
+        # Check for page break
+        if pdf.get_y() + min_space > pdf.h - pdf.b_margin:
+            pdf.add_page()
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(*color)
+        pdf.cell(0, 6, title, ln=True)
+        # Colored underline
+        y = pdf.get_y()
+        pdf.set_draw_color(*color)
+        pdf.set_line_width(0.6)
+        pdf.line(PAGE_L, y, PAGE_L + 50, y)
+        pdf.set_line_width(0.2)
+        pdf.ln(2)
+
+    # ── Helper: narrative text ──
+    def narrative(text):
+        pdf.set_font('Helvetica', '', 8.5)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(0, 4, text)
+        pdf.ln(1)
+
+    # ── Helper: divider ──
+    def divider():
+        pdf.set_draw_color(*card_border)
+        y = pdf.get_y()
+        pdf.line(PAGE_L, y, PAGE_R, y)
+        pdf.ln(3)
+
+    # ── Pre-compute recurring vs one-time (used by both sections) ──
+    _opp_recurring_mo = 0
+    _opp_onetime_total = 0
+    if missing_rent_data:
+        for _v in missing_rent_data.values():
+            _cnt = _v.get("missing_count", 0)
+            if _cnt == 0:
+                continue
+            _opp_recurring_mo += _cnt * _v.get("avg_recurring", 0)
+            _opp_onetime_total += _cnt * _v.get("avg_onetime", 0)
+    else:
+        _opp_recurring_mo = t2_mo
+
+    _opp_annual_recurring = _opp_recurring_mo * 12
+    _opp_annual_impact = _opp_annual_recurring + _opp_onetime_total
+    _opp_cap_rate = 0.05
+    _opp_value_impact = _opp_annual_impact / _opp_cap_rate if _opp_annual_impact > 0 else 0
+
+    # ── Helper: "show your work" italic explanation line ──
+    def show_work(text):
+        """Draw a small italic calculation explanation line below card rows."""
+        pdf.set_font('Helvetica', 'I', 7)
+        pdf.set_text_color(140, 140, 140)
+        pdf.cell(0, 3.5, text, ln=True)
+        pdf.ln(1)
+
+    # ── Helper: color for a lift value ──
+    def lift_color(val):
+        """Color for lift/actuals metrics — teal for positive, orange for negative."""
+        if val is None:
+            return (160, 160, 160)  # gray for N/A
+        return _teal_blue if val >= 0 else orange
+
+    def combined_color(val):
+        """Color for combined/total metrics — green for positive."""
+        if val is None:
+            return (160, 160, 160)
+        return green if val >= 0 else orange
+
+    # ── Helper: format large currency values with K/M suffixes ──
+    def _format_large_currency(val):
+        """Format a currency value with K/M suffix for readability."""
+        if val is None or val == 0:
+            return "$0"
+        sign = "-" if val < 0 else ""
+        val = abs(val)
+        if val >= 1_000_000:
+            return f"{sign}${val / 1_000_000:,.1f}M"
+        elif val >= 100_000:
+            return f"{sign}${val / 1_000:,.0f}K"
+        else:
+            return f"{sign}${val:,.0f}"
+
+    # ═══════════════════════════════════════════════════════════
+    #  PAGE 1: AT A GLANCE  (comparable-only = apples-to-apples)
+    # ═══════════════════════════════════════════════════════════
+    _cap_rate = 0.05
+
+    # ── Comparable-only analysis ──
+    # Headline numbers use ONLY properties with pre AND post data.
+    _comp_current_rev = comparable_current_rev or 0
+    _comp_units = 0
+    _noncomp_count = 0
+    _noncomp_current_rev = 0
+    _noncomp_units = 0
+    if comparable_data and property_doors:
+        _comp_names = set(comparable_data.keys())
+        for pname in comparable_data:
+            _comp_units += property_doors.get(pname, 0)
+        _noncomp_count = n_props_with_data - comparable_count
+        _noncomp_current_rev = current_monthly_rev - _comp_current_rev
+        for pname in (property_doors or {}):
+            if pname not in _comp_names:
+                _noncomp_units += property_doors.get(pname, 0)
+    elif comparable_data:
+        _noncomp_count = n_props_with_data - comparable_count
+        _noncomp_current_rev = current_monthly_rev - _comp_current_rev
+
+    # Compute comparable post-launch average (sum of each property's post avg)
+    _comp_post_avg = 0
+    if comparable_data:
+        _comp_post_avg = sum(
+            pdata.get("post_recent_avg", pdata.get("post_monthly_avg", 0))
+            for pdata in comparable_data.values()
+        )
+
+    # RealPage data history doesn't extend far enough to compute pre-PS
+    # baselines for properties launched before Jan 2025. We honor that
+    # constraint by skipping lift entirely for RealPage and showing
+    # current-state revenue + opportunity instead. See the Documentation
+    # tab → RealPage → Why Lift Analysis Is Not Shown for the full case.
+    _is_realpage = (pmc_system or "").lower() == "real_page"
+
+    # Use comparable numbers for headline when available, fall back to full portfolio
+    _has_comparable = comparable_count > 0 and _comp_current_rev > 0 and pre_baseline > 0
+    if _has_comparable:
+        _headline_current = _comp_current_rev
+        _headline_pre = pre_baseline
+        _headline_units = _comp_units
+        _headline_props = comparable_count
+    else:
+        _headline_current = current_monthly_rev
+        _headline_pre = pre_baseline
+        _headline_units = total_units
+        _headline_props = n_props_with_data
+
+    # Simple lift (current - pre)
+    _monthly_lift = _headline_current - _headline_pre if _headline_pre > 0 else 0
+    _simple_pct = (_monthly_lift / _headline_pre * 100) if _headline_pre > 0 and _monthly_lift else 0
+
+    # Average monthly lift (property-by-property average)
+    _adjusted_lift = t1_mo if comparable_count > 0 else 0
+
+    # Choose methodology based on use_avg_lift toggle
+    # For single-property without pre-PS data, skip lift calculations entirely.
+    _no_pre_data = (not _has_comparable and pre_baseline <= 0)
+    
+    if _no_pre_data:
+        # No pre-PS data — leave lift metrics blank, focus on opportunity
+        _active_lift = 0
+        _lift_per_unit = 0
+        _annual_lift = 0
+        _asset_value_impact = 0
+    elif use_avg_lift:
+        # Use average monthly lift (t1_mo) for all calculations
+        _active_lift = _adjusted_lift
+        _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
+        _annual_lift = _active_lift * 12
+        _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
+    else:
+        # Use simple lift (current - pre) for all calculations
+        _active_lift = _monthly_lift
+        _lift_per_unit = _active_lift / _headline_units if _headline_units and _headline_units > 0 and _active_lift else 0
+        _annual_lift = _active_lift * 12
+        _asset_value_impact = _annual_lift / _cap_rate if _annual_lift > 0 else 0
+
+    # Full portfolio rev-per-unit (used if no comparable)
+    _rev_per_unit = current_monthly_rev / total_units if total_units and total_units > 0 else 0
+
+    # Title
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.set_text_color(*dark_blue)
+    pdf.cell(0, 8, 'At a Glance', ln=True)
+    y_line = pdf.get_y()
+    pdf.set_draw_color(*dark_blue)
+    pdf.set_line_width(0.6)
+    pdf.line(PAGE_L, y_line, PAGE_L + 50, y_line)
+    pdf.set_line_width(0.2)
+    pdf.ln(6)
+
+    # ── Narrative paragraph ──
+    # When avg lift toggled, show post avg instead of current
+    _display_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else _headline_current
+    _display_rev_label = "average" if use_avg_lift else "generate"
+
+    _glance_parts = []
+    if _has_comparable and _headline_units > 0:
+        _glance_parts.append(
+            f"Across {_n_props(comparable_count).replace('propert', 'comparable propert')} ({_headline_units:,} units) with "
+            f"pre- and post-launch data, pet revenue before PetScreening was "
+            f"${_headline_pre:,.0f}/mo."
+        )
+        if use_avg_lift:
+            _glance_parts.append(
+                f" Post-launch, those properties average ${_display_rev:,.0f}/mo -- "
+                f"a ${_active_lift:,.0f}/mo average monthly lift, or "
+                f"${_lift_per_unit:,.2f} per unit per month."
+            )
+        else:
+            _glance_parts.append(
+                f" Today those same properties generate ${_display_rev:,.0f}/mo -- "
+                f"a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%), or "
+                f"${_lift_per_unit:,.2f} per unit per month."
+            )
+        if _asset_value_impact > 0:
+            _glance_parts.append(
+                f" At a 5% cap rate, that represents ~${_asset_value_impact:,.0f} in added asset value."
+            )
+    elif _has_comparable:
+        if use_avg_lift:
+            _glance_parts.append(
+                f"Across {comparable_count} comparable properties, pet revenue was "
+                f"${_headline_pre:,.0f}/mo before PetScreening. Post-launch average is "
+                f"${_display_rev:,.0f}/mo -- a ${_active_lift:,.0f}/mo average monthly lift."
+            )
+        else:
+            _glance_parts.append(
+                f"Across {comparable_count} comparable properties, pet revenue was "
+                f"${_headline_pre:,.0f}/mo before PetScreening and is now "
+                f"${_display_rev:,.0f}/mo -- a ${_active_lift:,.0f}/mo increase ({_simple_pct:+.1f}%)."
+            )
+    elif _no_pre_data:
+        # No pre-PS data available
+        _glance_parts.append(
+            f"This property generates ${current_monthly_rev:,.0f}/mo in pet fee revenue. "
+            f"No pre-PetScreening baseline is available for lift comparison -- see Opportunity section below for actionable revenue."
+        )
+    else:
+        _glance_parts.append(
+            f"This portfolio currently generates ${current_monthly_rev:,.0f}/mo in pet fee revenue "
+            f"across {n_props_with_data} properties."
+        )
+    # Add opportunity context (missing rent + suspected) -- emphasize this is
+    # across the entire portfolio, not just the comparable subset analyzed above.
+    _glance_leakage_mo = (_opp_recurring_mo or 0) + (su_current_mo or 0)
+    _glance_leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
+    if _glance_leakage_mo > 0 and _glance_leakage_tenants > 0:
+        _glance_parts.append(
+            f" Across the entire portfolio, {_glance_leakage_tenants:,} residents are not paying pet "
+            f"fees today -- a combined ~${_glance_leakage_mo:,.0f}/mo opportunity (confirmed missing "
+            f"rent + suspected undisclosed pets)."
+        )
+
+    narrative("".join(_glance_parts))
+
+    # ── RealPage current-state disclosure ──
+    # Keeps the story straight when the selection includes RealPage
+    # properties: they contribute current revenue and the opportunity
+    # numbers (missing + suspected), but no before/after lift, because the
+    # RealPage API only exposes today's snapshot (ledger access pending).
+    if realpage_prop_count and realpage_prop_count > 0:
+        pdf.ln(1)
+        _rp_note_y = pdf.get_y()
+        pdf.set_fill_color(249, 244, 230)  # Dog Bone White accent
+        pdf.set_draw_color(226, 171, 88)   # golden accent bar
+        pdf.rect(PAGE_L, _rp_note_y, PAGE_R - PAGE_L, 11, style='F')
+        pdf.rect(PAGE_L, _rp_note_y, 1.2, 11, style='F')
+        pdf.set_line_width(0.8)
+        pdf.line(PAGE_L, _rp_note_y, PAGE_L, _rp_note_y + 11)
+        pdf.set_line_width(0.2)
+        pdf.set_xy(PAGE_L + 3, _rp_note_y + 1.5)
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 4, _pdf_safe('Data note - RealPage properties'), ln=True)
+        pdf.set_x(PAGE_L + 3)
+        pdf.set_font('Helvetica', '', 7.5)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(PAGE_R - PAGE_L - 6, 3.2, _pdf_safe(
+            f"{_n_props(realpage_prop_count)} in this report run{'s' if realpage_prop_count == 1 else ''} "
+            f"on RealPage, which provides a current-state snapshot only. RealPage data is "
+            f"included at today's collected revenue and in the uncollected/suspected "
+            f"opportunity figures, and is excluded from the before/after lift analysis."
+        ))
+        pdf.ln(2)
+
+    pdf.ln(1)
+
+    # ── KPI cards: 3 summary cards ──
+    _glance_row1 = []
+    if _has_comparable and _headline_units > 0:
+        _glance_row1.append({
+            "value": f"{_headline_units:,}",
+            "label": "Comparable Units",
+            "sub": f"{comparable_count} properties with pre & post data",
+            "color": dark_blue,
+        })
+    elif total_units and total_units > 0:
+        _glance_row1.append({
+            "value": f"{total_units:,}",
+            "label": "Live Units",
+            "sub": f"Across {_n_props(n_props_with_data)}",
+            "color": dark_blue,
+        })
+    else:
+        _glance_row1.append({
+            "value": f"{n_props_with_data}",
+            "label": "Properties Analyzed",
+            "sub": f"of {n_props_total} total",
+            "color": dark_blue,
+        })
+
+    _glance_row1.append({
+        "value": f"${_headline_pre:,.0f}/mo" if _headline_pre > 0 else "--",
+        "label": "Pre-PS Revenue",
+        "sub": (
+            f"Avg baseline across {comparable_count} properties" if _has_comparable
+            else ("No pre-launch data" if _no_pre_data else None)
+        ),
+        "color": dark_blue if _headline_pre > 0 else (160, 160, 160),
+    })
+    if use_avg_lift and _comp_post_avg > 0:
+        _glance_row1.append({
+            "value": f"${_comp_post_avg:,.0f}/mo",
+            "label": "Post-PS Avg Revenue",
+            "sub": f"Avg across {comparable_count} properties, all post-launch months",
+            "color": dark_blue,
+        })
+    else:
+        _glance_row1.append({
+            "value": f"${_headline_current:,.0f}/mo" if _has_comparable else f"${current_monthly_rev:,.0f}/mo",
+            "label": "Current Revenue",
+            "sub": f"Same {comparable_count} properties, latest month" if _has_comparable else "Most recently completed month",
+            "color": dark_blue,
+        })
+    draw_card_row(_glance_row1)
+    pdf.ln(1)
+
+    # ── KPI cards -- row 2: lift + per-unit + cap rate ──
+    _glance_row2 = []
+    if _no_pre_data:
+        _glance_row2.append({
+            "value": "--",
+            "label": "Monthly Lift",
+            "sub": "No pre-launch baseline",
+            "color": (160, 160, 160),
+        })
+        _glance_row2.append({
+            "value": "--",
+            "label": "Lift per Unit",
+            "sub": "No pre-launch baseline",
+            "color": (160, 160, 160),
+        })
+    elif _active_lift != 0:
+        _lift_sign = "+" if _active_lift > 0 else ""
+        _lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+        _lift_sub = f"${_comp_post_avg:,.0f} avg - ${_headline_pre:,.0f} pre" if use_avg_lift else f"${_headline_current:,.0f} - ${_headline_pre:,.0f} ({_simple_pct:+.1f}%)"
+        _glance_row2.append({
+            "value": f"{_lift_sign}${_active_lift:,.0f}/mo",
+            "label": _lift_label,
+            "sub": _lift_sub,
+            "color": _teal_blue if _active_lift > 0 else orange,
+        })
+        if _headline_units and _headline_units > 0 and _lift_per_unit != 0:
+            _lpu_sign = "+" if _lift_per_unit > 0 else ""
+            _glance_row2.append({
+                "value": f"{_lpu_sign}${_lift_per_unit:,.2f}/unit/mo",
+                "label": "Lift per Unit",
+                "sub": f"${_active_lift:,.0f} / {_headline_units:,} units",
+                "color": _teal_blue if _lift_per_unit > 0 else orange,
+            })
+    elif total_units and total_units > 0 and _rev_per_unit > 0:
+        _glance_row2.append({
+            "value": f"${_rev_per_unit:,.2f}/unit/mo",
+            "label": "Revenue per Unit",
+            "sub": f"${current_monthly_rev:,.0f} / {total_units:,} units",
+            "color": _teal_blue,
+        })
+    if _asset_value_impact > 0:
+        _avi_str = _format_large_currency(_asset_value_impact)
+        _glance_row2.append({
+            "value": _avi_str,
+            "label": "Est. Asset Value Impact",
+            "sub": f"${_active_lift:,.0f}/mo x 12 / 5% cap rate",
+            "color": _teal_blue,
+        })
+
+    # Pad row 2 to 3 cards (but skip padding for no-pre-data case)
+    if not _no_pre_data:
+        while len(_glance_row2) < 3:
+            if _opp_recurring_mo > 0 and t2_tenants > 0:
+                _glance_row2.append({
+                    "value": f"${_opp_recurring_mo:,.0f}/mo",
+                    "label": "Revenue Left on Table",
+                    "sub": f"{t2_tenants:,} tenants not paying pet rent",
+                    "color": orange,
+                })
+            else:
+                _glance_row2.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+            break
+
+    # Only show Actuals row if we have pre-PS data to compare against
+    if _glance_row2 and not _no_pre_data:
+        pdf.ln(3)  # space for label pill
+        draw_card_row(_glance_row2, row_label="Actuals", row_label_color=_teal_blue)
+    elif _no_pre_data:
+        # Skip Actuals row entirely for no pre-PS data — the Opportunity row will show actionable data
+        pass
+
+    pdf.ln(1)
+
+    # ── KPI cards -- row 3: Pet Revenue Found (formerly Leakage) ──
+    # Found = confirmed missing rent + suspected undisclosed pets
+    _leakage_mo = _opp_recurring_mo + (su_current_mo or 0)
+    _leakage_tenants = (t2_tenants or 0) + (su_total_profiles or 0)
+    _units_for_per_unit = _headline_units if _headline_units and _headline_units > 0 else total_units
+    _leakage_per_unit = _leakage_mo / _units_for_per_unit if _units_for_per_unit and _units_for_per_unit > 0 and _leakage_mo > 0 else 0
+    _cumulative_lift_per_unit = _lift_per_unit + _leakage_per_unit  # actuals + found
+    _total_combined_mo = _active_lift + _leakage_mo  # actuals lift + found
+    _projected_annual_combined = _total_combined_mo * 12
+    _combined_asset_value = _projected_annual_combined / _cap_rate if _projected_annual_combined > 0 else 0
+
+    _leakage_annual = _leakage_mo * 12
+    _leakage_asset_value = _leakage_annual / _cap_rate if _leakage_annual > 0 else 0
+
+    if _leakage_mo > 0:
+        _glance_row3 = []
+        _glance_row3.append({
+            "value": f"${_leakage_mo:,.0f}/mo",
+            "label": "Pet Revenue Found",
+            "sub": f"{_leakage_tenants:,} residents not paying pet fees",
+            "color": orange,
+        })
+        if _units_for_per_unit and _units_for_per_unit > 0:
+            _glance_row3.append({
+                "value": f"${_leakage_per_unit:,.2f}/unit/mo",
+                "label": "Found per Unit",
+                "sub": f"${_leakage_mo:,.0f} / {_units_for_per_unit:,} units  |  Combined: ${_cumulative_lift_per_unit:,.2f}/unit/mo",
+                "color": orange,
+            })
+        _glance_row3.append({
+            "value": _format_large_currency(_leakage_asset_value),
+            "label": "Est. Value Impact (Found)",
+            "sub": f"${_leakage_mo:,.0f}/mo x 12 / 5% cap rate",
+            "color": orange,
+        })
+        # Pad to 3 cards
+        while len(_glance_row3) < 3:
+            _glance_row3.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+
+        pdf.ln(2)  # space for label
+        draw_card_row(_glance_row3, row_label="Opportunity", row_label_color=orange)
+        pdf.ln(1)
+
+        # Separator text
+        draw_separator_text("Total = Monthly Lift (Actuals) + Pet Revenue Found (Opportunity)")
+
+        # ── KPI cards -- row 4: Combined (Actuals + Found) ──
+        _glance_row4 = []
+        _glance_row4.append({
+            "value": f"${_total_combined_mo:,.0f}/mo",
+            "label": "Total Opportunity",
+            "sub": "Monthly Lift + Pet Revenue Found",
+            "color": green,
+            "actuals_val": _active_lift,
+            "found_val": _leakage_mo,
+        })
+        if _units_for_per_unit and _units_for_per_unit > 0:
+            _glance_row4.append({
+                "value": f"${_cumulative_lift_per_unit:,.2f}/unit/mo",
+                "label": "Combined Lift per Unit",
+                "sub": f"${_lift_per_unit:,.2f} actual + ${_leakage_per_unit:,.2f} found",
+                "color": green,
+            })
+        _glance_row4.append({
+            "value": _format_large_currency(_combined_asset_value),
+            "label": "Combined Est. Value Impact",
+            "sub": f"${_total_combined_mo:,.0f}/mo x 12 / 5% cap rate",
+            "color": green,
+        })
+        while len(_glance_row4) < 3:
+            _glance_row4.append({"value": "", "label": "", "sub": None, "color": dark_blue})
+
+        draw_card_row(_glance_row4, row_label="Total Opportunity", row_label_color=green, row_style="total")
+
+    elif _asset_value_impact > 0:
+        # No found revenue — show cap rate callout instead
+        pdf.ln(1)
+        callout_box(
+            f"Estimated Asset Value Impact: ${_asset_value_impact:,.0f} "
+            f"(${_active_lift:,.0f}/mo x 12 = ${_annual_lift:,.0f}/yr at 5% cap rate)"
+        )
+
+    # ── Portfolio extrapolation callout (if non-comparable properties exist) ──
+    # Portfolio-wide extrapolation ("how this scales") is OPT-IN: it only
+    # renders when the Total Portfolio Units optional input was filled in
+    # before fetching. No manual value -> no projection anywhere in the PDF.
+    _effective_portfolio_units = total_portfolio_units if total_portfolio_units and total_portfolio_units > 0 else 0
+    if _effective_portfolio_units > 0 and _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
+        pdf.ln(2)
+        # Use the combined per-unit (actuals lift + found) so the zinger reflects
+        # the same number we surface in the Total Opportunity row when possible.
+        _zinger_per_unit = _cumulative_lift_per_unit if (_leakage_mo > 0 and _cumulative_lift_per_unit > 0) else _lift_per_unit
+        _extrapolated_noncomp_lift = _zinger_per_unit * _noncomp_units
+        _total_portfolio_lift = (_active_lift + (_leakage_mo or 0)) + _extrapolated_noncomp_lift
+        _total_portfolio_lift_annual = _total_portfolio_lift * 12
+
+        # Prominent multi-line callout (matches callout_box visual style but
+        # supports wrapped narrative text + a colored total number).
+        _cb_x = PAGE_L + 4
+        _cb_w = USABLE_W - 8
+        _cb_start_y = pdf.get_y()
+        _cb_text = (
+            f"Applying the combined ${_zinger_per_unit:,.2f}/unit/mo across ALL "
+            f"{_effective_portfolio_units:,} units in {label}'s portfolio -- including "
+            f"{_noncomp_count} properties ({_noncomp_units:,} units) without pre-launch "
+            f"data -- the estimated total portfolio impact would be "
+            f"~${_total_portfolio_lift:,.0f}/mo (${_total_portfolio_lift_annual:,.0f}/yr)."
+        )
+        # Measure required height
+        pdf.set_font('Helvetica', 'B', 9.5)
+        _cb_line_h = 5
+        _cb_pad = 3
+        _cb_lines = pdf.multi_cell(_cb_w - 8, _cb_line_h, _cb_text, split_only=True) if hasattr(pdf, 'multi_cell') else [_cb_text]
+        try:
+            _cb_line_count = max(1, len(_cb_lines))
+        except Exception:
+            _cb_line_count = 3
+        _cb_h = _cb_line_count * _cb_line_h + _cb_pad * 2
+        # Background + left accent bar
+        pdf.set_fill_color(245, 250, 240)
+        pdf.set_draw_color(*green)
+        pdf.rect(_cb_x, _cb_start_y, _cb_w, _cb_h, 'F')
+        pdf.set_fill_color(*green)
+        pdf.rect(_cb_x, _cb_start_y, 2.5, _cb_h, 'F')
+        # Text body in green-tinted dark color
+        pdf.set_xy(_cb_x + 6, _cb_start_y + _cb_pad)
+        pdf.set_text_color(*green)
+        pdf.set_font('Helvetica', 'B', 9.5)
+        pdf.multi_cell(_cb_w - 8, _cb_line_h, _cb_text)
+        pdf.set_y(_cb_start_y + _cb_h + 2)
+        pdf.ln(1)
+
+    # ═══════════════════════════════════════════════════════════
+    #  HOW THIS SCALES — PORTFOLIO EXTRAPOLATION (same page)
+    # ═══════════════════════════════════════════════════════════
+    # Use combined lift per unit (actuals + found) for scaling
+    # Skip "How This Scales" for single-property PDFs -- only show for parent company reports
+    # Opt-in: requires the manually-entered Total Portfolio Units (see above).
+    _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
+    _show_scaling = (n_props_total > 1 and _effective_portfolio_units > 0
+                     and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0)
+    if _show_scaling:
+        pdf.ln(2)
+        section_heading("How This Scales", green, min_space=30)
+
+        _proj_monthly = _scale_lift_per_unit * _effective_portfolio_units
+        _proj_annual = _proj_monthly * 12
+        _proj_asset_value = _proj_annual / _cap_rate
+
+        _lift_source = "combined lift + found" if _leakage_mo > 0 else "lift"
+        _scale_text = (
+            f"If {label} were to roll PetScreening across their full portfolio of "
+            f"~{_effective_portfolio_units:,} units, the ${_scale_lift_per_unit:,.2f}/unit/mo {_lift_source} "
+            f"would translate to approximately ${_proj_annual:,.0f}/yr in additional pet fee revenue. "
+            f"Capitalized at a 5% cap rate, that represents ~${_proj_asset_value:,.0f} in added asset value."
+        )
+        narrative(_scale_text)
+
+        pdf.ln(1)
+        draw_card_row([
+            {
+                "value": f"~{_effective_portfolio_units:,}",
+                "label": "Total Portfolio Units",
+                "sub": "Full portfolio rollout target",
+                "color": dark_blue,
+            },
+            {
+                "value": f"${_proj_annual:,.0f}/yr",
+                "label": "Projected Annual Lift",
+                "sub": f"${_scale_lift_per_unit:,.2f}/unit/mo x {_effective_portfolio_units:,} units x 12",
+                "color": green,
+            },
+            {
+                "value": _format_large_currency(_proj_asset_value),
+                "label": "Projected Asset Value Impact",
+                "sub": f"${_proj_annual:,.0f}/yr at 5% cap rate",
+                "color": green,
+            },
+        ])
+
+        show_work(
+            f"Per-unit {_lift_source}: ${_scale_lift_per_unit:,.2f}/unit/mo x {_effective_portfolio_units:,} units "
+            f"= ${_proj_monthly:,.0f}/mo x 12 = ${_proj_annual:,.0f}/yr / 0.05 = ${_proj_asset_value:,.0f}"
+        )
+
+    # Force new page for detailed sections
+    pdf.add_page()
+
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 1: VALUE CREATED
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Value Created", green)
+
+    # Use comparable or full portfolio for Value Created cards
+    # When avg lift toggled, show post avg instead of current
+    if use_avg_lift and _comp_post_avg > 0:
+        _vc_current = _comp_post_avg
+        _vc_current_label = "Post-PS Avg Pet Revenue"
+    else:
+        _vc_current = _headline_current if _has_comparable else current_monthly_rev
+        _vc_current_label = "Current Monthly Pet-Related Revenue"
+    _vc_props_label = f"{comparable_count} comparable properties" if _has_comparable else f"{n_props_with_data} properties"
+
+    # Choose lift based on methodology toggle (same as page 1)
+    if use_avg_lift:
+        _vc_lift = _adjusted_lift
+        _vc_lift_label = "Average Monthly Lift"
+        _vc_lift_sub = "Property-by-property average" if comparable_count > 0 and _vc_lift != 0 else None
+    else:
+        _vc_lift = _monthly_lift
+        _vc_lift_label = "Monthly Lift"
+        _vc_lift_sub = f"{_simple_pct:+.1f}% vs baseline" if _has_comparable and _vc_lift != 0 else None
+
+    _sign_vc = "+" if _vc_lift > 0 else ""
+    _vc_color = _teal_blue if _vc_lift >= 0 else orange  # teal for actuals, matches At a Glance
+
+    # Calculate asset value impact from chosen methodology
+    _vc_annual_lift = _vc_lift * 12
+    _vc_asset_value = _vc_annual_lift / _cap_rate if _vc_annual_lift > 0 else 0
+
+    draw_card_row([
+        {
+            "value": f"${_vc_current:,.0f}/mo",
+            "label": _vc_current_label,
+            "sub": f"Across {_vc_props_label}",
+            "color": dark_blue,
+        },
+        {
+            "value": f"{_sign_vc}${_vc_lift:,.0f}/mo" if _vc_lift != 0 else "--",
+            "label": _vc_lift_label,
+            "sub": _vc_lift_sub,
+            "color": _vc_color,
+        },
+        {
+            "value": _format_large_currency(_vc_asset_value) if _vc_asset_value > 0 else "--",
+            "label": "Est. Asset Value Impact",
+            "sub": f"${_vc_lift:,.0f}/mo x 12 / 5% cap" if _vc_asset_value > 0 else None,
+            "color": _teal_blue if _vc_asset_value > 0 else dark_blue,
+        },
+    ])
+
+    # Show your work
+    show_work(f"Current revenue: sum of pet fee charges across {_vc_props_label} for the latest month of data.")
+
+    if _vc_lift != 0 and (_has_comparable or _vc_current > 0):
+        if _vc_lift > 0:
+            narrative(
+                f"Across {_vc_props_label}, pet revenue is ${_vc_current:,.0f}/mo, "
+                f"representing a ${_vc_lift:,.0f}/mo lift from the pre-launch baseline. "
+                f"At a 5% cap rate, this represents ~${_vc_asset_value:,.0f} in added asset value."
+            )
+        else:
+            # Negative lift — acknowledge and pivot to opportunity
+            _neg_mo = abs(_vc_lift)
+            _pivot_parts = [
+                f"Pet fee revenue is currently ${_neg_mo:,.0f}/mo below the pre-launch baseline. "
+            ]
+            # Pivot to opportunity
+            if t2_tenants > 0 and _opp_recurring_mo > 0:
+                _pivot_parts.append(
+                    f"However, ${_opp_recurring_mo:,.0f}/mo in pet rent is going uncollected from "
+                    f"tenants who have already completed screening -- a billing correction that would "
+                    f"more than close this gap. "
+                )
+            if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
+                _base_rev_for_100 = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+                _additional_at_100 = total_projected - _base_rev_for_100
+                if _additional_at_100 > 0:
+                    _pivot_parts.append(
+                        f"Combined with closing the adoption gap from {t3_adoption:.1f}% to 100% "
+                        f"(+${_additional_at_100:,.0f}/mo), the revenue picture changes significantly."
+                    )
+            narrative("".join(_pivot_parts))
+    else:
+        narrative(
+            "Revenue lift data is not yet available. Once properties have sufficient "
+            "pre-launch and post-launch charge data, this section will show the incremental "
+            "value PetScreening has created."
+        )
+
+    # ── DATA TRANSPARENCY ──
+    # Friendly PMC label — covers Yardi/Entrata, plus the underscore'd 'real_page'
+    _pmc_label = {
+        "yardi": "Yardi",
+        "entrata": "Entrata",
+        "real_page": "RealPage",
+    }.get((pmc_system or "").lower(), (pmc_system.capitalize() if pmc_system else "PMS"))
+    _dt_lines = []
+
+    # Methodology note when using average lift
+    if use_avg_lift:
+        _dt_lines.append(
+            "This report uses Average Monthly Lift methodology. For portfolios with "
+            "seasonal fluctuation (student housing, vacation properties), comparing any "
+            "single month to pre-launch can be misleading. Instead, we compare each "
+            "property's post-launch average to its pre-launch baseline for a more "
+            "stable view of PetScreening's impact."
+        )
+
+    # PMC scope disclaimer
+    _dt_lines.append(
+        f"This report covers {_pmc_label} data only. If this portfolio uses "
+        f"multiple property management systems, properties on other platforms "
+        f"are not included in these numbers."
+    )
+
+    # Comparable vs non-comparable breakdown
+    if _has_comparable:
+        if use_avg_lift:
+            # When using avg lift, emphasize the post-avg increase
+            _active_lift_dt = _adjusted_lift if _adjusted_lift else 0
+            if _active_lift_dt > 0:
+                _dt_lines.append(
+                    f"Across {comparable_count} comparable properties, post-launch pet revenue averages "
+                    f"${_comp_post_avg:,.0f}/mo -- an estimated +${_active_lift_dt:,.0f}/mo increase "
+                    f"({(_active_lift_dt / pre_baseline * 100):.1f}%) compared to the pre-launch baseline of ${pre_baseline:,.0f}/mo."
+                )
+        elif _noncomp_count > 0:
+            _nc_detail = f"{_noncomp_count} additional properties"
+            if _noncomp_units > 0:
+                _nc_detail += f" ({_noncomp_units:,} units)"
+            _nc_detail += f" generate ${_noncomp_current_rev:,.0f}/mo in pet revenue but have no pre-launch data for comparison, so are excluded from the lift analysis."
+            _dt_lines.append(_nc_detail)
+            _dt_lines.append(
+                f"Total portfolio pet revenue across all {n_props_with_data} {_pmc_label} properties: "
+                f"${current_monthly_rev:,.0f}/mo."
+            )
+        else:
+            _dt_lines.append(
+                f"All {n_props_with_data} properties with charge data have pre-launch baselines."
+            )
+
+    if _dt_lines:
+        pdf.ln(1)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_text_color(*light_blue)
+        pdf.cell(0, 5, 'Data Transparency', ln=True)
+        pdf.ln(1)
+
+        pdf.set_font('Helvetica', '', 8.5)
+        pdf.set_text_color(*body_gray)
+        for _dt_line in _dt_lines:
+            pdf.multi_cell(USABLE_W, 4.5, _dt_line)
+            pdf.ln(1)
+        pdf.ln(1)
+
+    divider()
+
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 2: REVENUE OPPORTUNITY
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Revenue Opportunity", orange)
+
+    # ── Single row: 3 cards ──
+    draw_card_row([
+        {
+            "value": f"{t2_tenants:,}" if t2_tenants > 0 else "0",
+            "label": "Tenants Not Paying",
+            "sub": f"Across {_n_props(t2_props)}" if t2_tenants > 0 else "All tenants compliant",
+            "color": orange if t2_tenants > 0 else green,
+        },
+        {
+            "value": f"${_opp_recurring_mo:,.0f}" if _opp_recurring_mo > 0 else "$0",
+            "label": "Missing Monthly Pet Rent",
+            "sub": f"{t2_tenants:,} tenants x ${_opp_recurring_mo / t2_tenants:,.0f}/mo avg fee" if t2_tenants > 0 and _opp_recurring_mo > 0 else "Fully collected",
+            "color": orange if _opp_recurring_mo > 0 else green,
+        },
+        {
+            "value": f"${_opp_annual_impact:,.0f}/yr" if _opp_annual_impact > 0 else "$0",
+            "label": "Annual Revenue Impact",
+            "sub": f"${_opp_recurring_mo:,.0f}/mo x 12" + (f" + ${_opp_onetime_total:,.0f} one-time" if _opp_onetime_total > 0 else "") if _opp_annual_impact > 0 else "No revenue gap identified",
+            "color": orange if _opp_annual_impact > 0 else green,
+        },
+    ])
+
+    # Show your work
+    if t2_tenants > 0 and _opp_recurring_mo > 0:
+        _avg_fee_sw = _opp_recurring_mo / t2_tenants
+        show_work(f"{t2_tenants:,} tenants x ${_avg_fee_sw:,.0f}/mo avg fee = ${_opp_recurring_mo:,.0f}/mo uncollected")
+
+    if t2_tenants > 0:
+        _avg_fee_per_tenant = _opp_recurring_mo / t2_tenants if t2_tenants > 0 else 0
+        narrative(
+            f"{t2_tenants:,} tenants have completed PetScreening profiles but are not being "
+            f"charged pet rent. At an average pet fee of ${_avg_fee_per_tenant:,.0f}/mo per tenant "
+            f"({t2_tenants:,} x ${_avg_fee_per_tenant:,.0f} = ${_opp_recurring_mo:,.0f}/mo)"
+            + (f" plus ${_opp_onetime_total:,.0f} in uncollected one-time fees" if _opp_onetime_total > 0 else "")
+            + f" across {t2_props} properties. "
+            f"This is a billing correction, not a sales effort."
+        )
+        if _opp_annual_impact > 0:
+            narrative(
+                f"On an annual basis, that is ${_opp_annual_impact:,.0f} in revenue not being captured."
+            )
+            callout_box(
+                f"Unrealized Property Value: ${_opp_value_impact:,.0f}  (${_opp_annual_impact:,.0f}/yr at 5% cap rate)"
+            )
+        if su_total_profiles and su_total_profiles > 0:
+            if avg_pet_fee and avg_pet_fee > 0:
+                narrative(
+                    f"Additionally, {_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets "
+                    f"(abandoned screening, unresolved requests). Using the same ${avg_pet_fee:,.0f}/mo "
+                    f"avg fee, that represents ~${su_current_mo:,.0f}/mo in potential additional revenue."
+                )
+            else:
+                narrative(
+                    f"Additionally, {_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets "
+                    f"(abandoned screening, unresolved requests), representing an estimated "
+                    f"${su_current_mo:,.0f}/mo in potential additional revenue."
+                )
+    elif su_total_profiles and su_total_profiles > 0:
+        if avg_pet_fee and avg_pet_fee > 0:
+            narrative(
+                f"No confirmed tenants are missing pet rent charges. However, "
+                f"{_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets. Using the same "
+                f"${avg_pet_fee:,.0f}/mo avg fee, that represents ~${su_current_mo:,.0f}/mo in "
+                f"potential additional revenue."
+            )
+        else:
+            narrative(
+                f"No confirmed tenants are missing pet rent charges. However, "
+                f"{_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets, representing "
+                f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
+            )
+    else:
+        _opportunity_note = (
+            "All screened tenants are currently being charged pet rent -- no billing gaps identified."
+        )
+        if t3_adoption is not None and t3_adoption < 100 and total_projected and total_projected > 0:
+            _opp_base_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+            _additional_at_100 = total_projected - _opp_base_rev
+            if _additional_at_100 > 0:
+                _opportunity_note += (
+                    f" However, your portfolio is currently at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
+                    f"Closing that gap to 100% -- through consistent screening enforcement at move-in "
+                    f"and renewal -- would unlock an estimated ${_additional_at_100:,.0f}/mo in additional "
+                    f"pet fee revenue (${total_projected:,.0f}/mo projected at full adoption)."
+                )
+        narrative(_opportunity_note)
+
+    divider()
+
+    # ═══════════════════════════════════════════════════════════
+    #  SECTION 3: PORTFOLIO HEALTH
+    # ═══════════════════════════════════════════════════════════
+    section_heading("Portfolio Health", dark_blue)
+
+    _adopt_str = f"{t3_adoption:.1f}%" if t3_adoption is not None else "--"
+    _su_str = f"{su_total_profiles:,}" if su_total_profiles and su_total_profiles > 0 else "n/a"
+
+    draw_card_row([
+        {
+            "value": _adopt_str,
+            "label": f"Avg {adopt_type_label} Adoption",
+            "sub": f"Across {_n_props(n_props_with_data)}",
+            "color": green if t3_adoption is not None and t3_adoption >= 50 else orange,
+        },
+        {
+            "value": f"{n_with_launch}",
+            "label": "Properties with Launch Date",
+            "sub": f"of {n_props_total} total",
+            "color": dark_blue,
+        },
+        {
+            "value": _su_str,
+            "label": "Suspected Undisclosed",
+            "sub": f"~${su_current_mo:,.0f}/mo" if su_total_profiles and su_total_profiles > 0 else None,
+            "color": orange if su_total_profiles and su_total_profiles > 0 else dark_blue,
+        },
+    ])
+
+    if t3_adoption is not None:
+        _ph_narrative = (
+            f"Your portfolio is running at {t3_adoption:.1f}% {adopt_type_label.lower()} adoption. "
+            f"{n_with_launch} of {n_props_total} properties have an established PetScreening launch date, "
+            f"and {n_props_with_data} have sufficient charge data for analysis."
+        )
+        if total_projected and total_projected > 0:
+            _ph_base_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else (current_monthly_rev or 0)
+            _additional_at_100 = total_projected - _ph_base_rev
+            if _additional_at_100 > 0:
+                _ph_narrative += (
+                    f" At 100% {adopt_type_label.lower()} adoption, projected pet fee revenue would be "
+                    f"${total_projected:,.0f}/mo -- an additional ${_additional_at_100:,.0f}/mo opportunity."
+                )
+        narrative(_ph_narrative)
+    else:
+        narrative(
+            f"{n_with_launch} of {n_props_total} properties have an established PetScreening "
+            f"launch date. Adoption data will populate once screening activity is available."
+        )
+
+    # ── Suspected Undisclosed explainer (separate block with divider) ──
+    if su_total_profiles and su_total_profiles > 0:
+        pdf.set_draw_color(*card_border)
+        _sep_y = pdf.get_y()
+        pdf.line(PAGE_L, _sep_y, PAGE_R, _sep_y)
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'I', 6.5)
+        pdf.set_text_color(*light_gray)
+        pdf.multi_cell(USABLE_W, 3,
+            "What are Suspected Undisclosed Pets?  Tenants who started a PetScreening profile "
+            "but never completed it, have an unresolved assistance animal request, or declared "
+            "'no pet' after starting an assistance profile.  Not confirmed pet owners "
+            "-- directional signals for follow-up, not billing."
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    #  PROGRESS SINCE LAST REPORT (needs a prior snapshot)
+    # ═══════════════════════════════════════════════════════════
+    if prev_snapshot and current_snapshot:
+        try:
+            _good_c = (103, 120, 72)   # sage green
+            _bad_c = (207, 90, 63)     # rust orange
+            _ps_date = str(prev_snapshot_ts)[:10] if prev_snapshot_ts else "previous run"
+            _delta_specs = [
+                ("current_monthly_rev", "Current pet revenue", "${:,.0f}/mo", True),
+                ("monthly_lift", "Monthly lift", "${:,.0f}/mo", True),
+                ("missing_tenants", "Tenants missing pet rent", "{:,.0f}", False),
+                ("missing_monthly", "Uncollected revenue", "${:,.0f}/mo", False),
+                ("suspected_tenants", "Suspected undisclosed", "{:,.0f}", False),
+                ("avg_adoption", "Avg adoption", "{:.1f}%", True),
+            ]
+            _delta_rows = []
+            for _dk, _dl, _dfmt, _up_good in _delta_specs:
+                _nv, _ov = current_snapshot.get(_dk), prev_snapshot.get(_dk)
+                if _nv is None or _ov is None:
+                    continue
+                try:
+                    _nv, _ov = float(_nv), float(_ov)
+                except (TypeError, ValueError):
+                    continue
+                _delta_rows.append((_dl, _dfmt.format(_ov), _dfmt.format(_nv),
+                                    _nv - _ov, _dfmt, _up_good))
+            if _delta_rows:
+                section_heading('Progress Since Last Report', dark_blue)
+                narrative(f"Movement in the headline numbers since the report generated on {_ps_date}. "
+                          f"Green marks improvement.")
+                _pw = [58, 38, 38, 46]
+                pdf.set_fill_color(249, 244, 230)
+                pdf.set_draw_color(*card_border)
+                pdf.set_font('Helvetica', 'B', 8)
+                pdf.set_text_color(*dark_blue)
+                for _w, _h in zip(_pw, ("METRIC", "LAST REPORT", "NOW", "CHANGE")):
+                    pdf.cell(_w, 6, f" {_h}", border=1, fill=True)
+                pdf.ln()
+                pdf.set_font('Helvetica', '', 8)
+                for _i, (_dl, _olds, _news, _d, _dfmt, _up_good) in enumerate(_delta_rows):
+                    pdf.set_fill_color(255, 255, 255) if _i % 2 == 0 else pdf.set_fill_color(250, 250, 248)
+                    pdf.set_text_color(*body_gray)
+                    pdf.cell(_pw[0], 6, _pdf_safe(f" {_dl}"), border='LR', fill=True)
+                    pdf.cell(_pw[1], 6, f" {_olds}", border='LR', fill=True)
+                    pdf.set_text_color(*dark_blue)
+                    pdf.cell(_pw[2], 6, f" {_news}", border='LR', fill=True)
+                    _improved = (_d > 0) == _up_good and _d != 0
+                    pdf.set_text_color(*(_good_c if (_improved or _d == 0) else _bad_c))
+                    _chg = ("+" if _d >= 0 else "-") + _dfmt.format(abs(_d))
+                    if _d == 0:
+                        _chg = "no change"
+                    pdf.cell(_pw[3], 6, f" {_chg}", border='LR', fill=True)
+                    pdf.ln()
+                pdf.cell(sum(_pw), 0, '', border='T', ln=True)
+                pdf.ln(4)
+        except Exception as _prog_err:  # noqa: BLE001 — never break the report
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Progress section error: {str(_prog_err)[:80]}', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  PET RENT PRICING — what this portfolio charges (own data)
+    # ═══════════════════════════════════════════════════════════
+    if benchmarks and benchmarks.get("pricing"):
+        try:
+            section_heading('Pet Rent Pricing', dark_blue)
+            _bmp = benchmarks["pricing"]
+            _n_bp = _bmp["n_props"]
+            if _n_bp > 1:
+                draw_card_row([
+                    {"value": f"${_bmp['median']:,.0f}/mo", "label": "TYPICAL PET RENT",
+                     "sub": f"median across {_n_bp:,} properties"},
+                    {"value": f"${_bmp['min']:,.0f}-${_bmp['max']:,.0f}",
+                     "label": "FULL RANGE", "sub": "lowest to highest property"},
+                    {"value": f"${_bmp['p25']:,.0f}-${_bmp['p75']:,.0f}",
+                     "label": "MIDDLE 50%", "sub": "25th-75th percentile"},
+                ])
+                narrative(
+                    f"Across the {_n_bp:,} properties with recurring pet rent in this report, "
+                    f"monthly fees range from ${_bmp['min']:,.0f} to ${_bmp['max']:,.0f} "
+                    f"(median ${_bmp['median']:,.0f}/mo; the middle half charge "
+                    f"${_bmp['p25']:,.0f}-${_bmp['p75']:,.0f}/mo). A wide spread can be a "
+                    f"pricing opportunity: properties at the low end may support rates closer "
+                    f"to the portfolio median."
+                )
+            else:
+                draw_card_row([
+                    {"value": f"${_bmp['median']:,.0f}/mo", "label": "TYPICAL PET RENT",
+                     "sub": "recurring pet rent at this property"},
+                ])
+            pdf.set_font('Helvetica', 'I', 6.5)
+            pdf.set_text_color(*light_gray)
+            pdf.multi_cell(USABLE_W, 3, _pdf_safe(
+                "Basis: recurring pet-rent charges pulled live from your property management "
+                "system for this report (per-property typical fee, per-tenant medians)."
+            ))
+            pdf.ln(3)
+        except Exception as _bm_err:  # noqa: BLE001
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Pricing section error: {str(_bm_err)[:80]}', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  KEY METRICS TABLE (always starts on page 2)
+    # ═══════════════════════════════════════════════════════════
+    pdf.add_page()
+
+    pdf.set_font('Helvetica', 'B', 12)
+    pdf.set_text_color(*dark_blue)
+    pdf.cell(0, 8, 'Key Metrics', ln=True)
+    pdf.ln(2)
+
+    # Table header row
+    pdf.set_fill_color(249, 244, 230)  # dog-bone-white
+    pdf.set_draw_color(*card_border)
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_text_color(*dark_blue)
+    pdf.cell(100, 7, '  METRIC', border=1, fill=True)
+    pdf.cell(80, 7, '  VALUE', border=1, fill=True, ln=True)
+
+    # metrics: list of (label, value_str, color_override_or_None)
+    metrics = []
+    # Revenue metric label/value based on toggle
+    _km_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else current_monthly_rev
+    _km_rev_label = "Post-PS Avg Pet Revenue (comparable)" if use_avg_lift else "Current Monthly Pet-Related Revenue (total portfolio)"
+    # "--" instead of "$0/mo" when there is no pre-launch data — a zero
+    # implies an observed baseline that does not exist (e.g. RealPage).
+    metrics.append((
+        "Pre-PS Baseline",
+        f"${pre_baseline:,.0f}/mo" if comparable_count > 0 else "--",
+        None,
+    ))
+    metrics.append((_km_rev_label, f"${_km_rev:,.0f}/mo", None))
+    if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
+        # Only show the methodology being used — less noise, fewer questions
+        _active_lift_m = _adjusted_lift if use_avg_lift else _monthly_lift
+        _active_lift_label = "Average Monthly Lift" if use_avg_lift else "Monthly Lift"
+        _active_sign = "+" if _active_lift_m > 0 else ""
+        metrics.append((_active_lift_label, f"{_active_sign}${_active_lift_m:,.0f}/mo", lift_color(_active_lift_m)))
+        _annual_lift_m = _active_lift_m * 12
+        metrics.append(("Annualized Lift", f"${_annual_lift_m:,.0f}/yr", lift_color(_annual_lift_m)))
+        if _annual_lift_m > 0:
+            _avi_m = _annual_lift_m / 0.05
+            metrics.append(("Est. Asset Value Impact (5% Cap)", _format_large_currency(_avi_m), _teal_blue))
+    if t2_tenants > 0:
+        metrics.append(("Tenants Not Paying Pet Rent", f"{t2_tenants:,}", orange))
+        metrics.append(("Uncollected Revenue", f"${_opp_recurring_mo:,.0f}/mo", orange))
+    if su_total_profiles and su_total_profiles > 0:
+        metrics.append(("Suspected Undisclosed Pets", f"{su_total_profiles:,}", orange))
+        metrics.append(("Suspected Undisclosed Revenue", f"~${su_current_mo:,.0f}/mo", orange))
+    if t3_adoption is not None:
+        metrics.append((f"{adopt_type_label} Adoption", f"{t3_adoption:.1f}%", green if t3_adoption >= 50 else orange))
+    # Use methodology-appropriate revenue for Additional Opportunity at 100%
+    if total_projected and total_projected > 0:
+        _additional_at_100_km = total_projected - _km_rev
+        if _additional_at_100_km > 0:
+            metrics.append(("Additional Opportunity at 100%", f"+${_additional_at_100_km:,.0f}/mo", green))
+    if total_projected and total_projected > 0:
+        metrics.append(("Projected Revenue at 100% Adoption", f"${total_projected:,.0f}/mo", None))
+    # Use same units as At a Glance (comparable units when available)
+    _km_units = _comp_units if (_has_comparable and _comp_units > 0) else total_units
+    if _km_units and _km_units > 0:
+        metrics.append(("Units (in analysis)", f"{_km_units:,}", None))
+        # Combined lift per unit = actual lift + found, consistent with At a Glance row 4
+        if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
+            _km_lift_per_unit = _active_lift_m / _km_units
+            _km_found_mo = _opp_recurring_mo + (su_current_mo or 0)
+            _km_found_per_unit = _km_found_mo / _km_units if _km_found_mo > 0 else 0
+            _km_combined_lpu = _km_lift_per_unit + _km_found_per_unit
+            _km_combined_sign = "+" if _km_combined_lpu > 0 else ""
+            metrics.append(("Combined Lift per Unit", f"{_km_combined_sign}${_km_combined_lpu:,.2f}/unit/mo", combined_color(_km_combined_lpu)))
+            if _km_found_per_unit > 0:
+                _km_lpu_sign = "+" if _km_lift_per_unit > 0 else ""
+                metrics.append(("", f"  Actual: {_km_lpu_sign}${_km_lift_per_unit:,.2f}  |  Found: +${_km_found_per_unit:,.2f}", None))
+    # ── Launch date (for single property) ──
+    if n_props_total == 1 and comparable_data and len(comparable_data) > 0:
+        _single_prop_name = list(comparable_data.keys())[0]
+        _single_comp = comparable_data[_single_prop_name]
+        _n_post = _single_comp.get("n_post", 0)
+        _n_pre = _single_comp.get("n_pre", 0)
+        if _n_post > 0 and latest_month:
+            # Calculate launch date from n_post months before latest_month
+            from dateutil.relativedelta import relativedelta
+            _launch_date_calc = latest_month - relativedelta(months=_n_post - 1)
+            metrics.append(("PetScreening Launch Date", _launch_date_calc.strftime("%B %Y"), dark_blue))
+            metrics.append(("Months Since Launch", f"{_n_post}", None))
+            if _n_pre > 0:
+                metrics.append(("Pre-Launch Months (baseline)", f"{_n_pre}", None))
+    
+    # ── Analysis scope ──
+    if comparable_count > 0 and n_props_total > 1:
+        metrics.append(("Comparable Properties (in analysis)", f"{comparable_count} of {n_props_with_data}", None))
+    if n_props_total > 1:
+        metrics.append(("Properties with Launch Date", f"{n_with_launch} of {n_props_total}", None))
+        metrics.append(("Properties with Charge Data", f"{n_props_with_data} of {n_props_total}", None))
+
+    # ── Portfolio totals (context, not used in lift) ──
+    if total_units and total_units > 0:
+        metrics.append(("Total Portfolio Units", f"{total_units:,}", None))
+    metrics.append(("Total Properties in Portfolio", f"{n_props_total}", None))
+
+    pdf.set_font('Helvetica', '', 9)
+    for i, (label_m, value_m, val_color) in enumerate(metrics):
+        # Alternate row shading
+        if i % 2 == 0:
+            pdf.set_fill_color(255, 255, 255)
+        else:
+            pdf.set_fill_color(250, 250, 248)
+        pdf.set_text_color(*body_gray)
+        pdf.cell(100, 6, f'  {label_m}', border='LR', fill=True)
+        pdf.set_text_color(*(val_color if val_color else dark_blue))
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(80, 6, f'  {value_m}', border='LR', fill=True, ln=True)
+        pdf.set_font('Helvetica', '', 9)
+    # Close table bottom
+    pdf.cell(180, 0, '', border='T', ln=True)
+
+    # ── Property Managers (optional) ──
+    if include_pm and pm_rows and len(pm_rows) > 0:
+        pdf.ln(6)
+        divider()
+        pdf.set_font('Helvetica', 'B', 11)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 8, 'Property Managers', ln=True)
+        pdf.ln(2)
+
+        _pm_by_prop = defaultdict(set)
+        for r in pm_rows:
+            pname = r.get('PROPERTY_NAME', 'Unknown')
+            email = r.get('PM_EMAIL', '')
+            if email and email.strip():
+                short = pname.split(" - ", 1)[-1] if " - " in pname else pname
+                _pm_by_prop[short].add(email)
+
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_fill_color(240, 238, 232)
+        pdf.cell(90, 6, 'Property', border=1, fill=True)
+        pdf.cell(90, 6, 'Property Manager(s)', border=1, fill=True, ln=True)
+
+        pdf.set_font('Helvetica', '', 8)
+        pdf.set_text_color(*body_gray)
+        for pname in sorted(_pm_by_prop.keys()):
+            emails = sorted(_pm_by_prop[pname])
+            pdf.cell(90, 5, _pdf_safe(pname[:45]), border='LR')
+            pdf.cell(90, 5, ", ".join(emails)[:80], border='LR', ln=True)
+        # Close table bottom
+        pdf.cell(180, 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  PROPERTY-LEVEL IMPACT TABLE + CHART (for single-property PDFs)
+    # ═══════════════════════════════════════════════════════════
+    _doors_dict = property_doors if property_doors else {}
+    # Single property = requested 1 property (n_props_total == 1)
+    # Don't require monthly_by_prop to have exactly 1 entry - it might have 0 or different names
+    _is_single_property = (n_props_total == 1)
+    
+    if comparable_data and len(comparable_data) > 0:
+        pdf.add_page()
+        section_heading("Impact by Property", dark_blue)
+        _impact_method = "average monthly lift" if use_avg_lift else "most recent completed month vs pre-launch average"
+        narrative(
+            f"Each property's lift is calculated using {_impact_method}. "
+            f"Pre-launch baseline uses up to 6 months before launch date."
+        )
+
+        # Table header — streamlined columns
+        _col_widths = [48, 14, 26, 26, 26, 22, 18]  # total = 180
+        _rev_col_label = 'Post Avg' if use_avg_lift else 'Current'
+        _col_headers = ['Property', 'Units', 'Pre Avg', _rev_col_label, 'Lift/mo', 'Lift/Unit', '%']
+        pdf.set_fill_color(249, 244, 230)
+        pdf.set_draw_color(*card_border)
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_text_color(*dark_blue)
+        for ci, hdr in enumerate(_col_headers):
+            pdf.cell(_col_widths[ci], 6, f' {hdr}', border=1, fill=True)
+        pdf.ln()
+
+        # Sort by methodology-appropriate lift descending
+        if use_avg_lift:
+            _sorted_props = sorted(comparable_data.items(), key=lambda x: x[1].get("diff_monthly", 0), reverse=True)
+        else:
+            def _simple_lift_sort(item):
+                pname, pdata_s = item
+                _pre_s = pdata_s.get("pre_avg", 0)
+                if monthly_by_prop and latest_month and pname in monthly_by_prop:
+                    _cur_s = monthly_by_prop[pname].get(latest_month, 0)
+                else:
+                    _cur_s = pdata_s.get("post_recent_avg", pdata_s.get("post_monthly_avg", 0))
+                return _cur_s - _pre_s
+            _sorted_props = sorted(comparable_data.items(), key=_simple_lift_sort, reverse=True)
+        pdf.set_font('Helvetica', '', 7)
+        for ri, (prop_name, pdata) in enumerate(_sorted_props):
+            # Page break check
+            if pdf.get_y() + 5 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+                # Reprint header
+                pdf.set_fill_color(249, 244, 230)
+                pdf.set_font('Helvetica', 'B', 7)
+                pdf.set_text_color(*dark_blue)
+                for ci, hdr in enumerate(_col_headers):
+                    pdf.cell(_col_widths[ci], 6, f' {hdr}', border=1, fill=True)
+                pdf.ln()
+                pdf.set_font('Helvetica', '', 7)
+
+            # Alternate shading
+            if ri % 2 == 0:
+                pdf.set_fill_color(255, 255, 255)
+            else:
+                pdf.set_fill_color(250, 250, 248)
+
+            _pre = pdata.get("pre_avg", 0)
+            _post = pdata.get("post_recent_avg", pdata.get("post_monthly_avg", 0))
+            _adj = pdata.get("diff_monthly", 0)
+            _prop_units = _doors_dict.get(prop_name, 0)
+
+            # Get latest month revenue for this property (most recent completed month)
+            _current_mo_rev = 0
+            if monthly_by_prop and latest_month and prop_name in monthly_by_prop:
+                _current_mo_rev = monthly_by_prop[prop_name].get(latest_month, 0)
+            else:
+                _current_mo_rev = _post  # fallback to post avg
+
+            # Lift: simple = current month - pre avg; avg = property-by-property average
+            if use_avg_lift:
+                _prop_lift = _adj
+            else:
+                _prop_lift = _current_mo_rev - _pre
+            _lift_per_u = _prop_lift / _prop_units if _prop_units > 0 else 0
+
+            # Truncate property name
+            _short_name = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
+            _short_name = _pdf_safe(_short_name[:28])
+
+            pdf.set_text_color(*body_gray)
+            pdf.cell(_col_widths[0], 5, f' {_short_name}', border='LR', fill=True)
+
+            # Units column
+            pdf.set_text_color(*dark_blue)
+            _units_str = str(_prop_units) if _prop_units > 0 else "--"
+            pdf.cell(_col_widths[1], 5, f' {_units_str}', border='LR', fill=True)
+
+            # Show post avg or current month depending on toggle
+            _rev_display = _post if use_avg_lift else _current_mo_rev
+
+            pdf.cell(_col_widths[2], 5, f' ${_pre:,.0f}', border='LR', fill=True)
+            pdf.cell(_col_widths[3], 5, f' ${_rev_display:,.0f}', border='LR', fill=True)
+
+            # Color-code lift
+            pdf.set_text_color(*lift_color(_prop_lift))
+            _prop_lift_sign = "+" if _prop_lift > 0 else ""
+            pdf.cell(_col_widths[4], 5, f' {_prop_lift_sign}${_prop_lift:,.0f}', border='LR', fill=True)
+
+            # Lift per unit
+            pdf.set_text_color(*lift_color(_lift_per_u))
+            if _prop_units > 0:
+                _lpu_sign = "+" if _lift_per_u > 0 else ""
+                pdf.cell(_col_widths[5], 5, f' {_lpu_sign}${_lift_per_u:,.2f}', border='LR', fill=True)
+            else:
+                pdf.set_text_color(160, 160, 160)
+                pdf.cell(_col_widths[5], 5, ' --', border='LR', fill=True)
+
+            # Lift %
+            _lift_pct = ((_rev_display - _pre) / _pre * 100) if _pre > 0 else 0
+            pdf.set_text_color(*lift_color(_lift_pct))
+            _pct_sign = "+" if _lift_pct > 0 else ""
+            pdf.cell(_col_widths[6], 5, f' {_pct_sign}{_lift_pct:.0f}%', border='LR', fill=True)
+            pdf.ln()
+
+        # Close table
+        pdf.cell(sum(_col_widths), 0, '', border='T', ln=True)
+
+        # ── Excluded properties (no pre-launch data) ──
+        if _noncomp_count > 0 and monthly_by_prop and latest_month:
+            _comp_names = set(comparable_data.keys())
+            _excluded_props = []
+            for pname in sorted(property_doors.keys()) if property_doors else []:
+                if pname not in _comp_names and pname in monthly_by_prop:
+                    _ep_units = _doors_dict.get(pname, 0)
+                    _ep_current = monthly_by_prop[pname].get(latest_month, 0)
+                    if _ep_current > 0 or _ep_units > 0:
+                        _excluded_props.append((pname, _ep_units, _ep_current))
+
+            if _excluded_props:
+                pdf.ln(4)
+                pdf.set_font('Helvetica', 'B', 9)
+                pdf.set_text_color(*light_gray)
+                pdf.cell(0, 5, f'Properties Excluded from Lift Analysis ({len(_excluded_props)})', ln=True)
+                pdf.set_font('Helvetica', 'I', 7)
+                pdf.cell(0, 3.5, 'No pre-launch charge data available for comparison.', ln=True)
+                pdf.ln(2)
+
+                # Mini table: Property | Units | Current Revenue
+                _ex_widths = [80, 30, 70]  # total = 180
+                _ex_headers = ['Property', 'Units', 'Current Revenue']
+                pdf.set_fill_color(249, 244, 230)
+                pdf.set_draw_color(*card_border)
+                pdf.set_font('Helvetica', 'B', 7)
+                pdf.set_text_color(*dark_blue)
+                for ci, hdr in enumerate(_ex_headers):
+                    pdf.cell(_ex_widths[ci], 6, f' {hdr}', border=1, fill=True)
+                pdf.ln()
+
+                pdf.set_font('Helvetica', '', 7)
+                for ei, (ep_name, ep_units, ep_rev) in enumerate(_excluded_props):
+                    if pdf.get_y() + 5 > pdf.h - pdf.b_margin:
+                        pdf.add_page()
+                        pdf.set_fill_color(249, 244, 230)
+                        pdf.set_font('Helvetica', 'B', 7)
+                        pdf.set_text_color(*dark_blue)
+                        for ci, hdr in enumerate(_ex_headers):
+                            pdf.cell(_ex_widths[ci], 6, f' {hdr}', border=1, fill=True)
+                        pdf.ln()
+                        pdf.set_font('Helvetica', '', 7)
+
+                    if ei % 2 == 0:
+                        pdf.set_fill_color(255, 255, 255)
+                    else:
+                        pdf.set_fill_color(250, 250, 248)
+
+                    _short_ep = ep_name.split(" - ", 1)[-1] if " - " in ep_name else ep_name
+                    _short_ep = _pdf_safe(_short_ep[:45])
+                    pdf.set_text_color(*body_gray)
+                    pdf.cell(_ex_widths[0], 5, f' {_short_ep}', border='LR', fill=True)
+                    pdf.set_text_color(*dark_blue)
+                    pdf.cell(_ex_widths[1], 5, f' {ep_units:,}' if ep_units > 0 else ' --', border='LR', fill=True)
+                    pdf.cell(_ex_widths[2], 5, f' ${ep_rev:,.0f}/mo', border='LR', fill=True)
+                    pdf.ln()
+                pdf.cell(sum(_ex_widths), 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  MONTHLY REVENUE CHART (single-property PDFs only)
+    #  Matches Fee Collection chart: green post-launch, blue pre-launch,
+    #  red dashed launch line, golden baseline, purple adoption overlay
+    # ═══════════════════════════════════════════════════════════
+    # Render chart for single-property PDFs
+    if _is_single_property and monthly_by_prop and len(monthly_by_prop) > 0 and latest_month:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-GUI backend
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+            
+            # Get the first (or only) property's monthly data
+            _chart_prop_name = list(monthly_by_prop.keys())[0]
+            _chart_data = monthly_by_prop[_chart_prop_name]
+            
+            # Get all months with data, sorted (no cap - show full history)
+            _chart_months = sorted([m for m in _chart_data.keys()])
+            _chart_values = [_chart_data.get(m, 0) for m in _chart_months]
+            
+            if _chart_months and len(_chart_months) >= 2:
+                # Create figure - taller to fill page space
+                fig, ax1 = plt.subplots(figsize=(7, 3.5), dpi=150)
+                
+                # Determine launch date and bar colors
+                _launch_dt = None
+                _launch_month = None
+                _pre_avg = 0
+                _bar_colors = []
+                
+                if comparable_data and _chart_prop_name in comparable_data:
+                    _comp_entry = comparable_data[_chart_prop_name]
+                    _n_pre = _comp_entry.get("n_pre", 0)
+                    _n_post = _comp_entry.get("n_post", 0)
+                    _pre_avg = _comp_entry.get("pre_avg", 0)
+                    
+                    if _n_post > 0:
+                        # Calculate launch month position
+                        _total_chart_months = len(_chart_months)
+                        _launch_idx = max(0, _total_chart_months - _n_post)
+                        if _launch_idx < _total_chart_months:
+                            _launch_month = _chart_months[_launch_idx]
+                        
+                        for i, m in enumerate(_chart_months):
+                            if i < _launch_idx:
+                                _bar_colors.append('#7D9BC1')  # Blue for pre-launch
+                            else:
+                                _bar_colors.append('#677848')  # Green for post-launch
+                
+                # Default to all green if no launch data (all post-launch)
+                if not _bar_colors:
+                    _bar_colors = ['#677848'] * len(_chart_months)
+                
+                # Plot bars
+                bar_width = 20  # days
+                ax1.bar(_chart_months, _chart_values, color=_bar_colors, width=bar_width, 
+                        edgecolor='white', linewidth=0.3, zorder=2)
+                
+                # Add golden dotted baseline line (pre-launch average)
+                if _pre_avg > 0:
+                    ax1.axhline(y=_pre_avg, color='#E2AB58', linestyle=':', linewidth=1.5, 
+                                label=f'Pre-PS baseline ${_pre_avg:,.0f}/mo', zorder=3)
+                
+                # Add red dashed launch line
+                if _launch_month:
+                    # Position line just before the launch month
+                    _line_x = _launch_month - timedelta(days=15)
+                    ax1.axvline(x=_line_x, color='#CF5A3F', linestyle='--', linewidth=2, 
+                                label='PS Launch', zorder=4)
+                
+                # Style primary axis (revenue)
+                ax1.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                ax1.spines['top'].set_visible(False)
+                ax1.spines['right'].set_visible(False)
+                ax1.spines['left'].set_color('#CCCCCC')
+                ax1.spines['bottom'].set_color('#CCCCCC')
+                ax1.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                ax1.set_ylabel('Monthly Revenue', fontsize=9, color='#4F5155')
+                plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                
+                # Secondary y-axis for adoption % would go here if compliance_data is passed
+                # For now, keep chart clean without adoption overlay
+                
+                # Add legend
+                _legend_handles = []
+                _legend_labels = []
+                
+                from matplotlib.patches import Patch
+                from matplotlib.lines import Line2D
+                
+                _legend_handles.append(Patch(facecolor='#677848', edgecolor='white'))
+                _legend_labels.append('Post-Launch')
+                
+                if any(c == '#7D9BC1' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#7D9BC1', edgecolor='white'))
+                    _legend_labels.append('Pre-Launch')
+                
+                if _launch_month:
+                    _legend_handles.append(Line2D([0], [0], color='#CF5A3F', linestyle='--', linewidth=2))
+                    _legend_labels.append('PS Launch')
+                
+                if _pre_avg > 0:
+                    _legend_handles.append(Line2D([0], [0], color='#E2AB58', linestyle=':', linewidth=1.5))
+                    _legend_labels.append(f'Pre-PS Baseline (${_pre_avg:,.0f}/mo)')
+                
+                if _legend_handles:
+                    ax1.legend(_legend_handles, _legend_labels, loc='upper left', fontsize=7, 
+                               framealpha=0.9, facecolor='white')
+                
+                plt.tight_layout()
+                
+                # Save to bytes
+                _chart_buf = io.BytesIO()
+                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _chart_buf.seek(0)
+                plt.close(fig)
+                
+                # Check if we need a new page or can fit on current page
+                if pdf.get_y() + 75 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                else:
+                    pdf.ln(10)  # More space between table and chart
+                
+                # Embed image (no title, just the chart)
+                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(65)
+                
+        except Exception as _chart_err:
+            # Log error for debugging
+            import traceback
+            _tb = traceback.format_exc()
+            # Add error note to PDF
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Chart error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
+
+    # ═══════════════════════════════════════════════════════════
+    #  PORTFOLIO BEFORE/AFTER CHART (parent-company PDFs)
+    #  Aggregated pet fee revenue across the comparable properties —
+    #  the same set behind the lift KPIs — with the PS rollout window
+    #  and the combined pre-PS baseline. Blue = before first launch,
+    #  sage = during rollout, green = all comparable properties live.
+    # ═══════════════════════════════════════════════════════════
+    elif monthly_by_prop and len(monthly_by_prop) > 1 and latest_month:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+            from matplotlib.patches import Patch
+            from matplotlib.lines import Line2D
+
+            _comp_names = [p for p in (comparable_data or {}) if p in monthly_by_prop]
+            _scope_names = _comp_names if _comp_names else list(monthly_by_prop.keys())
+            _port_monthly = {}
+            for _pn in _scope_names:
+                for _m, _v in monthly_by_prop[_pn].items():
+                    _port_monthly[_m] = _port_monthly.get(_m, 0) + _v
+            _chart_months = sorted(_port_monthly.keys())
+            _chart_values = [_port_monthly[m] for m in _chart_months]
+
+            if len(_chart_months) >= 2:
+                _launches = sorted(
+                    comparable_data[_pn]["launch_month"] for _pn in _comp_names
+                    if comparable_data[_pn].get("launch_month")
+                )
+                _rollout_start = _launches[0] if _launches else None
+                _rollout_end = _launches[-1] if _launches else None
+                _pre_avg_total = sum(
+                    comparable_data[_pn].get("pre_avg", 0) for _pn in _comp_names
+                ) if _comp_names else 0
+
+                _bar_colors = []
+                for _m in _chart_months:
+                    if _rollout_start and _m < _rollout_start:
+                        _bar_colors.append('#7D9BC1')   # before any PS launch
+                    elif _rollout_end and _m < _rollout_end:
+                        _bar_colors.append('#A9B79A')   # rollout in progress
+                    else:
+                        _bar_colors.append('#677848')   # all comparable live
+
+                fig, ax1 = plt.subplots(figsize=(7, 3.5), dpi=150)
+                ax1.bar(_chart_months, _chart_values, color=_bar_colors, width=20,
+                        edgecolor='white', linewidth=0.3, zorder=2)
+                if _pre_avg_total > 0:
+                    ax1.axhline(y=_pre_avg_total, color='#E2AB58', linestyle=':',
+                                linewidth=1.5, zorder=3)
+                if _rollout_start:
+                    ax1.axvline(x=_rollout_start - timedelta(days=15), color='#CF5A3F',
+                                linestyle='--', linewidth=2, zorder=4)
+
+                ax1.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                ax1.spines['top'].set_visible(False)
+                ax1.spines['right'].set_visible(False)
+                ax1.spines['left'].set_color('#CCCCCC')
+                ax1.spines['bottom'].set_color('#CCCCCC')
+                ax1.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                ax1.set_ylabel('Monthly Pet Fee Revenue', fontsize=9, color='#4F5155')
+                _scope_label = (
+                    f'Comparable Properties ({len(_scope_names)})' if _comp_names
+                    else f'All Properties ({len(_scope_names)})'
+                )
+                ax1.set_title(f'Before & After PetScreening — {_scope_label}',
+                              fontsize=10, color='#1F2257', pad=10)
+                plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+                _legend_handles = [Patch(facecolor='#677848', edgecolor='white')]
+                _legend_labels = ['Post-rollout']
+                if any(c == '#A9B79A' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#A9B79A', edgecolor='white'))
+                    _legend_labels.append('PS rollout in progress')
+                if any(c == '#7D9BC1' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#7D9BC1', edgecolor='white'))
+                    _legend_labels.append('Pre-PetScreening')
+                if _rollout_start:
+                    _legend_handles.append(Line2D([0], [0], color='#CF5A3F', linestyle='--', linewidth=2))
+                    _legend_labels.append('First PS Launch')
+                if _pre_avg_total > 0:
+                    _legend_handles.append(Line2D([0], [0], color='#E2AB58', linestyle=':', linewidth=1.5))
+                    _legend_labels.append(f'Pre-PS Baseline (${_pre_avg_total:,.0f}/mo)')
+                ax1.legend(_legend_handles, _legend_labels, loc='upper left', fontsize=7,
+                           framealpha=0.9, facecolor='white')
+
+                plt.tight_layout()
+                _chart_buf = io.BytesIO()
+                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _chart_buf.seek(0)
+                plt.close(fig)
+
+                if pdf.get_y() + 75 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                else:
+                    pdf.ln(10)
+                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(65)
+        except Exception as _chart_err:
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Portfolio chart error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
+
+    # ═══════════════════════════════════════════════════════════
+    #  INDIVIDUAL PROPERTY CHARTS APPENDIX (optional)
+    #  The same before/after charts shown in the Fee Collection tab,
+    #  one per comparable property, sorted by monthly lift.
+    # ═══════════════════════════════════════════════════════════
+    if (include_property_charts and not _is_single_property
+            and monthly_by_prop and comparable_data):
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+
+            _MAX_PROP_CHARTS = 40
+            _appendix_props = sorted(
+                (p for p in comparable_data if p in monthly_by_prop),
+                key=lambda p: -comparable_data[p].get("diff_monthly", 0),
+            )[:_MAX_PROP_CHARTS]
+
+            if _appendix_props:
+                pdf.add_page()
+                pdf.set_font('Helvetica', 'B', 13)
+                pdf.set_text_color(*dark_blue)
+                pdf.cell(0, 8, _pdf_safe('Appendix: Property Fee Collection Trends'), ln=True)
+                pdf.set_font('Helvetica', '', 8)
+                pdf.set_text_color(*body_gray)
+                _cap_note = (
+                    f'Before/after pet fee revenue for the {len(_appendix_props)} '
+                    f'comparable properties, sorted by monthly lift.'
+                )
+                if len(comparable_data) > _MAX_PROP_CHARTS:
+                    _cap_note += f' (Top {_MAX_PROP_CHARTS} of {len(comparable_data)} shown.)'
+                pdf.cell(0, 5, _pdf_safe(_cap_note), ln=True)
+                pdf.ln(2)
+
+            for _ap_name in _appendix_props:
+                _ap = comparable_data[_ap_name]
+                _ap_data = monthly_by_prop.get(_ap_name, {})
+                _ap_months = sorted(_ap_data.keys())
+                if len(_ap_months) < 2:
+                    continue
+                _ap_values = [_ap_data.get(m, 0) for m in _ap_months]
+                _ap_launch = _ap.get("launch_month")
+                _ap_pre = _ap.get("pre_avg", 0)
+                _ap_lift = _ap.get("diff_monthly", 0)
+
+                _colors = [
+                    '#7D9BC1' if (_ap_launch and m < _ap_launch) else '#677848'
+                    for m in _ap_months
+                ]
+                fig, ax = plt.subplots(figsize=(7, 2.1), dpi=140)
+                ax.bar(_ap_months, _ap_values, color=_colors, width=20,
+                       edgecolor='white', linewidth=0.3, zorder=2)
+                if _ap_pre > 0:
+                    ax.axhline(y=_ap_pre, color='#E2AB58', linestyle=':', linewidth=1.2, zorder=3)
+                if _ap_launch:
+                    ax.axvline(x=_ap_launch - timedelta(days=15), color='#CF5A3F',
+                               linestyle='--', linewidth=1.5, zorder=4)
+                ax.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                for side in ('top', 'right'):
+                    ax.spines[side].set_visible(False)
+                for side in ('left', 'bottom'):
+                    ax.spines[side].set_color('#CCCCCC')
+                ax.tick_params(axis='both', colors='#4F5155', labelsize=7)
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, len(_ap_months) // 8)))
+                _sign = '+' if _ap_lift >= 0 else ''
+                ax.set_title(
+                    f'{_ap_name[:60]}  ({_sign}${_ap_lift:,.0f}/mo lift, '
+                    f'baseline ${_ap_pre:,.0f}/mo)',
+                    fontsize=8.5, color='#1F2257', loc='left', pad=6,
+                )
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                plt.tight_layout()
+
+                _buf = io.BytesIO()
+                fig.savefig(_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _buf.seek(0)
+                plt.close(fig)
+
+                if pdf.get_y() + 52 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                pdf.image(_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(50)
+        except Exception as _chart_err:
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Property charts appendix error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
+
+    # ═══════════════════════════════════════════════════════════
+    #  MISSING RENT APPENDIX — TENANT LIST
+    # ═══════════════════════════════════════════════════════════
+    _has_tenant_detail = False
+    if missing_rent_data:
+        for _v in missing_rent_data.values():
+            if _v.get("missing_tenants") and len(_v.get("missing_tenants", [])) > 0:
+                _has_tenant_detail = True
+                break
+
+    if _has_tenant_detail:
+        pdf.add_page()
+        section_heading("Appendix: Missing Pet Rent -- Tenant Detail", orange)
+        narrative(
+            "The following tenants have completed PetScreening profiles with active household "
+            "pets but are not being charged pet rent. This list is actionable -- hand it to "
+            "your property managers for billing corrections."
+        )
+
+        _app_col_w = [38, 14, 36, 48, 22, 22]  # total = 180
+        _app_headers = ['Property', 'Unit', 'Tenant Name', 'Email', 'Status', 'Avg Fee']
+        pdf.set_fill_color(249, 244, 230)
+        pdf.set_draw_color(*card_border)
+        pdf.set_font('Helvetica', 'B', 7)
+        pdf.set_text_color(*dark_blue)
+        for ci, hdr in enumerate(_app_headers):
+            pdf.cell(_app_col_w[ci], 6, f' {hdr}', border=1, fill=True)
+        pdf.ln()
+
+        pdf.set_font('Helvetica', '', 7)
+        _app_ri = 0
+        for prop_name, pdata in sorted(missing_rent_data.items()):
+            tenants = pdata.get("missing_tenants", [])
+            if not tenants:
+                continue
+            _avg_fee = pdata.get("avg_recurring", 0)
+            _short_prop = prop_name.split(" - ", 1)[-1] if " - " in prop_name else prop_name
+            _short_prop = _pdf_safe(_short_prop[:28])
+            for tenant in tenants:
+                # Page break check
+                if pdf.get_y() + 5 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                    pdf.set_fill_color(249, 244, 230)
+                    pdf.set_font('Helvetica', 'B', 7)
+                    pdf.set_text_color(*dark_blue)
+                    for ci, hdr in enumerate(_app_headers):
+                        pdf.cell(_app_col_w[ci], 6, f' {hdr}', border=1, fill=True)
+                    pdf.ln()
+                    pdf.set_font('Helvetica', '', 7)
+
+                if _app_ri % 2 == 0:
+                    pdf.set_fill_color(255, 255, 255)
+                else:
+                    pdf.set_fill_color(250, 250, 248)
+
+                _tname = str(tenant.get("name", "Unknown"))[:20]
+                _tunit = str(tenant.get("unit", ""))[:8]
+                _temail = str(tenant.get("email", ""))[:30]
+                _tstatus = str(tenant.get("profile_status", tenant.get("status", "Compliant")))[:12]
+
+                pdf.set_text_color(*body_gray)
+                pdf.cell(_app_col_w[0], 5, f' {_short_prop}', border='LR', fill=True)
+                pdf.cell(_app_col_w[1], 5, f' {_tunit}', border='LR', fill=True)
+                pdf.cell(_app_col_w[2], 5, f' {_tname}', border='LR', fill=True)
+                pdf.cell(_app_col_w[3], 5, f' {_temail}', border='LR', fill=True)
+                pdf.cell(_app_col_w[4], 5, f' {_tstatus}', border='LR', fill=True)
+                pdf.set_text_color(*orange)
+                pdf.cell(_app_col_w[5], 5, f' ${_avg_fee:,.0f}/mo', border='LR', fill=True)
+                pdf.ln()
+                _app_ri += 1
+
+        # Close table
+        pdf.cell(sum(_app_col_w), 0, '', border='T', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  DATA COVERAGE + METHODOLOGY
+    # ═══════════════════════════════════════════════════════════
+    pdf.add_page()
+
+    # Data Coverage Box
+    _coverage_pct = (n_props_with_data / n_props_total * 100) if n_props_total > 0 else 0
+    _cov_y = pdf.get_y()
+    pdf.set_fill_color(245, 248, 250)
+    pdf.set_draw_color(180, 190, 200)
+    pdf.rect(PAGE_L, _cov_y, USABLE_W, 26, 'DF')
+    pdf.set_font('Helvetica', 'B', 9)
+    pdf.set_text_color(*dark_blue)
+    pdf.set_xy(PAGE_L + 4, _cov_y + 2)
+    pdf.cell(0, 5, 'Data Coverage', ln=True)
+    pdf.set_font('Helvetica', '', 8)
+    pdf.set_text_color(*body_gray)
+    pdf.set_x(PAGE_L + 4)
+    pdf.cell(0, 4, f'Data covers {n_props_with_data} of {n_props_total} properties ({_coverage_pct:.0f}%)', ln=True)
+    pdf.set_x(PAGE_L + 4)
+    pdf.cell(0, 4, f'Data as of {today_str}', ln=True)
+    pdf.set_x(PAGE_L + 4)
+    _gen_ts_cov = datetime.now().strftime("%B %d, %Y at %I:%M %p") + " ET"
+    pdf.cell(0, 4, f'Report generated {_gen_ts_cov}', ln=True)
+    # List excluded properties if we can infer them
+    if n_props_with_data < n_props_total:
+        _excluded_count = n_props_total - n_props_with_data
+        pdf.set_x(PAGE_L + 4)
+        pdf.set_font('Helvetica', 'I', 7)
+        pdf.set_text_color(140, 140, 140)
+        pdf.cell(0, 4, f'{_excluded_count} properties excluded due to insufficient charge data.', ln=True)
+    pdf.set_y(_cov_y + 30)
+
+    section_heading("Methodology", dark_blue)
+
+    # Describe the methodology actually used in this report
+    if use_avg_lift:
+        narrative(
+            "Monthly Lift: Property-by-property comparison of post-launch average "
+            "vs pre-launch average (up to 6 months before launch). Accounts for "
+            "properties added or removed since launch."
+        )
+    else:
+        narrative(
+            "Monthly Lift: Most recently completed month's pet fee revenue minus "
+            "the pre-launch baseline (average of up to 6 months before launch). "
+            "The portfolio-level lift is the sum across all comparable properties."
+        )
+
+    # Uncollected / missing rent methodology
+    _uncollected_parts = [
+        "Pet Revenue Found: Tenants with active PetScreening profiles and household pets "
+        "who are not being charged pet rent, plus suspected undisclosed pets."
+    ]
+    if t2_tenants > 0 and _opp_recurring_mo > 0:
+        _avg_fee_meth = _opp_recurring_mo / t2_tenants
+        _uncollected_parts.append(
+            f" Recurring uncollected revenue is estimated at ${_opp_recurring_mo:,.0f}/mo: "
+            f"{t2_tenants:,} tenants x ${_avg_fee_meth:,.0f}/mo average fee. "
+            f"The average fee is derived from each property's actual charges to paying tenants "
+            f"with the same pet type."
+        )
+    if _opp_onetime_total > 0:
+        _uncollected_parts.append(
+            f" One-time fees (${_opp_onetime_total:,.0f} total) are charges classified as "
+            f"non-recurring in the selected charge codes. The amount per tenant is based on "
+            f"each property's average one-time charge to paying tenants."
+        )
+    narrative("".join(_uncollected_parts))
+
+    narrative(
+        "Asset Value Impact: Annual lift divided by a 5% capitalization rate."
+    )
+
+    # Charge codes used
+    if selected_charge_codes and len(selected_charge_codes) > 0:
+        _codes_list = ", ".join(selected_charge_codes)
+        narrative(
+            f"Charge Codes Used: {_codes_list}. Only properties with at least one "
+            f"matching charge are included in the analysis."
+        )
+    else:
+        narrative(
+            "Charge Types: Revenue figures are based on the pet-related charge codes selected "
+            "during data configuration. Only properties with at least one matching charge are "
+            "included in the analysis."
+        )
+
+    # Return bytes
+    buf = io.BytesIO()
+    pdf.output(buf)
+    return buf.getvalue()
+
+
+def generate_exec_summary_html(
+    label, rev_change_mo, rev_change_total, avg_adoption, adopt_type_label,
+    total_projected, total_additional, n_proj_props,
+    mr_total_profiles, mr_current_mo, comparable_count,
+    current_monthly_rev, n_props_total, n_with_launch,
+    quick_rows, pm_rows=None, email_subject="", email_body="",
+    su_total_profiles=0, su_current_mo=0,
+    use_avg_lift=False, display_rev=None,
+):
+    """Generate a self-contained HTML executive summary for VP-level sharing.
+
+    Includes KPIs, narrative, detailed metrics table, and an optional
+    'Email All Property Managers' button (mailto link).
+    """
+    today_str = datetime.now().strftime("%B %d, %Y")
+    _logo_white = _PS_LOGO_WHITE_URI
+    _logo_dark = _PS_LOGO_DARK_URI
+
+    # Use display_rev if provided (post avg when toggled), otherwise current
+    _html_rev = display_rev if display_rev is not None else current_monthly_rev
+    _rev_label = "Post-PS Avg Pet Revenue" if use_avg_lift else "Current Monthly Pet Revenue"
+    sign = "+" if rev_change_mo >= 0 else ""
+    color_rev = "#677848" if rev_change_mo >= 0 else "#CF5A3F"
+    _lift_label = "Average Monthly Lift" if use_avg_lift else "Pet Revenue Change"
+    adopt_str = f"{avg_adoption:.1f}%" if avg_adoption is not None else "—"
+    proj_str = f"${total_projected:,.0f}/mo" if total_projected > 0 else "—"
+    addl_str = f"+${total_additional:,.0f}/mo" if total_additional > 0 else ""
+    _combined_mr = mr_total_profiles + su_total_profiles
+    _combined_mr_mo = mr_current_mo + su_current_mo
+    mr_str = f"{_combined_mr:,}" if _combined_mr > 0 else "—"
+    mr_rev_str = f"${_combined_mr_mo:,.0f}/mo" if _combined_mr_mo > 0 else ""
+    _mr_detail = ""
+    if mr_total_profiles > 0 and su_total_profiles > 0:
+        _mr_detail = f" ({mr_total_profiles} confirmed + {su_total_profiles} suspected)"
+    elif su_total_profiles > 0:
+        _mr_detail = f" ({su_total_profiles} suspected)"
+
+    # ── Quick stats table rows ─────────────────────────────────
+    stats_html = ""
+    for row in quick_rows:
+        stats_html += f"""
+        <tr>
+            <td style="font-weight:500">{row['Metric']}</td>
+            <td style="font-weight:700;color:#1F2257">{row['Value']}</td>
+            <td style="color:#636569">{row.get('Period', '')}</td>
+        </tr>"""
+
+    # ── Story paragraphs ──────────────────────────────────────
+    story_parts = []
+    if comparable_count > 0:
+        story_parts.append(
+            f"Since launching PetScreening across <b>{comparable_count}</b> comparable properties, "
+            f"pet fee revenue {'increased' if rev_change_mo >= 0 else 'decreased'} by "
+            f"<b>{sign}${rev_change_mo:,.0f}/mo</b>."
+        )
+    if mr_total_profiles > 0 and mr_current_mo > 0:
+        story_parts.append(
+            f"<b>{mr_total_profiles}</b> tenants have completed their PetScreening screening but "
+            f"aren't being charged pet rent — that's an estimated <b>${mr_current_mo:,.0f}/mo</b> "
+            f"in uncollected revenue."
+        )
+    elif mr_total_profiles > 0:
+        story_parts.append(
+            f"<b>{mr_total_profiles}</b> tenants have completed their PetScreening screening but "
+            f"aren't being charged pet rent."
+        )
+    if su_total_profiles > 0 and su_current_mo > 0:
+        story_parts.append(
+            f"Additionally, <b>{su_total_profiles}</b> tenants show signals of having undisclosed pets "
+            f"(abandoned screening, unresolved requests) — an estimated <b>${su_current_mo:,.0f}/mo</b> "
+            f"in potential additional revenue."
+        )
+    elif su_total_profiles > 0:
+        story_parts.append(
+            f"Additionally, <b>{su_total_profiles}</b> tenants show signals of having undisclosed pets."
+        )
+    if total_projected > 0 and avg_adoption is not None:
+        _collecting_label = "Post-launch average" if use_avg_lift else "Currently collecting"
+        story_parts.append(
+            f"{_collecting_label} <b>${_html_rev:,.0f}/mo</b> in pet fees. "
+            f"At <b>100% {adopt_type_label.lower()} adoption</b> (currently {avg_adoption:.1f}%), "
+            f"projected total pet fee revenue could reach <b>${total_projected:,.0f}/mo</b> — "
+            f"an additional <b>${total_additional:,.0f}/mo</b> across <b>{n_proj_props}</b> properties with data."
+        )
+    story_html = "<br><br>".join(story_parts) if story_parts else f"Analyzing {n_props_total} properties for {label}."
+
+    # ── Email section ──────────────────────────────────────────
+    email_section_html = ""
+    if pm_rows and len(pm_rows) > 0:
+        unique_emails = sorted(set(
+            r['PM_EMAIL'] for r in pm_rows
+            if r.get('PM_EMAIL') and r['PM_EMAIL'].strip()
+        ))
+        n_pm_props = len(set(r.get('PROPERTY_ID') for r in pm_rows if r.get('PROPERTY_ID')))
+
+        if unique_emails:
+            bcc_str = ",".join(unique_emails)
+            mailto_url = (
+                f"mailto:?bcc={urllib.parse.quote(bcc_str)}"
+                f"&subject={urllib.parse.quote(email_subject)}"
+                f"&body={urllib.parse.quote(email_body)}"
+            )
+
+            # PM table
+            pm_by_prop = defaultdict(set)
+            for r in pm_rows:
+                pname = r.get('PROPERTY_NAME', 'Unknown')
+                email = r.get('PM_EMAIL', '')
+                if email and email.strip():
+                    short = pname.split(" - ", 1)[-1] if " - " in pname else pname
+                    pm_by_prop[short].add(email)
+
+            pm_rows_html = ""
+            for pname in sorted(pm_by_prop.keys()):
+                emails = sorted(pm_by_prop[pname])
+                pm_rows_html += f"""
+                <tr>
+                    <td>{pname}</td>
+                    <td>{", ".join(emails)}</td>
+                    <td>{len(emails)}</td>
+                </tr>"""
+
+            email_section_html = f"""
+            <div class="section" style="margin-top:36px">
+                <h2>Recommended Next Step</h2>
+                <p style="font-size:14px;margin-bottom:16px;color:var(--text-muted)">
+                    Remind property managers that all new leases and renewals require a completed PetScreening profile.
+                </p>
+                <div style="text-align:center;margin:24px 0">
+                    <a href="{mailto_url}" style="
+                        display:inline-block;background:var(--pack-blue);color:#FFFFFF;
+                        font-family:'Poppins',Arial,sans-serif;font-size:16px;font-weight:600;
+                        padding:16px 36px;border-radius:10px;text-decoration:none;
+                        letter-spacing:0.3px;box-shadow:0 2px 8px rgba(31,34,87,0.15)
+                    ">Email All Property Managers ({len(unique_emails)})</a>
+                    <p style="font-size:12px;color:var(--text-muted);margin:10px 0 0 0">
+                        Opens your email client with all {len(unique_emails)} PMs in BCC across {n_pm_props} properties. You still have to click Send.
+                    </p>
+                </div>
+                <details style="margin-top:20px;cursor:pointer">
+                    <summary style="font-size:13px;font-weight:600;color:var(--text-heading);padding:8px 0">
+                        View all {len(unique_emails)} property manager emails
+                    </summary>
+                    <table style="margin-top:12px;font-size:12px">
+                        <thead>
+                            <tr>
+                                <th>Property</th>
+                                <th>Property Managers</th>
+                                <th>#</th>
+                            </tr>
+                        </thead>
+                        <tbody>{pm_rows_html}</tbody>
+                    </table>
+                </details>
+            </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PetScreening Impact Summary — {label}</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:wght@700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --pack-blue: #1F2257;
+    --retriever-rust: #B17455;
+    --tabby-yellow: #E2AB58;
+    --sky-blue: #DAEBF5;
+    --succulent-green: #8DAEA7;
+    --catnip-green: #677848;
+    --dog-bone-white: #F9F4E6;
+    --whisker-beige: #D3CEBD;
+    --smokey-gray: #636569;
+    --great-dane-gray: #4F5155;
+    --chew-toy-orange: #DD7B45;
+    --fire-hydrant-red: #CF5A3F;
+    --bg: #FAFAF8;
+    --card-bg: #ffffff;
+    --text: #4F5155;
+    --text-heading: #1F2257;
+    --text-muted: #636569;
+    --border: #E8E6E0;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Poppins', Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+    max-width: 900px;
+    margin: 0 auto;
+  }}
+  .header {{
+    background: linear-gradient(135deg, #1F2257 0%, #2a2d6e 100%);
+    color: white;
+    padding: 36px 48px 28px;
+    border-radius: 0 0 16px 16px;
+  }}
+  .header-logo {{ height: 26px; opacity: 0.95; margin-bottom: 12px; }}
+  .header h1 {{
+    font-family: 'Lora', Georgia, serif;
+    font-size: 26px;
+    font-weight: 700;
+    color: #E2AB58;
+    letter-spacing: -0.5px;
+    margin-bottom: 4px;
+  }}
+  .header .subtitle {{
+    font-size: 14px;
+    color: rgba(255,255,255,0.7);
+  }}
+  .container {{ padding: 32px 48px 48px; }}
+  .section {{ margin-bottom: 32px; }}
+  .section h2 {{
+    font-family: 'Poppins', Arial, sans-serif;
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text-heading);
+    border-bottom: 2px solid var(--retriever-rust);
+    padding-bottom: 8px;
+    display: inline-block;
+  }}
+  .kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin-bottom: 24px;
+  }}
+  .kpi-card {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 20px;
+    text-align: center;
+    box-shadow: 0 1px 3px rgba(31,34,87,0.04);
+  }}
+  .kpi-label {{
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+    font-weight: 500;
+  }}
+  .kpi-value {{
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-heading);
+    letter-spacing: -0.5px;
+  }}
+  .kpi-caption {{
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 6px;
+  }}
+  .story {{
+    background: var(--dog-bone-white);
+    border-left: 4px solid var(--tabby-yellow);
+    border-radius: 0 10px 10px 0;
+    padding: 20px 24px;
+    margin: 0 0 28px 0;
+    font-size: 14px;
+    line-height: 1.8;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card-bg);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(31,34,87,0.04);
+    font-size: 13px;
+  }}
+  thead {{ background: var(--dog-bone-white); }}
+  th {{
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-heading);
+    border-bottom: 2px solid var(--border);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }}
+  td {{
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr:hover td {{ background: #FAFAF5; }}
+  details summary {{
+    list-style: none;
+  }}
+  details summary::-webkit-details-marker {{
+    display: none;
+  }}
+  details summary::before {{
+    content: "▸ ";
+    transition: transform 0.2s;
+  }}
+  details[open] summary::before {{
+    content: "▾ ";
+  }}
+  .footer {{
+    text-align: center;
+    padding: 24px;
+    font-size: 11px;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    margin-top: 48px;
+  }}
+  .footer-logo {{ height: 20px; margin-bottom: 8px; opacity: 0.7; }}
+  /* ── Mobile / Phone ── */
+  @media (max-width: 700px) {{
+    .kpi-grid {{ grid-template-columns: repeat(2, 1fr) !important; }}
+    .container {{ padding: 16px; }}
+    .header {{ padding: 24px 16px; }}
+    .header h1 {{ font-size: 20px; }}
+    .kpi-value {{ font-size: 22px; }}
+    .kpi-label {{ font-size: 10px; }}
+    .story {{ padding: 16px; font-size: 13px; }}
+    table {{ font-size: 11px; display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+    th, td {{ padding: 8px 10px; }}
+  }}
+  @media (max-width: 480px) {{
+    .kpi-grid {{ grid-template-columns: 1fr !important; }}
+    .header h1 {{ font-size: 18px; }}
+    .kpi-value {{ font-size: 20px; }}
+    .story {{ font-size: 12px; padding: 14px; }}
+    table {{ font-size: 10px; }}
+  }}
+  @media print {{
+    body {{ background: white; }}
+    .header {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+    .kpi-card {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; break-inside: avoid; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <img src="{_logo_white}" alt="PetScreening" class="header-logo"
+       onerror="this.style.display='none'">
+  <h1>Impact Summary</h1>
+  <div class="subtitle">{label} · {today_str}</div>
+</div>
+
+<div class="container">
+
+  <!-- Value Created -->
+  <h2 style="font-size:13px;font-weight:600;color:var(--catnip-green);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Value Created</h2>
+  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="kpi-card">
+      <div class="kpi-label">Current Monthly Pet-Related Revenue</div>
+      <div class="kpi-value">${current_monthly_rev:,.0f}<span style="font-size:16px">/mo</span></div>
+      <div class="kpi-caption">Total pet fee revenue (latest month)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Pet Revenue Change Since PS</div>
+      <div class="kpi-value" style="color:{color_rev}">{sign}${rev_change_mo:,.0f}<span style="font-size:16px">/mo</span></div>
+      <div class="kpi-caption">vs pre-launch baseline</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Projected at 100% Adoption</div>
+      <div class="kpi-value" style="color:var(--retriever-rust)">{proj_str}</div>
+      {f'<div class="kpi-caption">{addl_str} additional</div>' if addl_str else ''}
+    </div>
+  </div>
+
+  <!-- Revenue Opportunity -->
+  <h2 style="font-size:13px;font-weight:600;color:var(--chew-toy-orange);text-transform:uppercase;letter-spacing:1px;margin:8px 0 12px 0">Revenue Opportunity</h2>
+  <div class="kpi-grid" style="grid-template-columns:repeat(3,1fr)">
+    <div class="kpi-card">
+      <div class="kpi-label">Not Paying Pet Rent</div>
+      <div class="kpi-value" style="color:var(--chew-toy-orange)">{mr_str}</div>
+      {f'<div class="kpi-caption">~{mr_rev_str} uncollected{_mr_detail}</div>' if mr_rev_str else f'<div class="kpi-caption">{_mr_detail}</div>' if _mr_detail else ''}
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Avg {adopt_type_label} Adoption</div>
+      <div class="kpi-value">{adopt_str}</div>
+      <div class="kpi-caption">Across {n_proj_props} properties with data</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Suspected Undisclosed</div>
+      <div class="kpi-value" style="color:var(--chew-toy-orange)">{f'{su_total_profiles:,}' if su_total_profiles > 0 else 'n/a'}</div>
+      {f'<div class="kpi-caption">~${su_current_mo:,.0f}/mo potential revenue</div>' if su_total_profiles > 0 and su_current_mo > 0 else ''}
+    </div>
+  </div>
+
+  <!-- Story -->
+  <div class="story">
+    {story_html}
+  </div>
+
+  <!-- Detailed Metrics -->
+  <div class="section">
+    <details>
+      <summary style="font-size:14px;font-weight:600;color:var(--text-heading);padding:8px 0;cursor:pointer">
+        Detailed metrics breakdown
+      </summary>
+      <table style="margin-top:12px">
+        <thead>
+          <tr><th>Metric</th><th>Value</th><th>Period</th></tr>
+        </thead>
+        <tbody>{stats_html}</tbody>
+      </table>
+    </details>
+  </div>
+
+  {email_section_html}
+
+  <div class="footer">
+    <img src="{_logo_dark}" alt="PetScreening" class="footer-logo"
+         onerror="this.style.display='none'"><br>
+    Powered by PetScreening · Generated {today_str}
+  </div>
+
+</div>
+
+</body>
+</html>"""
+    return html
+
+
+def build_current_snapshot_chart(monthly_by_prop, months, title_prefix):
+    """Horizontal bar chart of latest observed monthly revenue by property."""
+    latest_month = _latest_observed_revenue_month(monthly_by_prop, months)
+    if latest_month is None:
+        return None
+    current = {}
+    for prop, month_data in monthly_by_prop.items():
+        val = month_data.get(latest_month, 0)
+        if val > 0:
+            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+            current[short] = val
+
+    sorted_items = sorted(current.items(), key=lambda x: x[1], reverse=True)
+    if not sorted_items:
+        return None
+
+    props = [x[0] for x in sorted_items]
+    vals = [x[1] for x in sorted_items]
+
+    fig = go.Figure(go.Bar(
+        x=vals,
+        y=props,
+        orientation='h',
+        marker_color='#677848',
+        text=[f"${v:,.0f}" for v in vals],
+        textposition='outside',
+        textfont=dict(size=12, color="#1F2257", family="Poppins, Arial, sans-serif"),
+    ))
+    # Dynamic left margin — enough for labels but not too wide for mobile
+    max_label_len = max((len(p) for p in props), default=10)
+    left_margin = min(200, max(80, max_label_len * 7))
+
+    fig.update_layout(
+        title=dict(
+            text=f"{title_prefix}: Current Monthly Fee Revenue by Property ({latest_month.strftime('%b %Y')})",
+            font=dict(size=14, color="#1F2257"),
+        ),
+        height=max(400, len(props) * 28),
+        autosize=True,
+        template="plotly_white",
+        xaxis_title="Monthly Revenue ($)",
+        yaxis=dict(
+            autorange="reversed",
+            tickfont=dict(size=12, color="#4F5155"),
+        ),
+        xaxis=dict(tickfont=dict(color="#4F5155")),
+        margin=dict(l=left_margin),
+        plot_bgcolor="white",
+        paper_bgcolor="#FAFAF8",
+        font=dict(family="Poppins, Arial, sans-serif", size=11, color="#4F5155"),
+    )
+    return fig
+
+
+# ─── Missing Pet Rent Report ─────────────────────────────────────────
+JUNK_EMAILS = (
+    "'none@none.com','noemail@noemail.com','none@nowhere.com','none@gmail.com',"
+    "'noemail@gmail.com','na@na.com','no@email.com','na@gmail.com',"
+    "'noemail@greystar.com','no@no.com','n/a@gmail.com','none@aol.com',"
+    "'none@embreydc.com','noemail@comcapp.com'"
+)
+
+
+def fetch_property_manager_emails(property_ids, ancestry_id=None, parent_company_name=None):
+    """
+    Fetch property manager emails from Snowflake.
+
+    Uses parent_company_ancestry_id or parent_company_name on user_enriched
+    (more reliable than pm.entity_id which may not match d_properties.property_id).
+    Falls back to pm.entity_id IN (property_ids) if neither is available.
+
+    Returns a list of dicts: [{PM_EMAIL, PROPERTY_ID, PROPERTY_NAME}]
+    """
+    if not property_ids and not ancestry_id and not parent_company_name:
+        return []
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # Resolve ancestry_id if not provided — much more reliable than pm.entity_id
+    if not ancestry_id and not parent_company_name and property_ids:
+        try:
+            _cur = conn.cursor()
+            _cur.execute(f"""
+                SELECT DISTINCT parent_company_ancestry_id
+                FROM PROD.common.d_properties
+                WHERE property_id IN ({", ".join(str(int(pid)) for pid in property_ids)})
+                  AND parent_company_ancestry_id IS NOT NULL
+            """)
+            _aids = [str(r[0]) for r in _cur.fetchall() if r[0]]
+            _cur.close()
+            if len(_aids) == 1:
+                ancestry_id = _aids[0]
+        except Exception:
+            pass
+
+    # Build the WHERE filter — prefer ancestry_id on user_enriched
+    if ancestry_id:
+        scope_filter = f"u.parent_company_ancestry_id = '{ancestry_id}'"
+    elif parent_company_name:
+        safe_name = parent_company_name.replace("'", "''")
+        scope_filter = f"u.parent_company_name ILIKE '%{safe_name}%'"
+    else:
+        props_str = ", ".join(str(int(pid)) for pid in property_ids)
+        scope_filter = f"pm.entity_id IN ({props_str})"
+
+    sql = f"""
+    SELECT DISTINCT
+        CASE
+            WHEN u.user_email = 'parkatvenetopm@stylresidential.com'
+            THEN 'parkatvenetoteam@stylresidential.com'
+            WHEN u.user_email = 'admin@endeavourhsv.com'
+            THEN 'contracts@endeavourhsv.com'
+            ELSE u.user_email
+        END AS PM_EMAIL,
+        pm.entity_id AS PROPERTY_ID,
+        p.property_name AS PROPERTY_NAME
+    FROM PROD.staging.stg_petscreening__property_manager_permissions_only pm
+    LEFT JOIN PROD.petscreening.petscreening__user_enriched u
+        ON u.user_id = pm.user_id
+    LEFT JOIN PROD.common.d_properties p
+        ON pm.entity_id = p.property_id
+    WHERE u.user_status = 'active'
+      AND pm.name IN (
+          'manager_admin_permission',
+          'manager_view_hipaa_permission',
+          'manager_reviewer_permission',
+          'manager_view_only_permission'
+      )
+      AND u.compliance_status != 'n/a|manual|individual_level'
+      AND u.user_role = 'property_manager'
+      AND {scope_filter}
+      AND u.user_email IS NOT NULL
+      AND TRIM(u.user_email) <> ''
+    ORDER BY PROPERTY_NAME, PM_EMAIL
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    except Exception as e:
+        cur.close()
+        st.error(f"Error fetching PM emails: {e}")
+        return []
+
+
+# ─── Robust tenant matching helpers ──────────────────────────────────
+def _unit_sources_sql(pmc_system):
+    """SQL literal list for du.unit_source / property_source_name scoping.
+
+    "all" (combined mode) expands to every supported source system so one
+    query covers a parent company that spans Yardi + Entrata + RealPage.
+    """
+    systems = ("yardi", "entrata", "real_page", "appfolio") if pmc_system == "all" else (pmc_system,)
+    return ", ".join(f"'{sys_}'" for sys_ in systems)
+
+
+def _recent_paying_charges(charges_df, days=90):
+    """Restrict charge rows to those still active recently.
+
+    The missing/suspected reports answer "who is not paying *now*", but the
+    fetched data can carry up to 24 months of history. Without this filter, a
+    unit whose PREVIOUS tenant paid pet rent marks the CURRENT tenant as
+    covered (via unit/lease-level expansion in _build_paying_sets), hiding a
+    real opportunity. Rows with no parseable end date are treated as ongoing
+    and kept — unless the tenant is explicitly Past/Former.
+
+    Only use this for current-state matching; revenue charts must keep the
+    full history.
+    """
+    if charges_df is None or charges_df.empty or 'charge_to_date' not in charges_df.columns:
+        return charges_df
+    cutoff = datetime.now() - timedelta(days=days)
+    to_dt = pd.to_datetime(charges_df['charge_to_date'], errors='coerce')
+    status = charges_df.get('tenant_status')
+    if status is not None:
+        is_past = status.astype(str).str.strip().str.lower().isin(
+            ('past', 'former', 'former applicant')
+        )
+    else:
+        is_past = pd.Series(False, index=charges_df.index)
+    keep = (to_dt >= cutoff) | (to_dt.isna() & ~is_past)
+    return charges_df[keep]
+
+
+def _classify_pet_charge_codes(pet_charges, pmc_system, user_overrides=None,
+                               system_by_pid=None):
+    """Classify each (property_name, charge_code) as "recurring" or "onetime".
+
+    RealPage/AppFolio: always recurring (rows are monthly scheduled-charge
+    snapshots — the one-month normalized span must not look one-time).
+    Entrata: use the explicit `frequency` field.
+    Yardi: infer from the median charge date span (> 60 days → recurring;
+    missing dates → recurring, since missing ≠ one-time).
+
+    In combined mode (pmc_system == "all"), pass ``system_by_pid`` so each
+    property is classified by its own source system's rules.
+    """
+    _has_frequency = 'frequency' in pet_charges.columns
+    code_class = {}
+    for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
+        _grp_system = pmc_system
+        if pmc_system == "all" and system_by_pid and 'property_id' in grp.columns:
+            _grp_system = system_by_pid.get(str(grp['property_id'].iloc[0]), "yardi")
+        if _grp_system in ("real_page", "appfolio"):
+            # RealPage rows are monthly scheduled-charge snapshots keyed by
+            # post_month. AppFolio getrecurringcharges rows are recurring by endpoint semantics.
+            # Neither should look one-time just because the normalized span
+            # is a single month.
+            code_class[(pname, code)] = "recurring"
+        elif _has_frequency:
+            freqs = grp['frequency'].dropna().str.strip().str.lower()
+            onetime_count = (freqs == 'one-time').sum()
+            monthly_count = (freqs.isin(['monthly', 'recurring'])).sum()
+            code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
+        else:
+            spans = []
+            for _, row in grp.iterrows():
+                f, t = row['_from'], row['_to']
+                if f and t and not pd.isna(f) and not pd.isna(t):
+                    spans.append((t - f).days)
+            median_span = float(np.median(spans)) if spans else None
+            if median_span is None:
+                code_class[(pname, code)] = "recurring"
+            else:
+                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+
+    if user_overrides:
+        for (pname, code) in list(code_class.keys()):
+            if code in user_overrides:
+                code_class[(pname, code)] = user_overrides[code]
+    return code_class
+
+
+def _estimate_property_fees(pet_charges, code_class):
+    """Estimate the typical pet fee per property from tenants actually paying.
+
+    Methodology: per tenant, take the median amount per charge code (their
+    typical rate for that code), sum the tenant's recurring codes into one
+    monthly pet bill, then take the MEDIAN across tenants. Medians resist
+    skew from outlier amounts and duplicate rows; per-tenant aggregation
+    stops tenants with more charge rows (e.g. RealPage one-row-per-month
+    snapshots) from dominating the estimate. One-time fees: median occurrence
+    per code, summed across codes (pet fee + pet deposit), median across
+    tenants.
+
+    Returns (recurring_by_prop, onetime_by_prop): {property_name: float}.
+    Requires a numeric `_amt` column on pet_charges.
+    """
+    recurring_by_prop = {}
+    onetime_by_prop = {}
+    for pname, pgrp in pet_charges.groupby('property_name'):
+        rec_by_tenant = []
+        ot_by_tenant = []
+        for _tc, tgrp in pgrp.groupby('tenant_code'):
+            rec_code_rates = []
+            ot_total = 0.0
+            for code, cgrp in tgrp.groupby('charge_code'):
+                amts = [a for a in cgrp['_amt'].tolist() if a > 0]
+                if not amts:
+                    continue
+                if code_class.get((pname, code), 'recurring') == 'recurring':
+                    rec_code_rates.append(float(np.median(amts)))
+                else:
+                    ot_total += float(np.median(amts))
+            if rec_code_rates:
+                rec_by_tenant.append(sum(rec_code_rates))
+            if ot_total > 0:
+                ot_by_tenant.append(ot_total)
+        if rec_by_tenant:
+            recurring_by_prop[pname] = float(np.median(rec_by_tenant))
+        if ot_by_tenant:
+            onetime_by_prop[pname] = float(np.median(ot_by_tenant))
+    return recurring_by_prop, onetime_by_prop
+
+
+def _dedup_missing_rows(missing_df, pname, tenant_info):
+    """One row per USER_EMAIL for the per-month dollar estimation.
+
+    A user can have several f_leases rows (renewals, roommate re-signs) that
+    all survive SELECT DISTINCT because tenant_code differs. Counting each row
+    would add the estimated fee multiple times per month for the same person.
+    Prefer the row whose tenant_code has live lease-date info so the active
+    window stays accurate.
+    """
+    if missing_df.empty or 'USER_EMAIL' not in missing_df.columns:
+        return missing_df
+    df = missing_df.copy()
+    df['_has_info'] = df['TENANT_CODE'].astype(str).map(
+        lambda tc: 0 if (pname, tc) in tenant_info else 1
+    )
+    df = df.sort_values('_has_info').drop_duplicates(subset=['USER_EMAIL'], keep='first')
+    return df.drop(columns=['_has_info'])
+
+
+def _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system):
+    """Filter PetScreening profiles for RealPage properties against the LIVE
+    resident roster from the most recent fetch (realpage_live_api.LAST_RESIDENTS).
+
+    The SQL EXISTS clause checks the staging resident table, which can lag
+    weeks; the live roster is today's truth. This makes the missing/suspected
+    CSVs reflect who actually lives there right now. Applies only to
+    properties present in the roster — cached fetches leave LAST_RESIDENTS
+    empty, in which case the SQL filter stands alone. Profiles already
+    flagged as paying are kept (a live scheduled charge implies current).
+    """
+    if pmc_system not in ('real_page', 'all') or profiles_df.empty:
+        return profiles_df
+    try:
+        from realpage_live_api import LAST_RESIDENTS
+    except Exception:
+        return profiles_df
+    if not LAST_RESIDENTS:
+        return profiles_df
+
+    _sys_by_pid = st.session_state.get("property_system_by_pid", {}) or {}
+    _drop_status = {'former', 'former applicant'}
+    _today_s = datetime.now().strftime("%Y-%m-%d")
+
+    live_ok = {}
+    for _pid, _residents in LAST_RESIDENTS.items():
+        _emails, _leases = set(), set()
+        for r in _residents:
+            if str(r.get("lease_status") or "").strip().lower() in _drop_status:
+                continue
+            _mo = str(r.get("move_out_date") or "")[:10]
+            if _mo and _mo < _today_s:
+                continue
+            _em = str(r.get("email") or "").strip().lower()
+            if _em:
+                _emails.add(_em)
+            _lid = str(r.get("lease_id") or "").strip()
+            if _lid:
+                _leases.add(_lid)
+        live_ok[str(_pid)] = (_emails, _leases)
+
+    def _keep(row):
+        if row.get('pet_rent_paid') == 1:
+            return True
+        pid = str(row.get('PROPERTY_ID', '')).strip()
+        if pmc_system == 'all' and _sys_by_pid.get(pid, '') != 'real_page':
+            return True
+        entry = live_ok.get(pid)
+        if entry is None:
+            return True  # no live roster for this property (cache hit)
+        _emails, _leases = entry
+        em = str(row.get('USER_EMAIL', '')).strip().lower()
+        tc = str(row.get('TENANT_CODE', '')).strip()
+        return bool((em and em in _emails) or (tc and tc in _leases))
+
+    return profiles_df[profiles_df.apply(_keep, axis=1)]
+
+
+def _build_paying_sets(charges_df, selected_codes):
+    """Build normalized paying-tenant sets for robust matching.
+
+    Unit/lease-level expansion: if *any* tenant on a unit has a matching pet
+    charge, **all** tenants on that unit are considered paying.  This handles
+    shared leases where the charge is tied to one customer but covers the
+    whole unit (especially important for Entrata, also relevant for Yardi).
+
+    Returns
+    -------
+    paying_tc_set : set of (property_id_str, tenant_code_upper_stripped)
+        Primary match by tenant code (case-insensitive, trimmed).
+    paying_email_set : set of (property_id_str, email_lower_stripped)
+        Fallback match by email when tenant code doesn't align
+        (e.g. lease renewal changed the code).
+    """
+    pet_rows = charges_df[charges_df['charge_code'].isin(selected_codes)]
+
+    # Primary: (property_id, tenant_code) — uppercased + stripped
+    tc_pairs = pet_rows[['property_id', 'tenant_code']].drop_duplicates()
+    paying_tc_set = set(
+        zip(
+            tc_pairs['property_id'].astype(str).str.strip(),
+            tc_pairs['tenant_code'].astype(str).str.strip().str.upper(),
+        )
+    )
+
+    # Fallback: (property_id, email) — lowercased + stripped
+    paying_email_set = set()
+    if 'email' in pet_rows.columns:
+        email_rows = pet_rows[['property_id', 'email']].drop_duplicates()
+        email_rows = email_rows[
+            email_rows['email'].astype(str).str.strip().ne('')
+            & email_rows['email'].astype(str).str.strip().str.lower().ne('nan')
+            & email_rows['email'].astype(str).str.strip().str.lower().ne('none')
+        ]
+        if not email_rows.empty:
+            paying_email_set = set(
+                zip(
+                    email_rows['property_id'].astype(str).str.strip(),
+                    email_rows['email'].astype(str).str.strip().str.lower(),
+                )
+            )
+
+    # ── Unit-level expansion ───────────────────────────────────────────
+    # If ANY tenant on a (property_id, unit_code) has a pet charge, ALL
+    # tenants on that same unit are paying.  This prevents roommates from
+    # being flagged as "missing pet rent" when the lease already has it.
+    if 'unit_code' in charges_df.columns and 'property_id' in charges_df.columns:
+        # Identify units that have at least one paying tenant
+        pet_unit_keys = set(
+            zip(
+                pet_rows['property_id'].astype(str).str.strip(),
+                pet_rows['unit_code'].astype(str).str.strip().str.upper(),
+            )
+        )
+        # Discard empty unit codes
+        pet_unit_keys = {(p, u) for p, u in pet_unit_keys if u and u not in ('', 'NAN', 'NONE')}
+
+        if pet_unit_keys:
+            # Find all tenants on those units (from the full charges_df)
+            _all = charges_df.copy()
+            _all['_pid'] = _all['property_id'].astype(str).str.strip()
+            _all['_uc'] = _all['unit_code'].astype(str).str.strip().str.upper()
+            _all['_unit_key'] = list(zip(_all['_pid'], _all['_uc']))
+            unit_matches = _all[_all['_unit_key'].isin(pet_unit_keys)]
+
+            # Expand paying sets with all tenants on those units
+            _tc_extra = unit_matches[['_pid', 'tenant_code']].drop_duplicates()
+            paying_tc_set |= set(
+                zip(
+                    _tc_extra['_pid'],
+                    _tc_extra['tenant_code'].astype(str).str.strip().str.upper(),
+                )
+            )
+            if 'email' in unit_matches.columns:
+                _em_extra = unit_matches[['_pid', 'email']].drop_duplicates()
+                _em_extra = _em_extra[
+                    _em_extra['email'].astype(str).str.strip().ne('')
+                    & _em_extra['email'].astype(str).str.strip().str.lower().ne('nan')
+                    & _em_extra['email'].astype(str).str.strip().str.lower().ne('none')
+                ]
+                if not _em_extra.empty:
+                    paying_email_set |= set(
+                        zip(
+                            _em_extra['_pid'],
+                            _em_extra['email'].astype(str).str.strip().str.lower(),
+                        )
+                    )
+
+    # ── Lease-level expansion (Entrata) ──────────────────────────────
+    # If ANY customer on the same lease_id has a pet charge, ALL customers
+    # on that lease are paying.  This handles co-tenants whose charge is
+    # recorded under one customer_id but covers the whole lease.
+    if 'lease_id' in charges_df.columns:
+        pet_lease_keys = set(
+            zip(
+                pet_rows['property_id'].astype(str).str.strip(),
+                pet_rows['lease_id'].astype(str).str.strip(),
+            )
+        )
+        pet_lease_keys = {(p, lid) for p, lid in pet_lease_keys if lid and lid not in ('', 'nan', 'None')}
+
+        if pet_lease_keys:
+            _all_l = charges_df.copy()
+            _all_l['_pid'] = _all_l['property_id'].astype(str).str.strip()
+            _all_l['_lid'] = _all_l['lease_id'].astype(str).str.strip()
+            _all_l['_lease_key'] = list(zip(_all_l['_pid'], _all_l['_lid']))
+            lease_matches = _all_l[_all_l['_lease_key'].isin(pet_lease_keys)]
+
+            _tc_extra2 = lease_matches[['_pid', 'tenant_code']].drop_duplicates()
+            paying_tc_set |= set(
+                zip(
+                    _tc_extra2['_pid'],
+                    _tc_extra2['tenant_code'].astype(str).str.strip().str.upper(),
+                )
+            )
+            if 'email' in lease_matches.columns:
+                _em_extra2 = lease_matches[['_pid', 'email']].drop_duplicates()
+                _em_extra2 = _em_extra2[
+                    _em_extra2['email'].astype(str).str.strip().ne('')
+                    & _em_extra2['email'].astype(str).str.strip().str.lower().ne('nan')
+                    & _em_extra2['email'].astype(str).str.strip().str.lower().ne('none')
+                ]
+                if not _em_extra2.empty:
+                    paying_email_set |= set(
+                        zip(
+                            _em_extra2['_pid'],
+                            _em_extra2['email'].astype(str).str.strip().str.lower(),
+                        )
+                    )
+
+    return paying_tc_set, paying_email_set
+
+
+def _is_paying(row, paying_tc_set, paying_email_set):
+    """Check if a profile row matches a paying tenant.
+
+    Matches on (property_id, tenant_code) first (case-insensitive),
+    then falls back to (property_id, user_email) if available.
+    """
+    pid = str(row.get('PROPERTY_ID', '')).strip()
+    tc = str(row.get('TENANT_CODE', '')).strip().upper()
+    if (pid, tc) in paying_tc_set:
+        return 1
+    # Email fallback
+    email = str(row.get('USER_EMAIL', '')).strip().lower()
+    if email and email not in ('', 'nan', 'none') and (pid, email) in paying_email_set:
+        return 1
+    return 0
+
+
+def _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set):
+    """Apply `_is_paying` per row, then propagate across all rows for the
+    same user at the same property.
+
+    A user may have multiple f_leases rows — some with a matching
+    tenant_code and some with NULL / mismatched codes.  If *any* lease
+    row for the same (PROPERTY_ID, USER_EMAIL) pair is paying, we mark
+    *all* of that user's rows as paying so they are correctly excluded
+    from the "missing pet rent" list.
+
+    Returns the DataFrame with a `pet_rent_paid` column (1 = paying).
+    """
+    profiles_df = profiles_df.copy()
+    profiles_df['pet_rent_paid'] = profiles_df.apply(
+        lambda r: _is_paying(r, paying_tc_set, paying_email_set),
+        axis=1,
+    )
+
+    # Propagate: if ANY row for (property_id, email) is paying → all are
+    if 'USER_EMAIL' in profiles_df.columns:
+        user_paying = (
+            profiles_df
+            .groupby(['PROPERTY_ID', 'USER_EMAIL'])['pet_rent_paid']
+            .transform('max')
+        )
+        profiles_df['pet_rent_paid'] = user_paying
+
+    return profiles_df
+
+
+def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_ids):
+    """
+    Generate the 'Missing Pet Rent' report using LIVE API rent roll data.
+
+    Uses the **same** profile identification as fetch_missing_pet_rent_by_property
+    so that counts match across all tabs (Charts, Summary, Report).
+
+    Flow:
+      1. Live API data → identify tenants paying selected charge codes
+      2. Snowflake → PetScreening profiles with household pets (+ tenant_code)
+         ** Same filters as Charts tab: compliant, household, active **
+      3. Python join → profile with pet + no selected charge = Profile_No_Rent
+      4. Snowflake → R_MONTHLY_EXECUTIVE_SUMMARY for detailed pet/profile columns
+      5. Python join → final report (per-pet granularity for download)
+    """
+    pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    # Only include properties with at least 1 charge matching selected codes.
+    # Without this, properties with other charges but no pet charges would
+    # have ALL their PetScreening profiles flagged as "missing," inflating
+    # the count with unknowns.
+    _pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)]
+    _charge_pids = set(_pet_charges['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return pd.DataFrame()
+
+    props_str = ", ".join(str(int(pid)) for pid in property_ids)
+
+    # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
+    # Current-state report → only recently-active charges count as "paying".
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
+
+    realpage_current_resident_clause = ""
+    if pmc_system in ('real_page', 'all'):
+        # RealPage resident/charge data is a current snapshot. Require the
+        # PetScreening profile's lease/email to still exist in the latest
+        # RealPage resident list; otherwise old f_leases rows make past tenants
+        # look like current missing pet-rent opportunities.
+        realpage_current_resident_clause = """
+      AND (du.unit_source <> 'real_page' OR EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      ))
+        """
+
+    # ── Step 2: Query Snowflake for PetScreening household profiles ──
+    # ** MUST match fetch_missing_pet_rent_by_property exactly: compliant + household + active **
+    sql_profiles = f"""
+    SELECT DISTINCT
+        du.property_id,
+        COALESCE(
+            l.lease_source_external_id:tenant_code::STRING,
+            l.lease_source_external_id:"customerId"::STRING,
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
+        ) AS tenant_code,
+        ue.user_email,
+        ue.user_first_name,
+        ue.user_last_name,
+        ue.compliance_status,
+        ue.user_pet_type,
+        ue.user_pet_status,
+        ue.user_profile_url,
+        p.property_name,
+        du.unit_address_1,
+        du.unit_address_2,
+        CONCAT_WS(' ', du.unit_address_1, du.unit_address_2) AS full_unit_address
+    FROM PROD.common.d_units du
+    JOIN PROD.common.d_properties p
+        ON du.property_id = p.property_id
+    JOIN PROD.petscreening.petscreening__user_enriched ue
+        ON ue.unit_id = du.unit_id
+    JOIN PROD.common.f_leases l
+        ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
+      AND du.property_id IN ({props_str})
+      AND ue.compliance_status = 'compliant'
+      AND ue.user_pet_type = 'household'
+      AND ue.user_pet_status = 'active'
+      AND ue.user_email IS NOT NULL
+      AND TRIM(ue.user_email) <> ''
+      AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
+    """
+    cur.execute(sql_profiles)
+    profiles_df = pd.DataFrame(cur.fetchall())
+
+    if profiles_df.empty:
+        return pd.DataFrame()
+
+    # ── Step 3: Match live charges to profiles ──
+    profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
+
+    # ── Step 3b: Entrata freshness filter — exclude profiles not in API data ──
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
+        api_emails_by_prop = (
+            all_charges_df
+            .assign(
+                _pid=lambda d: d['property_id'].astype(str).str.strip(),
+                _em=lambda d: d['email'].astype(str).str.strip().str.lower(),
+            )
+            .loc[lambda d: d['_em'].ne('') & d['_em'].ne('nan') & d['_em'].ne('none')]
+            .groupby('_pid')['_em']
+            .apply(set)
+            .to_dict()
+        )
+        def _in_api(row):
+            pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
+            em = str(row.get('USER_EMAIL', '')).strip().lower()
+            return em in api_emails_by_prop.get(pid, set())
+        profiles_df['_in_api'] = profiles_df.apply(_in_api, axis=1)
+        _n_before = len(profiles_df)
+        profiles_df = profiles_df[profiles_df['_in_api'] | (profiles_df['pet_rent_paid'] == 1)]
+        _n_excluded = _n_before - len(profiles_df)
+        if _n_excluded > 0:
+            st.info(f"Entrata freshness filter: excluded {_n_excluded:,} profiles not found in current API data")
+        profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
+
+    # Tenants with household pets who are NOT paying any selected charge
+    missing_profiles = profiles_df[profiles_df['pet_rent_paid'] == 0].copy()
+
+    if missing_profiles.empty:
+        return pd.DataFrame()
+
+    # Build lookup set: (email_lower, property_id_str) for these missing tenants
+    missing_lookup = set(
+        zip(
+            missing_profiles['USER_EMAIL'].str.lower().str.strip(),
+            missing_profiles['PROPERTY_ID'].astype(str),
+        )
+    )
+
+    # ── Step 4: Query R_MONTHLY_EXECUTIVE_SUMMARY for detailed pet-level output ──
+    # No extra restrictive filters — the profile identification in Step 2–3 is
+    # already canonical.  We only need pet_profile_type/status to get the right
+    # pet records from the exec summary.
+    sql_exec = f"""
+    SELECT DISTINCT
+        m.pet_profile_url,
+        m.pet_id,
+        m.pet_name,
+        m.breed,
+        m.species,
+        m.user_first_name,
+        m.user_last_name,
+        m.user_email,
+        m.unit_id,
+        m.lease_start_date,
+        m.lease_end_date,
+        m.resident_type,
+        m.unit_address_1,
+        m.unit_address_2,
+        CONCAT_WS(' ', m.unit_address_1, m.unit_address_2) AS full_unit_address,
+        m.property_name,
+        m.property_id,
+        m.pet_level_compliance_status,
+        m.user_level_compliance_status,
+        m.pet_profile_type,
+        m.pet_profile_status,
+        m.property_source_name
+    FROM PROD.REPORTING.R_MONTHLY_EXECUTIVE_SUMMARY AS m
+    WHERE m.property_id IN ({props_str})
+      AND m.pet_profile_type = 'household'
+      AND m.pet_profile_status = 'active'
+      AND m.property_source_name IN ({_unit_sources_sql(pmc_system)})
+    """
+    cur.execute(sql_exec)
+    exec_df = pd.DataFrame(cur.fetchall())
+
+    if exec_df.empty:
+        return pd.DataFrame()
+
+    # Deduplicate: a tenant can have multiple exec summary rows (current + past lease).
+    # Keep 'current' rows preferentially; if a tenant only has non-current rows, keep them
+    # (profile matching in Step 2-3 already validated they're active).
+    if 'RESIDENT_TYPE' in exec_df.columns:
+        _rt_lower = exec_df['RESIDENT_TYPE'].astype(str).str.strip().str.lower()
+        exec_df['_is_current'] = _rt_lower.str.contains('current', na=False)
+        # Sort so current rows come first, then drop duplicates per tenant+property+pet
+        exec_df = exec_df.sort_values('_is_current', ascending=False)
+        _dedup_cols = ['USER_EMAIL', 'PROPERTY_ID', 'PET_ID']
+        _dedup_cols = [c for c in _dedup_cols if c in exec_df.columns]
+        if _dedup_cols:
+            exec_df = exec_df.drop_duplicates(subset=_dedup_cols, keep='first')
+        exec_df = exec_df.drop(columns=['_is_current'], errors='ignore')
+
+    # ── Step 5: Keep only exec summary records whose (email, property) is missing ──
+    report_df = exec_df[
+        exec_df.apply(
+            lambda r: (
+                str(r['USER_EMAIL']).lower().strip(),
+                str(r['PROPERTY_ID']),
+            ) in missing_lookup,
+            axis=1,
+        )
+    ].copy()
+
+    # Add the status columns to match the original query output
+    report_df['has_petscreening_pets'] = 1
+    report_df['pet_rent_paid'] = 0
+    report_df['overall_status'] = 'Profile_No_Rent'
+
+    return report_df
+
+
+def fetch_missing_pet_rent_by_property(
+    all_charges_df, selected_codes, property_ids, launch_dates, months,
+):
+    """
+    Per-property, per-month estimated uncollected pet rent, accounting for:
+      • Each missing tenant's actual lease dates (move_in/lease_from → move_out/lease_to)
+      • Property launch date (only count months on or after launch)
+      • Recurring rent vs one-time deposit classification
+
+    Returns
+    -------
+    dict  – {property_name: {
+        "missing_count": int,               # total missing tenants
+        "monthly_missing": {month: float},   # estimated missing $ per month
+        "avg_recurring": float,              # avg recurring pet fee/mo
+        "avg_onetime": float,                # avg one-time deposit
+        "charge_type_label": str,            # "rent", "deposit", or "rent + deposit"
+        "missing_tenants": [list of dicts],
+    }}
+    """
+    pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    # Only include properties with at least 1 charge matching selected codes.
+    # Without this, properties with other charges but no pet charges would
+    # have ALL their PetScreening profiles flagged as "missing," inflating
+    # the count with unknowns.
+    pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)].copy()
+    _charge_pids = set(pet_charges['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return {}
+
+    props_str = ", ".join(str(int(pid)) for pid in property_ids)
+
+    # ── Step 1: From LIVE API data, classify charge codes and compute avg fees ──
+    pet_charges['_amt'] = pd.to_numeric(pet_charges['charge_amount'], errors='coerce').fillna(0)
+    pet_charges['_from'] = pet_charges['charge_from_date'].apply(parse_date)
+    pet_charges['_to'] = pet_charges['charge_to_date'].apply(parse_date)
+
+    # Paying sets from charges still active recently — this is a current-state
+    # report, so a previous tenant's old pet charge must not mark the unit's
+    # current tenant as covered.
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
+    properties_with_payers = set(pet_charges['property_id'].astype(str).unique())
+
+    try:
+        _user_overrides = st.session_state.get("charge_type_overrides", {})
+    except Exception:
+        _user_overrides = {}
+    code_class = _classify_pet_charge_codes(
+        pet_charges, pmc_system, _user_overrides,
+        system_by_pid=st.session_state.get("property_system_by_pid"),
+    )
+
+    # Typical fee per property (per-tenant medians — see _estimate_property_fees)
+    avg_recurring_by_prop, avg_onetime_by_prop = _estimate_property_fees(
+        pet_charges, code_class
+    )
+
+    # Build tenant_info lookup from ALL API data (every tenant, all charge codes)
+    # so we can get lease dates for any tenant, even those without pet charges.
+    tenant_info = {}  # {(property_name, tenant_code): {move_in, move_out, lease_from, lease_to, status}}
+    for _, row in all_charges_df.iterrows():
+        key = (str(row['property_name']), str(row['tenant_code']))
+        if key in tenant_info:
+            continue
+        tenant_info[key] = {
+            'move_in': parse_date(row.get('move_in', '')),
+            'move_out': parse_date(row.get('move_out', '')),
+            'lease_from': parse_date(row.get('lease_from', '')),
+            'lease_to': parse_date(row.get('lease_to', '')),
+            'status': str(row.get('tenant_status', '')).strip().lower(),
+        }
+
+    realpage_current_resident_clause = ""
+    if pmc_system in ('real_page', 'all'):
+        # RealPage is current-snapshot data. Do not let stale f_leases rows from
+        # previous residents inflate current missing pet-rent estimates.
+        realpage_current_resident_clause = """
+      AND (du.unit_source <> 'real_page' OR EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      ))
+        """
+
+    # ── Step 2: Snowflake → PetScreening household profiles with tenant_code ──
+    sql_profiles = f"""
+    SELECT DISTINCT
+        du.property_id,
+        p.property_name,
+        COALESCE(
+            l.lease_source_external_id:tenant_code::STRING,
+            l.lease_source_external_id:"customerId"::STRING,
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
+        ) AS tenant_code,
+        ue.user_first_name,
+        ue.user_last_name,
+        ue.user_email,
+        ue.user_profile_url,
+        du.unit_address_1,
+        du.unit_address_2,
+        CONCAT_WS(' ', du.unit_address_1, du.unit_address_2) AS full_unit_address
+    FROM PROD.common.d_units du
+    JOIN PROD.common.d_properties p
+        ON du.property_id = p.property_id
+    JOIN PROD.petscreening.petscreening__user_enriched ue
+        ON ue.unit_id = du.unit_id
+    JOIN PROD.common.f_leases l
+        ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
+      AND du.property_id IN ({props_str})
+      AND ue.compliance_status = 'compliant'
+      AND ue.user_pet_type = 'household'
+      AND ue.user_pet_status = 'active'
+      AND ue.user_email IS NOT NULL
+      AND TRIM(ue.user_email) <> ''
+      AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
+    """
+    cur.execute(sql_profiles)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
+
+    if profiles_df.empty:
+        return {}
+
+    # ── Step 3: Match to paying set (case-insensitive tc + email fallback) ──
+    # If a user has multiple leases, paying on ANY lease counts for all rows.
+    profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
+
+    # ── Step 3b: Entrata freshness filter ──
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
+        api_emails_by_prop = (
+            all_charges_df
+            .assign(
+                _pid=lambda d: d['property_id'].astype(str).str.strip(),
+                _em=lambda d: d['email'].astype(str).str.strip().str.lower(),
+            )
+            .loc[lambda d: d['_em'].ne('') & d['_em'].ne('nan') & d['_em'].ne('none')]
+            .groupby('_pid')['_em']
+            .apply(set)
+            .to_dict()
+        )
+        def _in_api_check(row):
+            pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
+            em = str(row.get('USER_EMAIL', '')).strip().lower()
+            return em in api_emails_by_prop.get(pid, set())
+        profiles_df['_in_api'] = profiles_df.apply(_in_api_check, axis=1)
+        profiles_df = profiles_df[profiles_df['_in_api'] | (profiles_df['pet_rent_paid'] == 1)]
+        profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
+
+    # Portfolio-wide typical fee as fallback for properties with no payers
+    # (median across properties — same skew-resistance as per-property fees)
+    _all_recurring = [v for v in avg_recurring_by_prop.values() if v > 0]
+    _all_onetime = [v for v in avg_onetime_by_prop.values() if v > 0]
+    portfolio_avg_rec = float(np.median(_all_recurring)) if _all_recurring else 0
+    portfolio_avg_ot = float(np.median(_all_onetime)) if _all_onetime else 0
+
+    # ── Step 4: Per-property, per-month missing revenue ──
+    m0, mN = months[0], months[-1]
+    result = {}
+    for pname, grp in profiles_df.groupby('PROPERTY_NAME'):
+        missing = grp[grp['pet_rent_paid'] == 0]
+        if missing.empty:
+            continue
+        # One row per person for the dollar estimation — multiple f_leases
+        # rows for the same user would add the fee several times per month.
+        missing = _dedup_missing_rows(missing, pname, tenant_info)
+
+        # Property launch date — only count missing rent on or after launch
+        launch_dt = _resolve_launch_dt(launch_dates.get(pname))
+        launch_month = datetime(launch_dt.year, launch_dt.month, 1) if launch_dt else None
+
+        # Use property-specific avg if available, otherwise fall back to portfolio avg
+        avg_rec = avg_recurring_by_prop.get(pname, portfolio_avg_rec)
+        avg_ot = avg_onetime_by_prop.get(pname, portfolio_avg_ot)
+
+        # Determine what charge types are active at this property
+        has_recurring = avg_rec > 0
+        has_onetime = avg_ot > 0
+        _is_portfolio_avg = (pname not in avg_recurring_by_prop and pname not in avg_onetime_by_prop)
+        _suffix = " (portfolio avg)" if _is_portfolio_avg else ""
+        if has_recurring and has_onetime:
+            charge_label = f"rent (${avg_rec:,.0f}/mo) + deposit (${avg_ot:,.0f}){_suffix}"
+        elif has_recurring:
+            charge_label = f"rent (${avg_rec:,.0f}/mo){_suffix}"
+        elif has_onetime:
+            charge_label = f"deposit (${avg_ot:,.0f} one-time){_suffix}"
+        else:
+            charge_label = "no fee data available"
+
+        monthly_missing = {m: 0.0 for m in months}
+        missing_tenants = []
+
+        for _, row in missing.iterrows():
+            tc = str(row['TENANT_CODE'])
+            tinfo = tenant_info.get((pname, tc))
+
+            # Determine tenant's active period
+            if tinfo:
+                t_start = tinfo['move_in'] or tinfo['lease_from']
+                t_end = tinfo['move_out'] or tinfo['lease_to']
+                t_status = tinfo['status']
+            else:
+                t_start = None
+                t_end = None
+                t_status = 'current'
+
+            # Default start: if we have no date, assume they were active at launch
+            if t_start is None:
+                t_start = launch_dt if launch_dt else m0
+            active_from = datetime(t_start.year, t_start.month, 1)
+
+            # Default end: if current tenant or no end date, they're still active
+            if t_end is None or t_status == 'current':
+                active_to = mN
+            else:
+                active_to = datetime(t_end.year, t_end.month, 1)
+
+            # Only count months on or after property launch
+            if launch_month:
+                active_from = max(active_from, launch_month)
+
+            # Clamp to display window
+            active_from = max(active_from, m0)
+            active_to = min(active_to, mN)
+
+            first_month_done = False
+            for m in months:
+                if active_from <= m <= active_to:
+                    # Recurring rent: add every active month
+                    if has_recurring:
+                        monthly_missing[m] += avg_rec
+                    # One-time deposit: add only in tenant's first active month
+                    if has_onetime and not first_month_done:
+                        monthly_missing[m] += avg_ot
+                        first_month_done = True
+
+            # Build unit label: prefer unit_address_1, fall back to full_unit_address
+            _unit_label = str(row.get('UNIT_ADDRESS_2', '') or row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
+
+            missing_tenants.append({
+                "name": f"{row.get('USER_FIRST_NAME', '')} {row.get('USER_LAST_NAME', '')}".strip(),
+                "email": row.get('USER_EMAIL', ''),
+                "profile_url": row.get('USER_PROFILE_URL', ''),
+                "unit": _unit_label,
+                "active_from": active_from.strftime('%b %Y'),
+                "active_to": active_to.strftime('%b %Y') if active_to < mN else "Current",
+            })
+
+        # Compute summary stats
+        total_missing_in_window = sum(monthly_missing.values())
+        months_with_missing = sum(1 for v in monthly_missing.values() if v > 0)
+        est_per_month = total_missing_in_window / months_with_missing if months_with_missing > 0 else 0
+
+        # Count unique tenants by email (not raw rows which may have duplicates
+        # from multiple lease rows for the same person)
+        _unique_missing = missing['USER_EMAIL'].nunique() if 'USER_EMAIL' in missing.columns else len(missing)
+
+        result[pname] = {
+            "missing_count": _unique_missing,
+            "monthly_missing": monthly_missing,
+            "avg_recurring": avg_rec,
+            "avg_onetime": avg_ot,
+            "charge_type_label": charge_label,
+            "estimated_missing_per_month": est_per_month,
+            "total_missing_in_window": total_missing_in_window,
+            "missing_tenants": missing_tenants,
+        }
+    return result
+
+
+# ─── Suspected Undisclosed Pets ──────────────────────────────────────
+
+def fetch_suspected_undisclosed_by_property(
+    all_charges_df, selected_codes, property_ids, launch_dates, months,
+):
+    """
+    Per-property, per-month estimated uncollected pet rent from *suspected*
+    undisclosed pets — residents whose PetScreening profile signals a likely
+    pet they haven't disclosed or completed screening for.
+
+    Uses the same revenue estimation methodology as confirmed missing rent:
+    property-specific average fee from paying tenants, with portfolio-wide
+    fallback.
+
+    Returns
+    -------
+    dict  – same shape as fetch_missing_pet_rent_by_property:
+    {property_name: {
+        "missing_count": int,
+        "monthly_missing": {month: float},
+        "avg_recurring": float,
+        "avg_onetime": float,
+        "charge_type_label": str,
+        "estimated_missing_per_month": float,
+        "total_missing_in_window": float,
+        "missing_tenants": [list of dicts],  # includes suspected_reason
+    }}
+    """
+    pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # ── Scope to properties that actually have PET-RELATED charge data ──
+    _pet_charges_filter = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)]
+    _charge_pids = set(_pet_charges_filter['property_id'].astype(str).str.strip().unique())
+    property_ids = [pid for pid in property_ids if str(pid).strip() in _charge_pids]
+    if not property_ids:
+        return {}
+
+    props_str = ", ".join(str(int(pid)) for pid in property_ids)
+
+    # ── Step 1: Reuse the same charge classification & avg fee logic ──
+    pet_charges = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)].copy()
+    pet_charges['_amt'] = pd.to_numeric(pet_charges['charge_amount'], errors='coerce').fillna(0)
+    pet_charges['_from'] = pet_charges['charge_from_date'].apply(parse_date)
+    pet_charges['_to'] = pet_charges['charge_to_date'].apply(parse_date)
+
+    # Current-state report → match against recently-active charges only
+    # (see _recent_paying_charges).
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
+
+    try:
+        _user_overrides = st.session_state.get("charge_type_overrides", {})
+    except Exception:
+        _user_overrides = {}
+    code_class = _classify_pet_charge_codes(
+        pet_charges, pmc_system, _user_overrides,
+        system_by_pid=st.session_state.get("property_system_by_pid"),
+    )
+
+    avg_recurring_by_prop, avg_onetime_by_prop = _estimate_property_fees(
+        pet_charges, code_class
+    )
+
+    # Tenant info for lease dates
+    tenant_info = {}
+    for _, row in all_charges_df.iterrows():
+        key = (str(row['property_name']), str(row['tenant_code']))
+        if key in tenant_info:
+            continue
+        tenant_info[key] = {
+            'move_in': parse_date(row.get('move_in', '')),
+            'move_out': parse_date(row.get('move_out', '')),
+            'lease_from': parse_date(row.get('lease_from', '')),
+            'lease_to': parse_date(row.get('lease_to', '')),
+            'status': str(row.get('tenant_status', '')).strip().lower(),
+        }
+
+    # Portfolio-wide fallback (median across properties)
+    _all_recurring = [v for v in avg_recurring_by_prop.values() if v > 0]
+    _all_onetime = [v for v in avg_onetime_by_prop.values() if v > 0]
+    portfolio_avg_rec = float(np.median(_all_recurring)) if _all_recurring else 0
+    portfolio_avg_ot = float(np.median(_all_onetime)) if _all_onetime else 0
+
+    realpage_current_resident_clause = ""
+    if pmc_system in ('real_page', 'all'):
+        # RealPage current resident list is the freshness anchor for suspected
+        # undisclosed pets too; otherwise old f_leases rows can surface prior
+        # residents/leases as current opportunities.
+        realpage_current_resident_clause = """
+      AND (du.unit_source <> 'real_page' OR EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      ))
+        """
+
+    # ── Step 2: Query Snowflake for suspected undisclosed pets ──
+    sql_suspected = f"""
+    SELECT DISTINCT
+        du.property_id,
+        p.property_name,
+        COALESCE(
+            l.lease_source_external_id:tenant_code::STRING,
+            l.lease_source_external_id:"customerId"::STRING,
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
+        ) AS tenant_code,
+        ue.user_first_name,
+        ue.user_last_name,
+        ue.user_email,
+        ue.user_profile_url,
+        ue.user_pet_type,
+        ue.user_pet_status,
+        ue.compliance_status,
+        ue.household_profile_started_alltime,
+        ue.assistance_profile_started_alltime,
+        CASE
+            WHEN ue.user_pet_type = 'household'
+                 AND ue.user_pet_status IN ('draft','non_responsive','pending','returned')
+            THEN 'Abandoned household profile'
+            WHEN ue.user_pet_type = 'assistance'
+                 AND ue.user_pet_status IN ('draft','non_responsive','declined','not_recommended','returned')
+            THEN 'Unresolved assistance request'
+            ELSE 'Other suspected'
+        END AS suspected_reason
+    FROM PROD.common.d_units du
+    JOIN PROD.common.d_properties p
+        ON du.property_id = p.property_id
+    JOIN PROD.petscreening.petscreening__user_enriched ue
+        ON ue.unit_id = du.unit_id
+    JOIN PROD.common.f_leases l
+        ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+    LEFT JOIN PROD.common.f_user_pets up
+        ON up.user_key = ue.user_key
+    LEFT JOIN PROD.common.d_pet_profiles pp
+        ON pp.pet_key = up.pet_key
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
+      AND du.property_id IN ({props_str})
+      AND ue.compliance_status IN ('compliant', 'non_compliant')
+      /* Exclude recommended AND expired assistance profiles — both at pet_profile and user_enriched level */
+      AND NOT (
+          COALESCE(pp.pet_profile_kind, '') = 'assistance'
+          AND COALESCE(pp.pet_profile_status, '') IN ('recommended', 'expired')
+      )
+      AND NOT (
+          ue.user_pet_type = 'assistance'
+          AND ue.user_pet_status IN ('recommended', 'expired')
+      )
+      AND (
+            /* Current unresolved household profile, not any all-time household history */
+            (
+              ue.user_pet_type = 'household'
+              AND ue.user_pet_status IN ('draft', 'non_responsive', 'pending', 'returned')
+            )
+            OR
+            /* Current unresolved/denied assistance profile. Exclude not_pet rows;
+               a resident who attested no pet is too weak for the suspected KPI. */
+            (
+              ue.user_pet_type = 'assistance'
+              AND ue.user_pet_status IN (
+                'draft', 'non_responsive', 'declined',
+                'not_recommended', 'returned'
+              )
+            )
+          )
+      AND COALESCE(pp.pet_profile_archive_reason, '') = ''
+      AND ue.user_email IS NOT NULL
+      AND TRIM(ue.user_email) <> ''
+      AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
+    """
+    cur.execute(sql_suspected)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
+
+    if profiles_df.empty:
+        return {}
+
+    # ── Step 3: Exclude anyone already paying selected charges ──
+    # Uses case-insensitive tc + email fallback; propagates across multi-lease users
+    profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
+
+    # ── Step 3b: Entrata freshness filter ──
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
+        api_emails_by_prop = (
+            all_charges_df
+            .assign(
+                _pid=lambda d: d['property_id'].astype(str).str.strip(),
+                _em=lambda d: d['email'].astype(str).str.strip().str.lower(),
+            )
+            .loc[lambda d: d['_em'].ne('') & d['_em'].ne('nan') & d['_em'].ne('none')]
+            .groupby('_pid')['_em']
+            .apply(set)
+            .to_dict()
+        )
+        def _in_api_susp(row):
+            pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
+            em = str(row.get('USER_EMAIL', '')).strip().lower()
+            return em in api_emails_by_prop.get(pid, set())
+        profiles_df['_in_api'] = profiles_df.apply(_in_api_susp, axis=1)
+        profiles_df = profiles_df[profiles_df['_in_api'] | (profiles_df['pet_rent_paid'] == 1)]
+        profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
+
+    profiles_df = profiles_df[profiles_df['pet_rent_paid'] == 0].copy()
+
+    if profiles_df.empty:
+        return {}
+
+    # ── Step 4: Per-property, per-month missing revenue ──
+    m0, mN = months[0], months[-1]
+    result = {}
+    for pname, grp in profiles_df.groupby('PROPERTY_NAME'):
+        avg_rec = avg_recurring_by_prop.get(pname, portfolio_avg_rec)
+        avg_ot = avg_onetime_by_prop.get(pname, portfolio_avg_ot)
+
+        has_recurring = avg_rec > 0
+        has_onetime = avg_ot > 0
+        _is_portfolio_avg = (pname not in avg_recurring_by_prop and pname not in avg_onetime_by_prop)
+        _suffix = " (portfolio avg)" if _is_portfolio_avg else ""
+        if has_recurring and has_onetime:
+            charge_label = f"rent (${avg_rec:,.0f}/mo) + deposit (${avg_ot:,.0f}){_suffix}"
+        elif has_recurring:
+            charge_label = f"rent (${avg_rec:,.0f}/mo){_suffix}"
+        elif has_onetime:
+            charge_label = f"deposit (${avg_ot:,.0f} one-time){_suffix}"
+        else:
+            charge_label = "no fee data available"
+
+        launch_dt = _resolve_launch_dt(launch_dates.get(pname))
+        launch_month = datetime(launch_dt.year, launch_dt.month, 1) if launch_dt else None
+
+        monthly_missing = {m: 0.0 for m in months}
+        missing_tenants = []
+
+        # One row per person for the dollar estimation (duplicate lease rows
+        # would double-count the estimated fee).
+        _grp_dedup = _dedup_missing_rows(grp, pname, tenant_info)
+        for _, row in _grp_dedup.iterrows():
+            tc = str(row['TENANT_CODE'])
+            tinfo = tenant_info.get((pname, tc))
+
+            if tinfo:
+                t_start = tinfo['move_in'] or tinfo['lease_from']
+                t_end = tinfo['move_out'] or tinfo['lease_to']
+                t_status = tinfo['status']
+            else:
+                t_start = None
+                t_end = None
+                t_status = 'current'
+
+            if t_start is None:
+                t_start = launch_dt if launch_dt else m0
+            active_from = datetime(t_start.year, t_start.month, 1)
+
+            if t_end is None or t_status == 'current':
+                active_to = mN
+            else:
+                active_to = datetime(t_end.year, t_end.month, 1)
+
+            if launch_month:
+                active_from = max(active_from, launch_month)
+            active_from = max(active_from, m0)
+            active_to = min(active_to, mN)
+
+            first_month_done = False
+            for m in months:
+                if active_from <= m <= active_to:
+                    if has_recurring:
+                        monthly_missing[m] += avg_rec
+                    if has_onetime and not first_month_done:
+                        monthly_missing[m] += avg_ot
+                        first_month_done = True
+
+            # Build unit label: prefer unit_address_1, fall back to full_unit_address
+            _unit_label_s = str(row.get('UNIT_ADDRESS_2', '') or row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
+
+            missing_tenants.append({
+                "name": f"{row.get('USER_FIRST_NAME', '')} {row.get('USER_LAST_NAME', '')}".strip(),
+                "email": row.get('USER_EMAIL', ''),
+                "profile_url": row.get('USER_PROFILE_URL', ''),
+                "unit": _unit_label_s,
+                "suspected_reason": row.get('SUSPECTED_REASON', 'Unknown'),
+                "user_pet_type": row.get('USER_PET_TYPE', ''),
+                "user_pet_status": row.get('USER_PET_STATUS', ''),
+                "active_from": active_from.strftime('%b %Y'),
+                "active_to": active_to.strftime('%b %Y') if active_to < mN else "Current",
+            })
+
+        total_missing_in_window = sum(monthly_missing.values())
+        months_with_missing = sum(1 for v in monthly_missing.values() if v > 0)
+        est_per_month = total_missing_in_window / months_with_missing if months_with_missing > 0 else 0
+
+        # Count unique tenants by email (not raw rows which may have duplicates)
+        _unique_suspected = grp['USER_EMAIL'].nunique() if 'USER_EMAIL' in grp.columns else len(grp)
+
+        result[pname] = {
+            "missing_count": _unique_suspected,
+            "monthly_missing": monthly_missing,
+            "avg_recurring": avg_rec,
+            "avg_onetime": avg_ot,
+            "charge_type_label": charge_label,
+            "estimated_missing_per_month": est_per_month,
+            "total_missing_in_window": total_missing_in_window,
+            "missing_tenants": missing_tenants,
+        }
+    return result
+
+
+def generate_suspected_undisclosed_report(all_charges_df, selected_codes, property_ids):
+    """
+    Generate a downloadable report of suspected undisclosed pets.
+    Similar to generate_missing_pet_rent_report but uses the suspected
+    undisclosed query criteria and adds suspected_reason column.
+    """
+    pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    props_str = ", ".join(str(int(pid)) for pid in property_ids)
+
+    # Step 1: From live API data, build paying tenant set (normalized).
+    # Current-state report → only recently-active charges count as "paying".
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
+
+    realpage_current_resident_clause = ""
+    if pmc_system in ('real_page', 'all'):
+        realpage_current_resident_clause = """
+      AND (du.unit_source <> 'real_page' OR EXISTS (
+          SELECT 1
+          FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
+            AND (
+                r.lease_id = COALESCE(
+                    l.lease_source_external_id:\"lease_id\"::STRING,
+                    l.lease_external_id::STRING
+                )
+                OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
+            )
+            AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
+            AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
+      ))
+        """
+
+    # Step 2: Query Snowflake for suspected undisclosed profiles
+    sql = f"""
+    SELECT DISTINCT
+        du.property_id,
+        p.property_name,
+        COALESCE(
+            l.lease_source_external_id:tenant_code::STRING,
+            l.lease_source_external_id:"customerId"::STRING,
+            l.lease_source_external_id:"customer_id"::STRING,
+            l.lease_source_external_id:"lease_id"::STRING
+        ) AS tenant_code,
+        ue.user_first_name,
+        ue.user_last_name,
+        ue.user_email,
+        ue.user_profile_url,
+        ue.user_pet_type,
+        ue.user_pet_status,
+        ue.compliance_status,
+        ue.household_profile_started_alltime,
+        ue.assistance_profile_started_alltime,
+        du.unit_address_1,
+        du.unit_address_2,
+        CONCAT_WS(' ', du.unit_address_1, du.unit_address_2) AS full_unit_address,
+        l.lease_start_date,
+        l.lease_end_date,
+        CASE
+            WHEN ue.user_pet_type = 'household'
+                 AND ue.user_pet_status IN ('draft','non_responsive','pending','returned')
+            THEN 'Abandoned household profile'
+            WHEN ue.user_pet_type = 'assistance'
+                 AND ue.user_pet_status IN ('draft','non_responsive','declined','not_recommended','returned')
+            THEN 'Unresolved assistance request'
+            ELSE 'Other suspected'
+        END AS suspected_reason
+    FROM PROD.common.d_units du
+    JOIN PROD.common.d_properties p
+        ON du.property_id = p.property_id
+    JOIN PROD.petscreening.petscreening__user_enriched ue
+        ON ue.unit_id = du.unit_id
+    JOIN PROD.common.f_leases l
+        ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+    LEFT JOIN PROD.common.f_user_pets up
+        ON up.user_key = ue.user_key
+    LEFT JOIN PROD.common.d_pet_profiles pp
+        ON pp.pet_key = up.pet_key
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
+      AND du.property_id IN ({props_str})
+      AND ue.compliance_status IN ('compliant', 'non_compliant')
+      /* Exclude recommended AND expired assistance profiles — both at pet_profile and user_enriched level */
+      AND NOT (
+          COALESCE(pp.pet_profile_kind, '') = 'assistance'
+          AND COALESCE(pp.pet_profile_status, '') IN ('recommended', 'expired')
+      )
+      AND NOT (
+          ue.user_pet_type = 'assistance'
+          AND ue.user_pet_status IN ('recommended', 'expired')
+      )
+      AND (
+            /* Current unresolved household profile, not any all-time household history */
+            (
+              ue.user_pet_type = 'household'
+              AND ue.user_pet_status IN ('draft', 'non_responsive', 'pending', 'returned')
+            )
+            OR
+            /* Current unresolved/denied assistance profile. Exclude not_pet rows;
+               a resident who attested no pet is too weak for the suspected export. */
+            (
+              ue.user_pet_type = 'assistance'
+              AND ue.user_pet_status IN (
+                'draft', 'non_responsive', 'declined',
+                'not_recommended', 'returned'
+              )
+            )
+          )
+      AND COALESCE(pp.pet_profile_archive_reason, '') = ''
+      AND ue.user_email IS NOT NULL
+      AND TRIM(ue.user_email) <> ''
+      AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+      {realpage_current_resident_clause}
+    """
+    cur.execute(sql)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
+
+    if profiles_df.empty:
+        return pd.DataFrame()
+
+    # Step 3: Exclude anyone already paying (case-insensitive tc + email fallback)
+    # Propagates across multi-lease users — if any lease row is paying, all are
+    profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
+
+    # Step 3b: Entrata freshness filter
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
+        api_emails_by_prop = (
+            all_charges_df
+            .assign(
+                _pid=lambda d: d['property_id'].astype(str).str.strip(),
+                _em=lambda d: d['email'].astype(str).str.strip().str.lower(),
+            )
+            .loc[lambda d: d['_em'].ne('') & d['_em'].ne('nan') & d['_em'].ne('none')]
+            .groupby('_pid')['_em']
+            .apply(set)
+            .to_dict()
+        )
+        def _in_api_susp_rpt(row):
+            pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
+            em = str(row.get('USER_EMAIL', '')).strip().lower()
+            return em in api_emails_by_prop.get(pid, set())
+        profiles_df['_in_api'] = profiles_df.apply(_in_api_susp_rpt, axis=1)
+        profiles_df = profiles_df[profiles_df['_in_api'] | (profiles_df['pet_rent_paid'] == 1)]
+        profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
+
+    report_df = profiles_df[profiles_df['pet_rent_paid'] == 0].copy()
+
+    if report_df.empty:
+        return pd.DataFrame()
+
+    report_df['overall_status'] = 'Suspected_Undisclosed'
+    return report_df
+
 
 # ═════════════════════════════════════════════════════════════════════
 # STREAMLIT UI
@@ -85,7 +8282,37 @@ inject_brand_css()
 
 
 # ─── PMC system routing (for the 3-way Yardi/Entrata/RealPage switch) ──
+# AppFolio intentionally excluded while API access (MFA) is unresolved —
+# provider code kept as placeholder.
+ALL_PMC_SYSTEMS = ("yardi", "entrata", "real_page")
+
+
+def _scoped_systems(pmc_system=None):
+    """The concrete source systems a pmc_system value stands for."""
+    if pmc_system is None:
+        pmc_system = st.session_state.get("pmc_system", "yardi")
+    return list(ALL_PMC_SYSTEMS) if pmc_system == "all" else [pmc_system]
+
+
 def _load_parent_companies_for(pmc_system):
+    if pmc_system == "all":
+        # Union across systems: a big parent (e.g. Greystar) can run Yardi,
+        # Entrata AND RealPage properties. Merge by parent name, sum counts.
+        merged = {}
+        for _sys in ALL_PMC_SYSTEMS:
+            for r in _load_parent_companies_for(_sys):
+                name = r["PARENT_COMPANY_NAME"]
+                m = merged.get(name)
+                if m is None:
+                    merged[name] = dict(r)
+                    merged[name]["_SYSTEMS"] = [_sys]
+                else:
+                    m["TOTAL_PROPS"] = (m.get("TOTAL_PROPS") or 0) + (r.get("TOTAL_PROPS") or 0)
+                    m["API_PROPS"] = (m.get("API_PROPS") or 0) + (r.get("API_PROPS") or 0)
+                    if not m.get("ANCESTRY_ID") and r.get("ANCESTRY_ID"):
+                        m["ANCESTRY_ID"] = r.get("ANCESTRY_ID")
+                    m["_SYSTEMS"].append(_sys)
+        return sorted(merged.values(), key=lambda r: r["PARENT_COMPANY_NAME"])
     if pmc_system == "entrata":
         return load_entrata_parent_companies()
     if pmc_system == "real_page":
@@ -95,6 +8322,14 @@ def _load_parent_companies_for(pmc_system):
     return load_parent_companies()
 
 def _load_all_properties_for(pmc_system):
+    if pmc_system == "all":
+        out = []
+        for _sys in ALL_PMC_SYSTEMS:
+            for r in _load_all_properties_for(_sys):
+                row = dict(r)
+                row["_PMC_SYSTEM"] = _sys
+                out.append(row)
+        return out
     if pmc_system == "entrata":
         return load_entrata_all_properties()
     if pmc_system == "real_page":
@@ -104,6 +8339,18 @@ def _load_all_properties_for(pmc_system):
     return load_all_properties()
 
 def _load_properties_for_selection_for(pmc_system, **kwargs):
+    if pmc_system == "all":
+        out = []
+        for _sys in ALL_PMC_SYSTEMS:
+            try:
+                rows = _load_properties_for_selection_for(_sys, **kwargs)
+            except Exception:
+                rows = []
+            for r in rows or []:
+                row = dict(r)
+                row["_PMC_SYSTEM"] = _sys
+                out.append(row)
+        return out
     if pmc_system == "entrata":
         return load_entrata_properties_for_selection(**kwargs)
     if pmc_system == "real_page":
@@ -135,8 +8382,8 @@ else:
 _sel_label = st.session_state.get("selection_label", "")
 _sel_system = st.session_state.get("pmc_system", "yardi")
 if _sel_label:
-    _sys_badge = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}.get(_sel_system, "Yardi")
-    _badge_color = {"yardi": "#7D9BC1", "entrata": "#677848", "real_page": "#8F6A3E", "appfolio": "#5B7C99"}.get(_sel_system, "#7D9BC1")
+    _sys_badge = {"all": "All Systems", "yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}.get(_sel_system, "Yardi")
+    _badge_color = {"all": "#1F2257", "yardi": "#7D9BC1", "entrata": "#677848", "real_page": "#8F6A3E", "appfolio": "#5B7C99"}.get(_sel_system, "#7D9BC1")
     st.markdown(
         f'<div style="background:#F9F4E6;border-left:4px solid {_badge_color};padding:8px 16px;'
         f'border-radius:0 6px 6px 0;margin:0 0 12px 0;display:flex;align-items:center;gap:10px">'
@@ -172,14 +8419,23 @@ with st.sidebar:
     #   Entrata  -> 'entrata'
     #   RealPage -> 'real_page'   <-- with underscore, matches D_PROPERTIES
     #   AppFolio -> 'appfolio'
-    _pmc_labels  = ["Yardi", "Entrata", "RealPage", "AppFolio"]
-    _pmc_values  = ["yardi", "entrata", "real_page", "appfolio"]
+    # AppFolio is hidden for now: live API access is blocked by MFA on the
+    # account and the Snowflake-staged data is not trusted. The provider
+    # code (fetch_appfolio_for_properties etc.) stays as a placeholder —
+    # re-add "AppFolio"/"appfolio" here once API access is sorted.
+    _pmc_labels  = ["All Systems", "Yardi", "Entrata", "RealPage"]
+    _pmc_values  = ["all", "yardi", "entrata", "real_page"]
     _curr_idx = _pmc_values.index(st.session_state.pmc_system) if st.session_state.pmc_system in _pmc_values else 0
     _pmc_choice = st.radio(
         "Data Source:",
         _pmc_labels,
         index=_curr_idx,
-        help="Select the property management system to fetch charge data from.",
+        help=(
+            "Select the property management system to fetch charge data from. "
+            "All Systems combines every source a parent company uses (e.g. a "
+            "large parent running Yardi, Entrata AND RealPage properties) "
+            "into one dataset, one report, and one set of CSVs."
+        ),
         horizontal=True,
     )
     _pmc_system = _pmc_values[_pmc_labels.index(_pmc_choice)]
@@ -194,13 +8450,13 @@ with st.sidebar:
         st.session_state.selection_label = ""
         st.session_state.property_ids = []
         for _sk in list(st.session_state.keys()):
-            if (_sk.startswith("missing_rent_") and isinstance(st.session_state[_sk], dict)) or _sk in ("export_html", "exec_html"):
+            if (_sk.startswith("missing_rent_") and isinstance(st.session_state[_sk], dict)) or _sk in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv"):
                 del st.session_state[_sk]
 
     _is_entrata  = _pmc_system == "entrata"
-    _is_realpage = _pmc_system == "real_page"
+    _is_realpage = _pmc_system in ("real_page", "all")
     _is_appfolio = _pmc_system == "appfolio"
-    _system_label = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}[_pmc_system]
+    _system_label = {"all": "All Systems", "yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}[_pmc_system]
 
     st.divider()
     st.header("Select Properties")
@@ -305,7 +8561,7 @@ with st.sidebar:
     st.divider()
 
     # ── Check for saved exports ──
-    _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+    _auto_dir = _auto_export_dir()
     _saved_files = []
     if os.path.isdir(_auto_dir):
         _saved_files = sorted(
@@ -313,19 +8569,76 @@ with st.sidebar:
             reverse=True,
         )
 
-    # RealPage-only: optionally bypass Snowflake staging and call the OneSite
-    # SOAP API directly. Slower, but gives real-time data instead of whatever
-    # the nightly Airbyte sync last landed.
-    if _is_realpage:
+    # ── View mode: clean client-facing view vs developer view ───────
+    st.toggle(
+        "Developer view",
+        key="dev_view",
+        value=False,
+        help=(
+            "Show validation and debug widgets: raw data exports, "
+            "scheduled-vs-actual AR reconciliation, detailed breakdown "
+            "tables, and the property data explorer. Leave off for a "
+            "clean view when presenting or for non-technical users."
+        ),
+    )
+
+    # ── Fetch cache controls (all systems) ──────────────────────────
+    with st.expander("Data reuse (cache)"):
         st.toggle(
-            "\U0001F534 Use Live RealPage API (slower, bypasses Snowflake)",
-            key="realpage_use_live_api",
+            "Reuse recent fetches",
+            key="use_fetch_cache",
+            value=True,
             help=(
-                "Calls the OneSite SOAP API directly instead of reading from "
-                "Snowflake staging tables. Much slower for many properties "
-                "(2-4 SOAP calls per property) but gives real-time data. "
-                "Only the current-month snapshot is returned \u2014 no historical backfill."
+                "Reuses per-property charge data fetched within the max age "
+                "below instead of re-hitting the Yardi/Entrata/RealPage APIs. "
+                "Charge data changes on a monthly cadence, so a re-pull within "
+                "a few days rarely adds anything — and skipping it avoids "
+                "burning shared API rate limits. Turn off (or lower the max "
+                "age) when you need to see changes made in the PMS today; "
+                "fresh pulls always update the cache either way."
             ),
+        )
+        st.selectbox(
+            "Max age (days)",
+            options=[1, 3, 7, 14, 30],
+            index=2,
+            key="fetch_cache_ttl_days",
+        )
+        try:
+            from fetch_cache import cache_stats, clear_cache
+            _fc_stats = cache_stats()
+            _fc_backend = _fc_stats.get("backend", "local")
+            if _fc_backend == "snowflake":
+                st.caption(
+                    f"Backend: Snowflake `{_fc_stats.get('location', '')}` — "
+                    f"{_fc_stats.get('total_entries', 0):,} properties, "
+                    f"{_fc_stats.get('total_records', 0):,} rows (append-only; "
+                    f"doubles as our own fetch-history record). Toggle off "
+                    f"'Reuse recent fetches' to bypass."
+                )
+            elif _fc_stats.get("total_entries"):
+                st.caption(
+                    f"Local cache: {_fc_stats['total_entries']:,} properties "
+                    f"({_fc_stats.get('total_bytes', 0) / 1e6:.1f} MB)"
+                )
+                if st.button("Clear local cache", use_container_width=True):
+                    _n = clear_cache()
+                    st.success(f"Removed {_n} cached properties.")
+        except Exception:
+            pass
+
+    # RealPage: live API, current-state only. No mode toggle by design \u2014
+    # the 2026-07 accuracy audit (docs/realpage-accuracy-audit.md) showed
+    # the API cannot return history (`postmonth` ignored, Former residents
+    # unreachable) and Snowflake staging has its own gaps, so RealPage data
+    # is presented as what it truly is: today's snapshot. Missing/suspected
+    # reports and current revenue are accurate; before/after lift is not
+    # attributed until RealPage authorizes the `getresidentledger` endpoint.
+    if _is_realpage:
+        st.caption(
+            "RealPage is a live current-state snapshot: current revenue "
+            "and missing/suspected reports only \u2014 no before/after lift "
+            "(resident-ledger access pending with RealPage)."
         )
 
     # AppFolio starts Snowflake-backed; keep the live API path visible but
@@ -513,36 +8826,107 @@ if fetch_btn:
             # Clear cached missing rent, suspected, and charge type data
             for _stale_key in list(st.session_state.keys()):
                 if (_stale_key.startswith("missing_rent_") or _stale_key.startswith("suspected_") or
-                    _stale_key in ("export_html", "exec_html", "charge_type_overrides")):
+                    _stale_key in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv", "charge_type_overrides")):
                     del st.session_state[_stale_key]
             st.markdown(f"Fetching {_system_label} data (full history — display window: **{lookback_months} months**)...")
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            # Route to correct API fetch
-            if _pmc_system == "entrata":
-                all_charges, fetch_log, ar_charges, raw_lease_arrays = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
-            elif _pmc_system == "real_page":
-                if st.session_state.get("realpage_use_live_api"):
-                    from realpage_live_api import fetch_realpage_live
-                    all_charges, fetch_log = fetch_realpage_live(
-                        properties, progress_bar, status_text, lookback_months,
-                        junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
-                    )
-                else:
-                    all_charges, fetch_log = fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
-            elif _pmc_system == "appfolio":
-                if st.session_state.get("appfolio_use_live_api"):
-                    st.warning("AppFolio live API is not enabled yet — using Snowflake data for now.")
-                all_charges, fetch_log = fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
+            # Route to correct API fetch — wrapped in the per-property cache
+            # so repeat pulls within the TTL skip the APIs entirely. In
+            # "All Systems" mode, properties are grouped by source system and
+            # each group goes through its own fetcher; results are combined
+            # into one dataset.
+            from fetch_cache import fetch_with_cache
+
+            def _fetch_fn_for(_sys):
+                """(fetch_fn, cache_mode) for one concrete source system."""
+                if _sys == "entrata":
+                    return (lambda props: fetch_entrata_for_properties(props, progress_bar, status_text, lookback_months)), ""
+                if _sys == "real_page":
+                    # Live current-state only (see sidebar note / audit doc).
+                    # Returns the 5-tuple form so the live resident roster is
+                    # persisted in the cache — cache-hit runs then filter the
+                    # missing/suspected reports identically to fresh runs.
+                    import realpage_live_api as _rp_api
+
+                    def _rp_fetch(props):
+                        _c, _l = _rp_api.fetch_realpage_live(
+                            props, progress_bar, status_text, lookback_months,
+                            junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
+                        )
+                        _extras = {
+                            _pid: {"residents": _res}
+                            for _pid, _res in _rp_api.LAST_RESIDENTS.items()
+                        }
+                        return _c, _l, [], [], _extras
+
+                    return _rp_fetch, "live"
+                if _sys == "appfolio":
+                    if st.session_state.get("appfolio_use_live_api"):
+                        st.warning("AppFolio live API is not enabled yet — using Snowflake data for now.")
+                    return (lambda props: fetch_appfolio_for_properties(props, progress_bar, status_text, lookback_months)), ""
+                return (lambda props: fetch_rentroll_for_properties(props, progress_bar, status_text, lookback_months)), ""
+
+            if _pmc_system == "all":
+                _sys_groups = {}
+                for _p in properties:
+                    _sys_groups.setdefault(_p.get("_PMC_SYSTEM", "yardi"), []).append(_p)
             else:
-                all_charges, fetch_log = fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
+                _sys_groups = {_pmc_system: properties}
+
+            # pid → source system, used by the report builders (missing /
+            # suspected SQL scoping) when systems are combined.
+            st.session_state["property_system_by_pid"] = {
+                str(_p.get("PROPERTY_ID")): _p.get("_PMC_SYSTEM", _pmc_system)
+                for _p in properties
+            }
+
+            all_charges, fetch_log, ar_charges, raw_lease_arrays = [], [], [], []
+            _cache_hits = _cache_misses = 0
+            _cache_oldest = None
+            for _sys, _sys_props in _sys_groups.items():
+                if _pmc_system == "all":
+                    status_text.text(f"Fetching {_sys} ({len(_sys_props)} properties)...")
+                _fn, _mode = _fetch_fn_for(_sys)
+                _c, _l, _a, _r, _ci = fetch_with_cache(
+                    _sys,
+                    _sys_props,
+                    _fn,
+                    ttl_days=float(st.session_state.get("fetch_cache_ttl_days", 7)),
+                    force_refresh=not st.session_state.get("use_fetch_cache", True),
+                    mode=_mode,
+                )
+                all_charges.extend(_c)
+                _sys_label_map = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}
+                for _lr in _l:
+                    _lr["system"] = _sys_label_map.get(_sys, _sys)
+                fetch_log.extend(_l)
+                ar_charges.extend(_a)
+                raw_lease_arrays.extend(_r)
+                if _sys == "real_page":
+                    # Restore live resident rosters from cached payloads so
+                    # report filtering behaves the same on cache hits.
+                    import realpage_live_api as _rp_api2
+                    for _pid, _ex in (_ci.get("extras_by_pid") or {}).items():
+                        if _ex and _ex.get("residents") is not None:
+                            _rp_api2.LAST_RESIDENTS[str(_pid)] = _ex["residents"]
+                _cache_hits += _ci["hits"]
+                _cache_misses += _ci["misses"]
+                if _ci["oldest"] is not None and (_cache_oldest is None or _ci["oldest"] < _cache_oldest):
+                    _cache_oldest = _ci["oldest"]
+
+            if len(_sys_groups) > 1:
+                _grp_summary = ", ".join(f"{s}: {len(p)}" for s, p in sorted(_sys_groups.items()))
+                st.caption(f"Combined {len(_sys_groups)} source systems — {_grp_summary}")
+            if _cache_hits:
+                _oldest_txt = f" (oldest from {_cache_oldest.strftime('%b %d %H:%M')})" if _cache_oldest else ""
+                st.caption(
+                    f"Reused cached data for {_cache_hits} of "
+                    f"{len(properties)} properties{_oldest_txt}; fetched "
+                    f"{_cache_misses} fresh. Disable in the sidebar "
+                    f"cache panel to force a full re-pull."
+                )
 
             success_count = sum(1 for l in fetch_log if l['status'].startswith('Success'))
             error_count = sum(1 for l in fetch_log if l['status'].startswith('Error'))
@@ -561,18 +8945,24 @@ if fetch_btn:
                     st.session_state.raw_lease_arrays_df = None
 
                 # ── Auto-export to disk (survives crashes / memory kills) ──
-                _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
-                os.makedirs(_auto_dir, exist_ok=True)
-                _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                _label_safe = st.session_state.get("selection_label", "export").replace(" ", "_")[:60]
-                _auto_path = os.path.join(_auto_dir, f"charges_{_label_safe}_{_ts}.csv")
-                st.session_state.all_charges_df.to_csv(_auto_path, index=False)
-                _auto_msg = f"Auto-saved {len(all_charges):,} charges → `{os.path.basename(_auto_path)}`"
-                if ar_charges and st.session_state.ar_charges_df is not None:
-                    _ar_path = os.path.join(_auto_dir, f"ar_charges_{_label_safe}_{_ts}.csv")
-                    st.session_state.ar_charges_df.to_csv(_ar_path, index=False)
-                    _auto_msg += f" + AR transactions"
-                st.info(f"💾 {_auto_msg} (in `auto_exports/` folder)")
+                # In Streamlit-in-Snowflake the app stage is read-only, so
+                # this falls back to the temp dir (and the Snowflake fetch
+                # cache is the real persistence there anyway).
+                try:
+                    _auto_dir = _auto_export_dir()
+                    os.makedirs(_auto_dir, exist_ok=True)
+                    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _label_safe = st.session_state.get("selection_label", "export").replace(" ", "_")[:60]
+                    _auto_path = os.path.join(_auto_dir, f"charges_{_label_safe}_{_ts}.csv")
+                    st.session_state.all_charges_df.to_csv(_auto_path, index=False)
+                    _auto_msg = f"Auto-saved {len(all_charges):,} charges → `{os.path.basename(_auto_path)}`"
+                    if ar_charges and st.session_state.ar_charges_df is not None:
+                        _ar_path = os.path.join(_auto_dir, f"ar_charges_{_label_safe}_{_ts}.csv")
+                        st.session_state.ar_charges_df.to_csv(_ar_path, index=False)
+                        _auto_msg += f" + AR transactions"
+                    st.info(f"💾 {_auto_msg} (in `{os.path.basename(_auto_dir)}/` folder)")
+                except Exception as _auto_err:  # noqa: BLE001 — never break a fetch over a local save
+                    st.caption(f"Auto-export skipped: {str(_auto_err)[:100]}")
 
                 # Build summary message
                 summary_parts = [f"Fetched **{len(all_charges):,}** charges across **{success_count}** properties"]
@@ -591,7 +8981,11 @@ if fetch_btn:
 # ─── Show fetch results ──────────────────────────────────────────────
 if st.session_state.fetch_log is not None:
     with st.expander("Fetch Results (click to expand)", expanded=False):
-        _render_table(st.session_state.fetch_log, height=300)
+        _fl_df = st.session_state.fetch_log
+        if _fl_df is not None and "system" in getattr(_fl_df, "columns", []):
+            _fl_cols = ["system"] + [c for c in _fl_df.columns if c != "system"]
+            _fl_df = _fl_df[_fl_cols]
+        _render_table(_fl_df, height=300)
 
 # ─── Charge code selection ───────────────────────────────────────────
 if st.session_state.all_charges_df is not None:
@@ -655,7 +9049,7 @@ if st.session_state.all_charges_df is not None:
         st.info("Select at least one charge code above to continue.")
     else:
         # ─── Charge Type Classification (Recurring vs One-Time) ──────
-        with st.expander("⚙️ Charge type classification — recurring vs one-time", expanded=False):
+        with st.expander("Charge type classification — recurring vs one-time", expanded=False):
             st.markdown(
                 "Each charge code is auto-classified as **recurring** (monthly pet rent) or "
                 "**one-time** (pet deposit/fee). One-time charges only count in their start month "
@@ -743,260 +9137,265 @@ if st.session_state.all_charges_df is not None:
 
             if st.session_state.get(_override_key):
                 _n_overrides = len(st.session_state[_override_key])
-                st.info(f"📌 {_n_overrides} manual override{'s' if _n_overrides > 1 else ''} active. "
+                st.info(f"{_n_overrides} manual override{'s' if _n_overrides > 1 else ''} active. "
                         f"These override the auto-detection for revenue charts and lift calculations.")
 
         st.divider()
 
         # ─── Raw Data Exports (for Snowflake validation) ─────────────
-        with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
-            st.markdown(
-                "Download the raw data that the app uses so you can upload it to "
-                "Snowflake and independently recreate/validate the numbers with SQL.  \n"
-                "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
-            )
+        # Developer-view only — hidden in the default client-facing view
+        if st.session_state.get("dev_view", False):
+            with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
+                st.markdown(
+                    "Download the raw data that the app uses so you can upload it to "
+                    "Snowflake and independently recreate/validate the numbers with SQL.  \n"
+                    "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
+                )
 
-            pmc_sys = st.session_state.get("pmc_system", "yardi")
-            props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
+                pmc_sys = st.session_state.get("pmc_system", "yardi")
+                props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
 
-            # ── Fix dates before export ──────────────────────────────
-            # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
-            # Fix all date columns so the CSV can be uploaded to Snowflake directly.
-            _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
-                          'charge_from_date', 'charge_to_date']
+                # ── Fix dates before export ──────────────────────────────
+                # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
+                # Fix all date columns so the CSV can be uploaded to Snowflake directly.
+                _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
+                              'charge_from_date', 'charge_to_date']
 
-            def _fix_dates_for_export(export_df):
-                """Fix century-shifted dates (0025 → 2025) in all date columns."""
-                fixed = export_df.copy()
-                for col in _date_cols:
-                    if col not in fixed.columns:
-                        continue
-                    def _fix_date_val(val):
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            return val
-                        s = str(val).strip()
-                        if not s or s.lower() in ('nan', 'nat', 'none', ''):
-                            return None
-                        # Try parsing and fix year if < 1000
-                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                def _fix_dates_for_export(export_df):
+                    """Fix century-shifted dates (0025 → 2025) in all date columns."""
+                    fixed = export_df.copy()
+                    for col in _date_cols:
+                        if col not in fixed.columns:
+                            continue
+                        def _fix_date_val(val):
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                return val
+                            s = str(val).strip()
+                            if not s or s.lower() in ('nan', 'nat', 'none', ''):
+                                return None
+                            # Try parsing and fix year if < 1000
+                            for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                                try:
+                                    dt = datetime.strptime(s[:10], fmt)
+                                    if dt.year < 1000:
+                                        dt = dt.replace(year=dt.year + 2000)
+                                    return dt.strftime("%Y-%m-%d")
+                                except (ValueError, TypeError):
+                                    continue
+                            # If it's already a datetime/Timestamp object
                             try:
-                                dt = datetime.strptime(s[:10], fmt)
-                                if dt.year < 1000:
-                                    dt = dt.replace(year=dt.year + 2000)
-                                return dt.strftime("%Y-%m-%d")
-                            except (ValueError, TypeError):
-                                continue
-                        # If it's already a datetime/Timestamp object
-                        try:
-                            if hasattr(val, 'year') and val.year < 1000:
-                                val = val.replace(year=val.year + 2000)
-                            return str(val)[:10]
-                        except Exception:
-                            return val
-                    fixed[col] = fixed[col].apply(_fix_date_val)
-                return fixed
+                                if hasattr(val, 'year') and val.year < 1000:
+                                    val = val.replace(year=val.year + 2000)
+                                return str(val)[:10]
+                            except Exception:
+                                return val
+                        fixed[col] = fixed[col].apply(_fix_date_val)
+                    return fixed
 
-            exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
+                exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
 
-            with exp_c1:
-                st.markdown("**1. All API Charges**")
-                st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
-                _export_all = _fix_dates_for_export(df)
-                st.download_button(
-                    "Download all_charges.csv",
-                    data=_export_all.to_csv(index=False),
-                    file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_all_charges",
-                )
-
-            with exp_c2:
-                st.markdown("**2. Pet Charges Only**")
-                st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
-                _pet_only = df[df['charge_code'].isin(selected_codes)]
-                _export_pet = _fix_dates_for_export(_pet_only)
-                st.download_button(
-                    "Download pet_charges.csv",
-                    data=_export_pet.to_csv(index=False),
-                    file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_pet_charges",
-                )
-
-            with exp_c3:
-                st.markdown("**3. Paying Tenant Sets**")
-                st.caption("Every (property_id, tenant_code) and (property_id, email) pair identified as paying after unit/lease expansion.")
-                _pay_tc, _pay_em = _build_paying_sets(df, selected_codes)
-                _pay_tc_df = pd.DataFrame(list(_pay_tc), columns=["property_id", "tenant_code"])
-                _pay_em_df = pd.DataFrame(list(_pay_em), columns=["property_id", "email"])
-                _pay_combined = pd.concat([
-                    _pay_tc_df.assign(match_type="tenant_code", match_key=_pay_tc_df["tenant_code"]).drop(columns=["tenant_code"]),
-                    _pay_em_df.assign(match_type="email", match_key=_pay_em_df["email"]).drop(columns=["email"]),
-                ], ignore_index=True)
-                st.download_button(
-                    "Download paying_tenants.csv",
-                    data=_pay_combined.to_csv(index=False),
-                    file_name=f"paying_tenants_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_paying_sets",
-                )
-
-            with exp_c4:
-                st.markdown("**4. PS Profiles + Paying Flag**")
-                st.caption("PetScreening profiles from Snowflake with the paying flag applied — the raw join result before final filtering.")
-                if st.button("Generate Profiles Export", key="gen_profiles_export"):
-                    with st.spinner("Querying Snowflake for profiles..."):
-                        _sql = f"""
-                        SELECT DISTINCT
-                            du.property_id,
-                            p.property_name,
-                            COALESCE(
-                                l.lease_source_external_id:tenant_code::STRING,
-                                l.lease_source_external_id:"customerId"::STRING,
-                                l.lease_source_external_id:"customer_id"::STRING,
-                                l.lease_source_external_id:"lease_id"::STRING
-                            ) AS tenant_code,
-                            ue.user_email,
-                            ue.user_first_name,
-                            ue.user_last_name,
-                            ue.compliance_status,
-                            ue.user_pet_type,
-                            ue.user_pet_status,
-                            ue.user_profile_url
-                        FROM PROD.common.d_units du
-                        JOIN PROD.common.d_properties p ON du.property_id = p.property_id
-                        JOIN PROD.petscreening.petscreening__user_enriched ue ON ue.unit_id = du.unit_id
-                        JOIN PROD.common.f_leases l ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
-                        WHERE du.unit_source = '{pmc_sys}'
-                          AND du.property_id IN ({props_str_export})
-                          AND ue.compliance_status = 'compliant'
-                          AND ue.user_pet_type = 'household'
-                          AND ue.user_pet_status = 'active'
-                          AND ue.user_email IS NOT NULL
-                          AND TRIM(ue.user_email) <> ''
-                          AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
-                        """
-                        _profiles = pd.DataFrame(run_query(_sql))
-                        if not _profiles.empty:
-                            _profiles = _apply_paying_flag(_profiles, _pay_tc, _pay_em)
-                            st.session_state["_export_profiles_df"] = _profiles
-                            st.success(f"Loaded {len(_profiles):,} profiles. {(_profiles['pet_rent_paid'] == 1).sum():,} paying, {(_profiles['pet_rent_paid'] == 0).sum():,} not paying.")
-                        else:
-                            st.warning("No profiles found.")
-
-                if "_export_profiles_df" in st.session_state and st.session_state["_export_profiles_df"] is not None:
-                    _prof_df = st.session_state["_export_profiles_df"]
+                with exp_c1:
+                    st.markdown("**1. All API Charges**")
+                    st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
+                    _export_all = _fix_dates_for_export(df)
                     st.download_button(
-                        "Download profiles_with_flag.csv",
-                        data=_prof_df.to_csv(index=False),
-                        file_name=f"profiles_with_paying_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "Download all_charges.csv",
+                        data=_export_all.to_csv(index=False),
+                        file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                         mime="text/csv",
-                        key="dl_profiles_flag",
+                        key="dl_all_charges",
                     )
 
-            # ── 5. AR Transactions Export (Entrata only) ────────────
-            _ar_export_df = st.session_state.get("ar_charges_df")
-            if pmc_sys == "entrata" and _ar_export_df is not None and not _ar_export_df.empty:
-                st.markdown("---")
-                exp_ar1, exp_ar2, _ = st.columns([1, 1, 2])
-                with exp_ar1:
-                    st.markdown("**5. AR Transactions (Entrata)**")
-                    st.caption(
-                        "Actual posted AR transactions (pet-related only). "
-                        "These are what was *actually billed* vs the scheduled charges above."
-                    )
+                with exp_c2:
+                    st.markdown("**2. Pet Charges Only**")
+                    st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
+                    _pet_only = df[df['charge_code'].isin(selected_codes)]
+                    _export_pet = _fix_dates_for_export(_pet_only)
                     st.download_button(
-                        "Download ar_transactions.csv",
-                        data=_ar_export_df.to_csv(index=False),
-                        file_name=f"ar_transactions_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "Download pet_charges.csv",
+                        data=_export_pet.to_csv(index=False),
+                        file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                         mime="text/csv",
-                        key="dl_ar_transactions",
+                        key="dl_pet_charges",
                     )
-                with exp_ar2:
-                    st.markdown("**6. Scheduled + AR Flag**")
-                    st.caption(
-                        "All pet charges with an `ar_match` column: YES if a matching AR transaction "
-                        "exists for the same lease + charge code, NO otherwise."
+
+                with exp_c3:
+                    st.markdown("**3. Paying Tenant Sets**")
+                    st.caption("Every (property_id, tenant_code) and (property_id, email) pair identified as paying after unit/lease expansion.")
+                    _pay_tc, _pay_em = _build_paying_sets(df, selected_codes)
+                    _pay_tc_df = pd.DataFrame(list(_pay_tc), columns=["property_id", "tenant_code"])
+                    _pay_em_df = pd.DataFrame(list(_pay_em), columns=["property_id", "email"])
+                    _pay_combined = pd.concat([
+                        _pay_tc_df.assign(match_type="tenant_code", match_key=_pay_tc_df["tenant_code"]).drop(columns=["tenant_code"]),
+                        _pay_em_df.assign(match_type="email", match_key=_pay_em_df["email"]).drop(columns=["email"]),
+                    ], ignore_index=True)
+                    st.download_button(
+                        "Download paying_tenants.csv",
+                        data=_pay_combined.to_csv(index=False),
+                        file_name=f"paying_tenants_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        key="dl_paying_sets",
                     )
-                    # Build the flagged export
-                    _pet_sched = df[df['charge_code'].isin(selected_codes)].copy()
-                    _ar_keys = set()
-                    if 'lease_id' in _pet_sched.columns:
-                        for _, _ar_row in _ar_export_df.iterrows():
-                            _ar_keys.add((
-                                str(_ar_row.get('lease_id', '')).strip(),
-                                str(_ar_row.get('charge_code_name', '')).strip().lower(),
-                            ))
-                        _pet_sched['ar_match'] = _pet_sched.apply(
-                            lambda r: 'YES' if (
-                                str(r.get('lease_id', '')).strip(),
-                                str(r.get('charge_code', '')).strip().lower(),
-                            ) in _ar_keys else 'NO',
-                            axis=1,
+
+                with exp_c4:
+                    st.markdown("**4. PS Profiles + Paying Flag**")
+                    st.caption("PetScreening profiles from Snowflake with the paying flag applied — the raw join result before final filtering.")
+                    if st.button("Generate Profiles Export", key="gen_profiles_export"):
+                        with st.spinner("Querying Snowflake for profiles..."):
+                            _conn = get_snowflake_connection()
+                            _cur = _conn.cursor(snowflake.connector.DictCursor)
+                            _sql = f"""
+                            SELECT DISTINCT
+                                du.property_id,
+                                p.property_name,
+                                COALESCE(
+                                    l.lease_source_external_id:tenant_code::STRING,
+                                    l.lease_source_external_id:"customerId"::STRING,
+                                    l.lease_source_external_id:"customer_id"::STRING,
+                                    l.lease_source_external_id:"lease_id"::STRING
+                                ) AS tenant_code,
+                                ue.user_email,
+                                ue.user_first_name,
+                                ue.user_last_name,
+                                ue.compliance_status,
+                                ue.user_pet_type,
+                                ue.user_pet_status,
+                                ue.user_profile_url
+                            FROM PROD.common.d_units du
+                            JOIN PROD.common.d_properties p ON du.property_id = p.property_id
+                            JOIN PROD.petscreening.petscreening__user_enriched ue ON ue.unit_id = du.unit_id
+                            JOIN PROD.common.f_leases l ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+                            WHERE du.unit_source = '{pmc_sys}'
+                              AND du.property_id IN ({props_str_export})
+                              AND ue.compliance_status = 'compliant'
+                              AND ue.user_pet_type = 'household'
+                              AND ue.user_pet_status = 'active'
+                              AND ue.user_email IS NOT NULL
+                              AND TRIM(ue.user_email) <> ''
+                              AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+                            """
+                            _cur.execute(_sql)
+                            _profiles = pd.DataFrame(_cur.fetchall())
+                            if not _profiles.empty:
+                                _profiles = _apply_paying_flag(_profiles, _pay_tc, _pay_em)
+                                st.session_state["_export_profiles_df"] = _profiles
+                                st.success(f"Loaded {len(_profiles):,} profiles. {(_profiles['pet_rent_paid'] == 1).sum():,} paying, {(_profiles['pet_rent_paid'] == 0).sum():,} not paying.")
+                            else:
+                                st.warning("No profiles found.")
+
+                    if "_export_profiles_df" in st.session_state and st.session_state["_export_profiles_df"] is not None:
+                        _prof_df = st.session_state["_export_profiles_df"]
+                        st.download_button(
+                            "Download profiles_with_flag.csv",
+                            data=_prof_df.to_csv(index=False),
+                            file_name=f"profiles_with_paying_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_profiles_flag",
                         )
-                    else:
-                        _pet_sched['ar_match'] = 'N/A'
-                    _export_flagged = _fix_dates_for_export(_pet_sched)
-                    st.download_button(
-                        "Download pet_charges_with_ar_flag.csv",
-                        data=_export_flagged.to_csv(index=False),
-                        file_name=f"pet_charges_ar_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        key="dl_pet_ar_flag",
-                    )
 
-            # ── 7. Raw Lease Arrays Export (Entrata only) ────────────
-            _raw_arrays_df = st.session_state.get("raw_lease_arrays_df")
-            if pmc_sys == "entrata" and _raw_arrays_df is not None and not _raw_arrays_df.empty:
-                st.markdown("---")
-                _rac1, _rac2, _ = st.columns([1, 1, 2])
-                with _rac1:
-                    st.markdown("**7. Raw Lease Arrays (Entrata)**")
-                    st.caption(
-                        "One row per lease with the raw `scheduledCharges` and `arTransactions` "
-                        "JSON arrays exactly as returned by the Entrata API. "
-                        "Open the CSV and expand the JSON columns to see every individual "
-                        "charge and transaction."
-                    )
-                    st.download_button(
-                        "Download raw_lease_arrays.csv",
-                        data=_raw_arrays_df.to_csv(index=False),
-                        file_name=f"raw_lease_arrays_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        key="dl_raw_lease_arrays",
-                    )
-                with _rac2:
-                    _n_with_sched = (_raw_arrays_df['n_scheduled_charges'] > 0).sum()
-                    _n_with_ar = (_raw_arrays_df['n_ar_transactions'] > 0).sum()
-                    st.metric("Leases with scheduled charges", f"{_n_with_sched:,}")
-                    st.metric("Leases with AR transactions", f"{_n_with_ar:,}")
+                # ── 5. AR Transactions Export (Entrata only) ────────────
+                _ar_export_df = st.session_state.get("ar_charges_df")
+                if pmc_sys == "entrata" and _ar_export_df is not None and not _ar_export_df.empty:
+                    st.markdown("---")
+                    exp_ar1, exp_ar2, _ = st.columns([1, 1, 2])
+                    with exp_ar1:
+                        st.markdown("**5. AR Transactions (Entrata)**")
+                        st.caption(
+                            "Actual posted AR transactions (pet-related only). "
+                            "These are what was *actually billed* vs the scheduled charges above."
+                        )
+                        st.download_button(
+                            "Download ar_transactions.csv",
+                            data=_ar_export_df.to_csv(index=False),
+                            file_name=f"ar_transactions_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_ar_transactions",
+                        )
+                    with exp_ar2:
+                        st.markdown("**6. Scheduled + AR Flag**")
+                        st.caption(
+                            "All pet charges with an `ar_match` column: YES if a matching AR transaction "
+                            "exists for the same lease + charge code, NO otherwise."
+                        )
+                        # Build the flagged export
+                        _pet_sched = df[df['charge_code'].isin(selected_codes)].copy()
+                        _ar_keys = set()
+                        if 'lease_id' in _pet_sched.columns:
+                            for _, _ar_row in _ar_export_df.iterrows():
+                                _ar_keys.add((
+                                    str(_ar_row.get('lease_id', '')).strip(),
+                                    str(_ar_row.get('charge_code_name', '')).strip().lower(),
+                                ))
+                            _pet_sched['ar_match'] = _pet_sched.apply(
+                                lambda r: 'YES' if (
+                                    str(r.get('lease_id', '')).strip(),
+                                    str(r.get('charge_code', '')).strip().lower(),
+                                ) in _ar_keys else 'NO',
+                                axis=1,
+                            )
+                        else:
+                            _pet_sched['ar_match'] = 'N/A'
+                        _export_flagged = _fix_dates_for_export(_pet_sched)
+                        st.download_button(
+                            "Download pet_charges_with_ar_flag.csv",
+                            data=_export_flagged.to_csv(index=False),
+                            file_name=f"pet_charges_ar_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_pet_ar_flag",
+                        )
 
-            st.divider()
-            st.markdown("##### Snowflake Upload Instructions")
-            st.code(
-                "-- 1. Create a stage and file format\n"
-                "CREATE OR REPLACE FILE FORMAT my_csv_format TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '\"' SKIP_HEADER = 1;\n"
-                "CREATE OR REPLACE STAGE my_validation_stage FILE_FORMAT = my_csv_format;\n\n"
-                "-- 2. Upload via SnowSQL or Snowsight UI\n"
-                "PUT file:///path/to/all_charges_*.csv @my_validation_stage;\n\n"
-                "-- 3. Create table and load\n"
-                "CREATE OR REPLACE TABLE sandbox.validation.api_charges AS\n"
-                "SELECT $1 as parent_company, $2 as property_id, $3 as property_name,\n"
-                "       $4 as property_code, $5 as launch_date, $6 as unit_code,\n"
-                "       $7 as unit_type, $8 as market_rent, $9 as tenant_code,\n"
-                "       $10 as first_name, $11 as last_name, $12 as tenant_status,\n"
-                "       $13 as lease_from, $14 as lease_to, $15 as move_in,\n"
-                "       $16 as move_out, $17 as email, $18 as charge_code,\n"
-                "       $19 as charge_type, $20 as charge_amount,\n"
-                "       $21 as charge_from_date, $22 as charge_to_date\n"
-                "FROM @my_validation_stage/all_charges_*.csv;\n\n"
-                "-- 4. Validate: count pet charges\n"
-                "SELECT charge_code, COUNT(*) as cnt, SUM(charge_amount::float) as total\n"
-                "FROM sandbox.validation.api_charges\n"
-                "WHERE charge_code ILIKE '%pet%'\n"
-                "GROUP BY 1 ORDER BY 2 DESC;",
-                language="sql",
-            )
+                # ── 7. Raw Lease Arrays Export (Entrata only) ────────────
+                _raw_arrays_df = st.session_state.get("raw_lease_arrays_df")
+                if pmc_sys == "entrata" and _raw_arrays_df is not None and not _raw_arrays_df.empty:
+                    st.markdown("---")
+                    _rac1, _rac2, _ = st.columns([1, 1, 2])
+                    with _rac1:
+                        st.markdown("**7. Raw Lease Arrays (Entrata)**")
+                        st.caption(
+                            "One row per lease with the raw `scheduledCharges` and `arTransactions` "
+                            "JSON arrays exactly as returned by the Entrata API. "
+                            "Open the CSV and expand the JSON columns to see every individual "
+                            "charge and transaction."
+                        )
+                        st.download_button(
+                            "Download raw_lease_arrays.csv",
+                            data=_raw_arrays_df.to_csv(index=False),
+                            file_name=f"raw_lease_arrays_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_raw_lease_arrays",
+                        )
+                    with _rac2:
+                        _n_with_sched = (_raw_arrays_df['n_scheduled_charges'] > 0).sum()
+                        _n_with_ar = (_raw_arrays_df['n_ar_transactions'] > 0).sum()
+                        st.metric("Leases with scheduled charges", f"{_n_with_sched:,}")
+                        st.metric("Leases with AR transactions", f"{_n_with_ar:,}")
+
+                st.divider()
+                st.markdown("##### Snowflake Upload Instructions")
+                st.code(
+                    "-- 1. Create a stage and file format\n"
+                    "CREATE OR REPLACE FILE FORMAT my_csv_format TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '\"' SKIP_HEADER = 1;\n"
+                    "CREATE OR REPLACE STAGE my_validation_stage FILE_FORMAT = my_csv_format;\n\n"
+                    "-- 2. Upload via SnowSQL or Snowsight UI\n"
+                    "PUT file:///path/to/all_charges_*.csv @my_validation_stage;\n\n"
+                    "-- 3. Create table and load\n"
+                    "CREATE OR REPLACE TABLE sandbox.validation.api_charges AS\n"
+                    "SELECT $1 as parent_company, $2 as property_id, $3 as property_name,\n"
+                    "       $4 as property_code, $5 as launch_date, $6 as unit_code,\n"
+                    "       $7 as unit_type, $8 as market_rent, $9 as tenant_code,\n"
+                    "       $10 as first_name, $11 as last_name, $12 as tenant_status,\n"
+                    "       $13 as lease_from, $14 as lease_to, $15 as move_in,\n"
+                    "       $16 as move_out, $17 as email, $18 as charge_code,\n"
+                    "       $19 as charge_type, $20 as charge_amount,\n"
+                    "       $21 as charge_from_date, $22 as charge_to_date\n"
+                    "FROM @my_validation_stage/all_charges_*.csv;\n\n"
+                    "-- 4. Validate: count pet charges\n"
+                    "SELECT charge_code, COUNT(*) as cnt, SUM(charge_amount::float) as total\n"
+                    "FROM sandbox.validation.api_charges\n"
+                    "WHERE charge_code ILIKE '%pet%'\n"
+                    "GROUP BY 1 ORDER BY 2 DESC;",
+                    language="sql",
+                )
 
         st.divider()
 
@@ -1005,8 +9404,8 @@ if st.session_state.all_charges_df is not None:
         # ═══════════════════════════════════════════════════════════════
         tab_charts, tab_next, tab_report, tab_docs = st.tabs([
             "Fee Collection Charts",
-            "Summary",
-            "Missing Pet Rent Report",
+            "Summary & Reports",
+            "Missing Pet Rent",
             "Documentation & SQL",
         ])
 
@@ -1020,7 +9419,7 @@ if st.session_state.all_charges_df is not None:
             if analyze_btn:
                 # Clear cached data on new analysis
                 for _key in list(st.session_state.keys()):
-                    if _key.startswith("missing_rent_") or _key in ("export_html", "exec_html"):
+                    if _key.startswith("missing_rent_") or _key in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv"):
                         del st.session_state[_key]
 
                 label = st.session_state.selection_label
@@ -1134,7 +9533,7 @@ if st.session_state.all_charges_df is not None:
                 charge_cols = [
                     "property_id", "property_name", "from_date", "to_date", "amount",
                     "tenant_code", "first_name", "last_name",
-                    "tenant_status", "charge_code", "charge_type",
+                    "tenant_status", "charge_code", "charge_type", "frequency",
                     "email", "move_in", "move_out", "lease_from", "lease_to",
                     "_raw_to_date", "_move_out_dt", "_lease_to_dt",
                 ]
@@ -1176,7 +9575,6 @@ if st.session_state.all_charges_df is not None:
                 #   Median span > 60 days → recurring (charged monthly)
                 #   Median span ≤ 60 days → one-time (deposit/fee)
                 # One-time charges only count in their from_date month.
-                _has_frequency = any('frequency' in rec for rec in cd["parsed_charges"])
                 _code_class = {}  # {(property_name, charge_code): "recurring" | "onetime"}
 
                 # Group records by (property_name, charge_code)
@@ -1185,16 +9583,24 @@ if st.session_state.all_charges_df is not None:
                     key = (rec["property_name"], rec["charge_code"])
                     _by_prop_code[key].append(rec)
 
+                # Per-property source system (matters in All Systems mode:
+                # each property is classified by its own system's rules).
+                _chart_sys_by_pid = st.session_state.get("property_system_by_pid", {}) or {}
+                _session_sys = st.session_state.get("pmc_system")
+
                 for (pname, code), recs in _by_prop_code.items():
-                    if st.session_state.get("pmc_system") == "real_page":
+                    _grp_sys = _session_sys
+                    if _session_sys == "all":
+                        _grp_sys = _chart_sys_by_pid.get(str(recs[0].get("property_id", "")), "yardi")
+                    _grp_freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency') and not pd.isna(r.get('frequency'))]
+                    if _grp_sys in ("real_page", "appfolio"):
                         # RealPage uses one row per observed post_month. Treat
                         # selected pet-rent codes as recurring even though each
                         # row's normalized date span is one month.
                         _code_class[(pname, code)] = "recurring"
-                    elif _has_frequency:
-                        freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency')]
-                        onetime_count = sum(1 for f in freqs if f == 'one-time')
-                        monthly_count = sum(1 for f in freqs if f in ('monthly', 'recurring'))
+                    elif _grp_freqs:
+                        onetime_count = sum(1 for f in _grp_freqs if f == 'one-time')
+                        monthly_count = sum(1 for f in _grp_freqs if f in ('monthly', 'recurring'))
                         _code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
                     else:
                         spans = []
@@ -1224,13 +9630,23 @@ if st.session_state.all_charges_df is not None:
                 monthly_portfolio_count = defaultdict(int)
                 monthly_by_prop = defaultdict(lambda: defaultdict(float))
 
+                _neg_rows = 0
+                _neg_total = 0.0
                 for rec in cd["parsed_charges"]:
                     prop = rec["property_name"]
                     amt = rec["amount"]
                     from_dt = rec["from_date"]
                     to_dt = rec["to_date"]
 
-                    if from_dt is None or pd.isna(from_dt) or amt <= 0:
+                    if from_dt is None or pd.isna(from_dt):
+                        continue
+                    if amt <= 0:
+                        # Negative rows are usually concessions/adjustments
+                        # (e.g. CONCPET). They are excluded from revenue, but
+                        # surface the total so nobody thinks they vanished.
+                        if amt < 0:
+                            _neg_rows += 1
+                            _neg_total += amt
                         continue
 
                     charge_start = datetime(int(from_dt.year), int(from_dt.month), 1)
@@ -1255,12 +9671,19 @@ if st.session_state.all_charges_df is not None:
                 monthly_portfolio_count = dict(monthly_portfolio_count)
                 monthly_by_prop = {p: dict(v) for p, v in monthly_by_prop.items()}
 
+                if _neg_rows:
+                    st.caption(
+                        f"{_neg_rows:,} negative charge rows totaling "
+                        f"${_neg_total:,.0f} (concessions/adjustments, e.g. "
+                        f"CONCPET) were excluded from revenue."
+                    )
+
                 # Compute pre/post launch analysis
                 launch_analysis = compute_launch_analysis(monthly_by_prop, months, launch_dates)
 
                 st.header("Fee Collection Analysis")
 
-                latest_month = months[-1]
+                latest_month = _latest_observed_revenue_month(monthly_by_prop, months) or months[-1]
 
                 # ── Property funnel — consistent cascade ──────────────
                 _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -1393,6 +9816,30 @@ if st.session_state.all_charges_df is not None:
                 # KPI ROW 1: Launch impact metrics (always shown)
                 # ═══════════════════════════════════════════════════════════
 
+                _rp_in_scope = (st.session_state.get("pmc_system") == "real_page") or (
+                    st.session_state.get("pmc_system") == "all"
+                    and any(v == "real_page" for v in (st.session_state.get("property_system_by_pid") or {}).values())
+                )
+                if _rp_in_scope:
+                    st.info(
+                        "**RealPage properties are current-state snapshots**: they "
+                        "contribute current collected revenue and the missing / "
+                        "suspected opportunity numbers, but **no before/after lift** "
+                        "— the RealPage API cannot return payment history "
+                        "(resident-ledger access pending with RealPage)."
+                    )
+
+                # ── Data health panel ──
+                try:
+                    _health = _run_data_health_checks(df, monthly_by_prop, months, launch_dates)
+                    _n_pass = sum(1 for h in _health if h["status"] == "pass")
+                    with st.expander(f"Data health — {_n_pass}/{len(_health)} checks passed"):
+                        for h in _health:
+                            _hi = "Pass" if h["status"] == "pass" else "Warning"
+                            st.markdown(f"- **{_hi}** · {h['label']} — {h['detail']}")
+                except Exception:
+                    pass
+
                 if launch_analysis:
                     comparable = {p: a for p, a in launch_analysis.items()
                                   if _launch_analysis_is_comparable(a)}
@@ -1405,9 +9852,10 @@ if st.session_state.all_charges_df is not None:
                     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
                     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
 
-                    # Simple lift (current month - pre baseline)
+                    # Simple lift (latest observed revenue month - pre baseline)
                     _fc_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
-                    _fc_current_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0
+                    _fc_latest = _latest_observed_revenue_month(monthly_by_prop, months, comparable.keys()) if comparable else latest_month
+                    _fc_current_rev = sum(monthly_by_prop[p].get(_fc_latest, 0) for p in comparable.keys()) if comparable and _fc_latest else 0
                     _fc_simple_lift = _fc_current_rev - _fc_pre_baseline if _fc_pre_baseline > 0 else 0
 
                     # Display based on toggle
@@ -2027,398 +10475,404 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 ar_df = st.session_state.get("ar_charges_df")
                 if _is_entrata_view and ar_df is not None and not ar_df.empty:
                     st.divider()
-                    with st.expander("Scheduled vs Actual Revenue (AR Transactions)", expanded=False):
-                        st.caption(
-                            "Compares **scheduled charges** (what the lease says should be billed) "
-                            "with **AR transactions** (what was actually posted to the ledger). "
-                            "AR data comes from Entrata's `includeArTransactions` response."
-                        )
-
-                        ar_df_work = ar_df.copy()
-                        ar_df_work['_amt'] = pd.to_numeric(ar_df_work['amount'], errors='coerce').fillna(0)
-                        ar_df_work['_paid'] = pd.to_numeric(ar_df_work['amount_paid'], errors='coerce').fillna(0)
-
-                        _ar_post_dates = pd.to_datetime(ar_df_work['post_month'], errors='coerce', format='mixed')
-                        ar_df_work['_post_month_dt'] = _ar_post_dates.apply(
-                            lambda d: datetime(d.year, d.month, 1) if pd.notna(d) else None
-                        )
-                        ar_in_window = ar_df_work[
-                            ar_df_work['_post_month_dt'].notna()
-                            & ar_df_work['_post_month_dt'].between(months[0], months[-1])
-                        ]
-
-                        ar_monthly_portfolio = defaultdict(float)
-                        ar_monthly_by_prop = defaultdict(lambda: defaultdict(float))
-                        for _, row in ar_in_window.iterrows():
-                            m = row['_post_month_dt']
-                            ar_monthly_portfolio[m] += row['_amt']
-                            ar_monthly_by_prop[row['property_name']][m] += row['_amt']
-
-                        # Summary metrics
-                        total_ar = ar_in_window['_amt'].sum()
-                        total_ar_paid = ar_in_window['_paid'].sum()
-                        total_scheduled = sum(monthly_portfolio.get(m, 0) for m in months)
-
-                        mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("Scheduled Revenue", f"${total_scheduled:,.0f}",
-                                   help="Total from scheduled charges over the display window")
-                        mc2.metric("Actual Posted (AR)", f"${total_ar:,.0f}",
-                                   help="Total from AR transactions posted over the display window")
-                        mc3.metric("AR Collected", f"${total_ar_paid:,.0f}",
-                                   help="Of the posted amount, how much has been paid")
-                        _diff_pct = ((total_ar / total_scheduled - 1) * 100) if total_scheduled > 0 else 0
-                        mc4.metric("Variance", f"{_diff_pct:+.1f}%",
-                                   help="AR posted vs Scheduled: positive means actual > scheduled")
-
-                        # Monthly comparison table
-                        compare_rows = []
-                        for m in months:
-                            sched = monthly_portfolio.get(m, 0)
-                            actual = ar_monthly_portfolio.get(m, 0)
-                            compare_rows.append({
-                                "Month": m.strftime("%b %Y"),
-                                "Scheduled ($)": f"{sched:,.2f}",
-                                "Actual AR ($)": f"{actual:,.2f}",
-                                "Difference ($)": f"{(actual - sched):,.2f}",
-                                "Variance (%)": f"{((actual / sched - 1) * 100):+.1f}%" if sched > 0 else "N/A",
-                            })
-                        compare_df = pd.DataFrame(compare_rows)
-                        st.markdown("**Monthly Comparison**")
-                        st.table(compare_df)
-
-                        # Per-property breakdown
-                        if ar_monthly_by_prop:
-                            st.subheader("Per-Property: Scheduled vs Actual")
-                            prop_compare = []
-                            for prop in sorted(monthly_by_prop.keys()):
-                                sched_total = sum(monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
-                                ar_total = sum(ar_monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
-                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-                                prop_compare.append({
-                                    "Property": short,
-                                    "Scheduled ($)": f"{sched_total:,.2f}",
-                                    "Actual AR ($)": f"{ar_total:,.2f}",
-                                    "Difference ($)": f"{(ar_total - sched_total):,.2f}",
-                                    "Variance (%)": f"{((ar_total / sched_total - 1) * 100):+.1f}%" if sched_total > 0 else ("N/A" if ar_total == 0 else "New"),
-                                })
-                            prop_compare_df = pd.DataFrame(prop_compare)
-                            st.table(prop_compare_df)
-
-                        st.caption(
-                            f"AR data: **{len(ar_in_window):,}** pet-related transactions in window. "
-                            f"Total AR rows (all time): **{len(ar_df):,}**"
-                        )
-
-                        # ── Raw AR Transactions (individual posted charges) ──
-                        st.markdown("---")
-                        st.subheader("AR Transactions (Individual Posted Charges)")
-                        st.caption(
-                            "Each row = one actual charge posted to the ledger. "
-                            "This is what the property management system actually billed, "
-                            "not what the lease says *should* be billed."
-                        )
-
-                        # Build a clean display table from ar_df
-                        _ar_display = ar_df.copy()
-                        _ar_display['_amt'] = pd.to_numeric(_ar_display['amount'], errors='coerce').fillna(0)
-                        _ar_display['_paid'] = pd.to_numeric(_ar_display['amount_paid'], errors='coerce').fillna(0)
-                        _ar_display['_bal'] = pd.to_numeric(_ar_display['balance_due'], errors='coerce').fillna(0)
-
-                        _ar_table_rows = []
-                        for _, _r in _ar_display.iterrows():
-                            _ar_table_rows.append({
-                                "Unit": _r.get('unit', ''),
-                                "Lease ID": _r.get('lease_id', ''),
-                                "Charge": _r.get('charge_code_name', ''),
-                                "Post Date": str(_r.get('post_date', ''))[:10],
-                                "Post Month": str(_r.get('post_month', ''))[:7],
-                                "Amount": f"${_r['_amt']:,.2f}",
-                                "Paid": f"${_r['_paid']:,.2f}",
-                                "Balance": f"${_r['_bal']:,.2f}",
-                                "Description": str(_r.get('description', ''))[:50],
-                            })
-
-                        if _ar_table_rows:
-                            _ar_table_df = pd.DataFrame(_ar_table_rows)
-
-                            # Month filter
-                            _ar_months = sorted(set(r["Post Month"] for r in _ar_table_rows if r["Post Month"]))
-                            if _ar_months:
-                                _sel_ar_month = st.selectbox(
-                                    "Filter by post month:",
-                                    ["All"] + _ar_months,
-                                    index=0,
-                                    key="ar_month_filter",
-                                )
-                                if _sel_ar_month != "All":
-                                    _ar_table_df = _ar_table_df[_ar_table_df["Post Month"] == _sel_ar_month]
-
-                            st.markdown(f"**{len(_ar_table_df)}** transactions shown")
-                            _render_table(_ar_table_df, height=400)
-
-                            st.download_button(
-                                "Download AR transactions",
-                                data=_ar_display.to_csv(index=False),
-                                file_name=f"ar_transactions_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv",
-                                key="dl_ar_inline",
+                    # Developer-view only — hidden in the default client-facing view
+                    if st.session_state.get("dev_view", False):
+                        with st.expander("Scheduled vs Actual Revenue (AR Transactions)", expanded=False):
+                            st.caption(
+                                "Compares **scheduled charges** (what the lease says should be billed) "
+                                "with **AR transactions** (what was actually posted to the ledger). "
+                                "AR data comes from Entrata's `includeArTransactions` response."
                             )
-                        else:
-                            st.info("No AR transactions found for this property.")
+
+                            ar_df_work = ar_df.copy()
+                            ar_df_work['_amt'] = pd.to_numeric(ar_df_work['amount'], errors='coerce').fillna(0)
+                            ar_df_work['_paid'] = pd.to_numeric(ar_df_work['amount_paid'], errors='coerce').fillna(0)
+
+                            _ar_post_dates = pd.to_datetime(ar_df_work['post_month'], errors='coerce', format='mixed')
+                            ar_df_work['_post_month_dt'] = _ar_post_dates.apply(
+                                lambda d: datetime(d.year, d.month, 1) if pd.notna(d) else None
+                            )
+                            ar_in_window = ar_df_work[
+                                ar_df_work['_post_month_dt'].notna()
+                                & ar_df_work['_post_month_dt'].between(months[0], months[-1])
+                            ]
+
+                            ar_monthly_portfolio = defaultdict(float)
+                            ar_monthly_by_prop = defaultdict(lambda: defaultdict(float))
+                            for _, row in ar_in_window.iterrows():
+                                m = row['_post_month_dt']
+                                ar_monthly_portfolio[m] += row['_amt']
+                                ar_monthly_by_prop[row['property_name']][m] += row['_amt']
+
+                            # Summary metrics
+                            total_ar = ar_in_window['_amt'].sum()
+                            total_ar_paid = ar_in_window['_paid'].sum()
+                            total_scheduled = sum(monthly_portfolio.get(m, 0) for m in months)
+
+                            mc1, mc2, mc3, mc4 = st.columns(4)
+                            mc1.metric("Scheduled Revenue", f"${total_scheduled:,.0f}",
+                                       help="Total from scheduled charges over the display window")
+                            mc2.metric("Actual Posted (AR)", f"${total_ar:,.0f}",
+                                       help="Total from AR transactions posted over the display window")
+                            mc3.metric("AR Collected", f"${total_ar_paid:,.0f}",
+                                       help="Of the posted amount, how much has been paid")
+                            _diff_pct = ((total_ar / total_scheduled - 1) * 100) if total_scheduled > 0 else 0
+                            mc4.metric("Variance", f"{_diff_pct:+.1f}%",
+                                       help="AR posted vs Scheduled: positive means actual > scheduled")
+
+                            # Monthly comparison table
+                            compare_rows = []
+                            for m in months:
+                                sched = monthly_portfolio.get(m, 0)
+                                actual = ar_monthly_portfolio.get(m, 0)
+                                compare_rows.append({
+                                    "Month": m.strftime("%b %Y"),
+                                    "Scheduled ($)": f"{sched:,.2f}",
+                                    "Actual AR ($)": f"{actual:,.2f}",
+                                    "Difference ($)": f"{(actual - sched):,.2f}",
+                                    "Variance (%)": f"{((actual / sched - 1) * 100):+.1f}%" if sched > 0 else "N/A",
+                                })
+                            compare_df = pd.DataFrame(compare_rows)
+                            st.markdown("**Monthly Comparison**")
+                            st.table(compare_df)
+
+                            # Per-property breakdown
+                            if ar_monthly_by_prop:
+                                st.subheader("Per-Property: Scheduled vs Actual")
+                                prop_compare = []
+                                for prop in sorted(monthly_by_prop.keys()):
+                                    sched_total = sum(monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
+                                    ar_total = sum(ar_monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
+                                    short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+                                    prop_compare.append({
+                                        "Property": short,
+                                        "Scheduled ($)": f"{sched_total:,.2f}",
+                                        "Actual AR ($)": f"{ar_total:,.2f}",
+                                        "Difference ($)": f"{(ar_total - sched_total):,.2f}",
+                                        "Variance (%)": f"{((ar_total / sched_total - 1) * 100):+.1f}%" if sched_total > 0 else ("N/A" if ar_total == 0 else "New"),
+                                    })
+                                prop_compare_df = pd.DataFrame(prop_compare)
+                                st.table(prop_compare_df)
+
+                            st.caption(
+                                f"AR data: **{len(ar_in_window):,}** pet-related transactions in window. "
+                                f"Total AR rows (all time): **{len(ar_df):,}**"
+                            )
+
+                            # ── Raw AR Transactions (individual posted charges) ──
+                            st.markdown("---")
+                            st.subheader("AR Transactions (Individual Posted Charges)")
+                            st.caption(
+                                "Each row = one actual charge posted to the ledger. "
+                                "This is what the property management system actually billed, "
+                                "not what the lease says *should* be billed."
+                            )
+
+                            # Build a clean display table from ar_df
+                            _ar_display = ar_df.copy()
+                            _ar_display['_amt'] = pd.to_numeric(_ar_display['amount'], errors='coerce').fillna(0)
+                            _ar_display['_paid'] = pd.to_numeric(_ar_display['amount_paid'], errors='coerce').fillna(0)
+                            _ar_display['_bal'] = pd.to_numeric(_ar_display['balance_due'], errors='coerce').fillna(0)
+
+                            _ar_table_rows = []
+                            for _, _r in _ar_display.iterrows():
+                                _ar_table_rows.append({
+                                    "Unit": _r.get('unit', ''),
+                                    "Lease ID": _r.get('lease_id', ''),
+                                    "Charge": _r.get('charge_code_name', ''),
+                                    "Post Date": str(_r.get('post_date', ''))[:10],
+                                    "Post Month": str(_r.get('post_month', ''))[:7],
+                                    "Amount": f"${_r['_amt']:,.2f}",
+                                    "Paid": f"${_r['_paid']:,.2f}",
+                                    "Balance": f"${_r['_bal']:,.2f}",
+                                    "Description": str(_r.get('description', ''))[:50],
+                                })
+
+                            if _ar_table_rows:
+                                _ar_table_df = pd.DataFrame(_ar_table_rows)
+
+                                # Month filter
+                                _ar_months = sorted(set(r["Post Month"] for r in _ar_table_rows if r["Post Month"]))
+                                if _ar_months:
+                                    _sel_ar_month = st.selectbox(
+                                        "Filter by post month:",
+                                        ["All"] + _ar_months,
+                                        index=0,
+                                        key="ar_month_filter",
+                                    )
+                                    if _sel_ar_month != "All":
+                                        _ar_table_df = _ar_table_df[_ar_table_df["Post Month"] == _sel_ar_month]
+
+                                st.markdown(f"**{len(_ar_table_df)}** transactions shown")
+                                _render_table(_ar_table_df, height=400)
+
+                                st.download_button(
+                                    "Download AR transactions",
+                                    data=_ar_display.to_csv(index=False),
+                                    file_name=f"ar_transactions_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="dl_ar_inline",
+                                )
+                            else:
+                                st.info("No AR transactions found for this property.")
 
                 # ── 6. Collapsible Tables Section ───────────────────────
                 st.divider()
-                with st.expander("Show detailed tables (PetScreening impact breakdown & monthly revenue)", expanded=False):
+                # Developer-view only — hidden in the default client-facing view
+                if st.session_state.get("dev_view", False):
+                    with st.expander("Show detailed tables (PetScreening impact breakdown & monthly revenue)", expanded=False):
 
-                    # -- Impact Breakdown Table --
-                    if launch_analysis:
-                        st.subheader("PetScreening Impact by Property")
-                        st.caption(
-                            "Sorted by biggest monthly revenue increase after PetScreening launch. "
-                            "Properties launched before the lookback window show 'Live before window' (no pre-launch data to compare)."
-                        )
-
-                        la_rows = []
-                        for prop, a in launch_analysis.items():
-                            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-
-                            # Properties need observed pre-launch data and a meaningful baseline to compare.
-                            # A 1-2 month baseline is marked as low-data, but still contributes
-                            # so the table matches the top aggregate and individual chart lift badges.
-                            has_comparison = _launch_analysis_is_comparable(a)
-
-                            if has_comparison:
-                                sign_m = "+" if a["diff_monthly"] >= 0 else ""
-                                sign_t = "+" if a["diff_total"] >= 0 else ""
-                                arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
-                                la_rows.append({
-                                    "Property": short,
-                                    "Launch": a["launch_month"].strftime("%b %Y"),
-                                    "Pre-PS Avg ($/mo)": f"${a['pre_avg']:,.0f}",
-                                    "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
-                                    "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
-                                    "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
-                                    "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo completed post · {a['n_post']}mo total",
-                                    "_sort": a["diff_monthly"],
-                                    "_comparable": True,
-                                })
-                            else:
-                                la_rows.append({
-                                    "Property": short,
-                                    "Launch": a["launch_month"].strftime("%b %Y"),
-                                    "Pre-PS Avg ($/mo)": "Live before window",
-                                    "Current Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
-                                    "Monthly Lift": "—",
-                                    "Cumulative Impact": "—",
-                                    "Window": f"{a['n_post']}mo after (no pre data)",
-                                    "_sort": -999999,
-                                    "_comparable": False,
-                                })
-
-                        # Sort: comparable properties first (by monthly change desc),
-                        # then non-comparable at the bottom
-                        la_rows.sort(key=lambda r: (not r["_comparable"], -r["_sort"] if r["_comparable"] else 0))
-                        for r in la_rows:
-                            del r["_sort"]
-                            del r["_comparable"]
-
-                        la_df = pd.DataFrame(la_rows)
-                        _render_table(la_df, height=500)
-
-                        # Count how many are excluded from the aggregate
-                        n_no_pre = sum(1 for a in launch_analysis.values() if a["n_pre"] == 0)
-                        if n_no_pre > 0:
+                        # -- Impact Breakdown Table --
+                        if launch_analysis:
+                            st.subheader("PetScreening Impact by Property")
                             st.caption(
-                                f"**{n_no_pre}** propert{'y' if n_no_pre == 1 else 'ies'} launched before the "
-                                f"lookback window — shown as 'Live before window' and **excluded** from "
-                                f"aggregate impact numbers above (no pre-launch baseline to compare)."
+                                "Sorted by biggest monthly revenue increase after PetScreening launch. "
+                                "Properties launched before the lookback window show 'Live before window' (no pre-launch data to compare)."
                             )
 
-                    # -- Monthly Revenue Table --
-                    st.divider()
-                    st.subheader("Monthly Revenue Table")
-                    monthly_table = []
-                    for month in months:
-                        row = {"Month": month.strftime("%b %Y"),
-                               "Total Revenue": monthly_portfolio.get(month, 0),
-                               "# Charges": monthly_portfolio_count.get(month, 0)}
-                        for prop in sorted(monthly_by_prop.keys()):
-                            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-                            row[short] = monthly_by_prop[prop].get(month, 0)
-                        monthly_table.append(row)
+                            la_rows = []
+                            for prop, a in launch_analysis.items():
+                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                    monthly_df = pd.DataFrame(monthly_table)
-                    _render_table(monthly_df, height=500)
+                                # Properties need observed pre-launch data and a meaningful baseline to compare.
+                                # A 1-2 month baseline is marked as low-data, but still contributes
+                                # so the table matches the top aggregate and individual chart lift badges.
+                                has_comparison = _launch_analysis_is_comparable(a)
 
-                    st.download_button(
-                        "Download Selected Charges CSV",
-                        data=cd["filtered_csv"],
-                        file_name=f"pet_rent_{label.replace(' ', '_')}.csv",
-                        mime="text/csv",
-                    )
+                                if has_comparison:
+                                    sign_m = "+" if a["diff_monthly"] >= 0 else ""
+                                    sign_t = "+" if a["diff_total"] >= 0 else ""
+                                    arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
+                                    la_rows.append({
+                                        "Property": short,
+                                        "Launch": a["launch_month"].strftime("%b %Y"),
+                                        "Pre-PS Avg ($/mo)": f"${a['pre_avg']:,.0f}",
+                                        "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
+                                        "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
+                                        "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
+                                        "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo completed post · {a['n_post']}mo total",
+                                        "_sort": a["diff_monthly"],
+                                        "_comparable": True,
+                                    })
+                                else:
+                                    la_rows.append({
+                                        "Property": short,
+                                        "Launch": a["launch_month"].strftime("%b %Y"),
+                                        "Pre-PS Avg ($/mo)": "Live before window",
+                                        "Current Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
+                                        "Monthly Lift": "—",
+                                        "Cumulative Impact": "—",
+                                        "Window": f"{a['n_post']}mo after (no pre data)",
+                                        "_sort": -999999,
+                                        "_comparable": False,
+                                    })
+
+                            # Sort: comparable properties first (by monthly change desc),
+                            # then non-comparable at the bottom
+                            la_rows.sort(key=lambda r: (not r["_comparable"], -r["_sort"] if r["_comparable"] else 0))
+                            for r in la_rows:
+                                del r["_sort"]
+                                del r["_comparable"]
+
+                            la_df = pd.DataFrame(la_rows)
+                            _render_table(la_df, height=500)
+
+                            # Count how many are excluded from the aggregate
+                            n_no_pre = sum(1 for a in launch_analysis.values() if a["n_pre"] == 0)
+                            if n_no_pre > 0:
+                                st.caption(
+                                    f"**{n_no_pre}** propert{'y' if n_no_pre == 1 else 'ies'} launched before the "
+                                    f"lookback window — shown as 'Live before window' and **excluded** from "
+                                    f"aggregate impact numbers above (no pre-launch baseline to compare)."
+                                )
+
+                        # -- Monthly Revenue Table --
+                        st.divider()
+                        st.subheader("Monthly Revenue Table")
+                        monthly_table = []
+                        for month in months:
+                            row = {"Month": month.strftime("%b %Y"),
+                                   "Total Revenue": monthly_portfolio.get(month, 0),
+                                   "# Charges": monthly_portfolio_count.get(month, 0)}
+                            for prop in sorted(monthly_by_prop.keys()):
+                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+                                row[short] = monthly_by_prop[prop].get(month, 0)
+                            monthly_table.append(row)
+
+                        monthly_df = pd.DataFrame(monthly_table)
+                        _render_table(monthly_df, height=500)
+
+                        st.download_button(
+                            "Download Selected Charges CSV",
+                            data=cd["filtered_csv"],
+                            file_name=f"pet_rent_{label.replace(' ', '_')}.csv",
+                            mime="text/csv",
+                        )
 
                 # ── 6. Per-Property Data Explorer ───────────────────────
                 st.divider()
-                with st.expander("Property Data Explorer (debug / compare individual charge rows)", expanded=False):
-                    st.caption(
-                        "**to_date** = coalesce(charge_to_date, move_out, lease_to) for past tenants. "
-                        "Current tenants show ACTIVE. **to_date_src** shows which date field was used."
-                    )
-                    all_props_sorted = sorted(monthly_by_prop.keys())
-                    short_to_full = {(p.split(" - ", 1)[-1] if " - " in p else p): p for p in all_props_sorted}
-                    explorer_prop = st.selectbox(
-                        "Select a property to inspect:",
-                        [""] + sorted(short_to_full.keys()),
-                        key="explorer_prop",
-                    )
-                    if explorer_prop:
-                        full_prop = short_to_full[explorer_prop]
+                # Developer-view only — hidden in the default client-facing view
+                if st.session_state.get("dev_view", False):
+                    with st.expander("Property Data Explorer (debug / compare individual charge rows)", expanded=False):
+                        st.caption(
+                            "**to_date** = coalesce(charge_to_date, move_out, lease_to) for past tenants. "
+                            "Current tenants show ACTIVE. **to_date_src** shows which date field was used."
+                        )
+                        all_props_sorted = sorted(monthly_by_prop.keys())
+                        short_to_full = {(p.split(" - ", 1)[-1] if " - " in p else p): p for p in all_props_sorted}
+                        explorer_prop = st.selectbox(
+                            "Select a property to inspect:",
+                            [""] + sorted(short_to_full.keys()),
+                            key="explorer_prop",
+                        )
+                        if explorer_prop:
+                            full_prop = short_to_full[explorer_prop]
 
-                        # Filter charges for this property
-                        prop_charges = [
-                            r for r in cd["parsed_charges"]
-                            if r["property_name"] == full_prop and r.get("amount", 0) > 0
-                        ]
-                        raw_df = pd.DataFrame(prop_charges) if prop_charges else pd.DataFrame()
-
-                        if not raw_df.empty:
-                            # ── Summary by charge code ──
-                            st.markdown("##### Charge Code Breakdown")
-                            code_summary = (
-                                raw_df.groupby("charge_code")
-                                .agg(
-                                    tenants=("tenant_code", "nunique"),
-                                    rows=("charge_code", "size"),
-                                    total=("amount", "sum"),
-                                    avg_amt=("amount", "mean"),
-                                    min_amt=("amount", "min"),
-                                    max_amt=("amount", "max"),
-                                )
-                                .sort_values("total", ascending=False)
-                                .reset_index()
-                            )
-                            code_summary.columns = [
-                                "Charge Code", "Unique Tenants", "Rows",
-                                "Total $", "Avg $/charge", "Min $", "Max $",
+                            # Filter charges for this property
+                            prop_charges = [
+                                r for r in cd["parsed_charges"]
+                                if r["property_name"] == full_prop and r.get("amount", 0) > 0
                             ]
-                            for col in ["Total $", "Avg $/charge", "Min $", "Max $"]:
-                                code_summary[col] = code_summary[col].apply(lambda x: f"${x:,.2f}")
-                            _render_table(code_summary)
+                            raw_df = pd.DataFrame(prop_charges) if prop_charges else pd.DataFrame()
 
-                            # ── Monthly breakdown ──
-                            st.markdown("##### Monthly Revenue")
-                            prop_monthly = monthly_by_prop.get(full_prop, {})
-                            prop_table = []
-                            for m in months:
-                                # Count charges active in this month
-                                active_in_month = [
-                                    rec for rec in prop_charges
-                                    if rec["from_date"] is not None
-                                    and not pd.isna(rec["from_date"])
-                                    and datetime(int(rec["from_date"].year), int(rec["from_date"].month), 1) <= m
-                                    and (
-                                        datetime(int(rec["to_date"].year), int(rec["to_date"].month), 1) >= m
-                                        if rec["to_date"] is not None and not pd.isna(rec["to_date"]) and isinstance(rec["to_date"], datetime)
-                                        else window_end >= m
+                            if not raw_df.empty:
+                                # ── Summary by charge code ──
+                                st.markdown("##### Charge Code Breakdown")
+                                code_summary = (
+                                    raw_df.groupby("charge_code")
+                                    .agg(
+                                        tenants=("tenant_code", "nunique"),
+                                        rows=("charge_code", "size"),
+                                        total=("amount", "sum"),
+                                        avg_amt=("amount", "mean"),
+                                        min_amt=("amount", "min"),
+                                        max_amt=("amount", "max"),
                                     )
-                                ]
-                                # Break down by charge code
-                                code_breakdown = defaultdict(float)
-                                for rec in active_in_month:
-                                    code_breakdown[rec.get("charge_code", "?")] += rec["amount"]
-                                breakdown_str = ", ".join(
-                                    f"{code}: ${val:,.0f}" for code, val in sorted(code_breakdown.items())
-                                ) if code_breakdown else ""
-
-                                prop_table.append({
-                                    "Month": m.strftime("%b %Y"),
-                                    "Revenue": f"${prop_monthly.get(m, 0):,.2f}",
-                                    "# Charges": len(active_in_month),
-                                    "# Tenants": len(set(r.get("tenant_code", "") for r in active_in_month)),
-                                    "By Code": breakdown_str,
-                                })
-                            st.caption(f"**{explorer_prop}** — monthly revenue for display window ({len(months)} months)")
-                            _render_table(pd.DataFrame(prop_table), height=400)
-
-                            # ── Full charge rows with tenant info ──
-                            st.markdown("##### All Charge Line Items")
-
-                            # Show which globally-selected codes exist for this property
-                            available_codes = sorted(raw_df["charge_code"].dropna().unique().tolist())
-                            missing_codes = [c for c in selected_codes if c not in available_codes]
-                            if missing_codes:
-                                st.info(
-                                    f"This property only has **{', '.join(available_codes)}** from your selected codes. \n"
-                                    f"Not found here: {', '.join(f'`{c}`' for c in missing_codes)} "
-                                    f"(those codes may not apply to this property)."
+                                    .sort_values("total", ascending=False)
+                                    .reset_index()
                                 )
+                                code_summary.columns = [
+                                    "Charge Code", "Unique Tenants", "Rows",
+                                    "Total $", "Avg $/charge", "Min $", "Max $",
+                                ]
+                                for col in ["Total $", "Avg $/charge", "Min $", "Max $"]:
+                                    code_summary[col] = code_summary[col].apply(lambda x: f"${x:,.2f}")
+                                _render_table(code_summary)
 
-                            # Optional: filter by charge code within explorer
-                            filter_code = st.multiselect(
-                                "Filter by charge code:",
-                                available_codes,
-                                default=available_codes,
-                                key="explorer_code_filter",
-                            )
-                            display_df = raw_df[raw_df["charge_code"].isin(filter_code)].copy() if filter_code else raw_df.copy()
+                                # ── Monthly breakdown ──
+                                st.markdown("##### Monthly Revenue")
+                                prop_monthly = monthly_by_prop.get(full_prop, {})
+                                prop_table = []
+                                for m in months:
+                                    # Count charges active in this month
+                                    active_in_month = [
+                                        rec for rec in prop_charges
+                                        if rec["from_date"] is not None
+                                        and not pd.isna(rec["from_date"])
+                                        and datetime(int(rec["from_date"].year), int(rec["from_date"].month), 1) <= m
+                                        and (
+                                            datetime(int(rec["to_date"].year), int(rec["to_date"].month), 1) >= m
+                                            if rec["to_date"] is not None and not pd.isna(rec["to_date"]) and isinstance(rec["to_date"], datetime)
+                                            else window_end >= m
+                                        )
+                                    ]
+                                    # Break down by charge code
+                                    code_breakdown = defaultdict(float)
+                                    for rec in active_in_month:
+                                        code_breakdown[rec.get("charge_code", "?")] += rec["amount"]
+                                    breakdown_str = ", ".join(
+                                        f"{code}: ${val:,.0f}" for code, val in sorted(code_breakdown.items())
+                                    ) if code_breakdown else ""
 
-                            display_df = display_df.sort_values(
-                                ["charge_code", "tenant_code", "from_date"],
-                                ascending=[True, True, False],
-                            )
-                            # Format dates
-                            display_df["from_date"] = display_df["from_date"].apply(
-                                lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) else "")
-                            display_df["to_date"] = display_df["to_date"].apply(
-                                lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) and isinstance(d, datetime) else "ACTIVE")
-                            display_df["amount"] = display_df["amount"].apply(lambda x: f"${x:,.2f}")
+                                    prop_table.append({
+                                        "Month": m.strftime("%b %Y"),
+                                        "Revenue": f"${prop_monthly.get(m, 0):,.2f}",
+                                        "# Charges": len(active_in_month),
+                                        "# Tenants": len(set(r.get("tenant_code", "") for r in active_in_month)),
+                                        "By Code": breakdown_str,
+                                    })
+                                st.caption(f"**{explorer_prop}** — monthly revenue for display window ({len(months)} months)")
+                                _render_table(pd.DataFrame(prop_table), height=400)
 
-                            # Build tenant name column
-                            display_df["tenant"] = (
-                                display_df.get("first_name", pd.Series(dtype=str)).fillna("")
-                                + " "
-                                + display_df.get("last_name", pd.Series(dtype=str)).fillna("")
-                            ).str.strip()
+                                # ── Full charge rows with tenant info ──
+                                st.markdown("##### All Charge Line Items")
 
-                            # to_date source indicator: shows where the end date came from
-                            def _to_date_source(row):
-                                raw = row.get("_raw_to_date")
-                                mo = row.get("_move_out_dt")
-                                lt = row.get("_lease_to_dt")
-                                if raw is not None and not pd.isna(raw):
-                                    return "charge"
-                                if mo is not None and not pd.isna(mo):
-                                    return "move_out"
-                                if lt is not None and not pd.isna(lt):
-                                    return "lease_end"
-                                return ""
-                            if "_raw_to_date" in display_df.columns:
-                                display_df["to_date_src"] = display_df.apply(_to_date_source, axis=1)
+                                # Show which globally-selected codes exist for this property
+                                available_codes = sorted(raw_df["charge_code"].dropna().unique().tolist())
+                                missing_codes = [c for c in selected_codes if c not in available_codes]
+                                if missing_codes:
+                                    st.info(
+                                        f"This property only has **{', '.join(available_codes)}** from your selected codes. \n"
+                                        f"Not found here: {', '.join(f'`{c}`' for c in missing_codes)} "
+                                        f"(those codes may not apply to this property)."
+                                    )
+
+                                # Optional: filter by charge code within explorer
+                                filter_code = st.multiselect(
+                                    "Filter by charge code:",
+                                    available_codes,
+                                    default=available_codes,
+                                    key="explorer_code_filter",
+                                )
+                                display_df = raw_df[raw_df["charge_code"].isin(filter_code)].copy() if filter_code else raw_df.copy()
+
+                                display_df = display_df.sort_values(
+                                    ["charge_code", "tenant_code", "from_date"],
+                                    ascending=[True, True, False],
+                                )
+                                # Format dates
+                                display_df["from_date"] = display_df["from_date"].apply(
+                                    lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) else "")
+                                display_df["to_date"] = display_df["to_date"].apply(
+                                    lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) and isinstance(d, datetime) else "ACTIVE")
+                                display_df["amount"] = display_df["amount"].apply(lambda x: f"${x:,.2f}")
+
+                                # Build tenant name column
+                                display_df["tenant"] = (
+                                    display_df.get("first_name", pd.Series(dtype=str)).fillna("")
+                                    + " "
+                                    + display_df.get("last_name", pd.Series(dtype=str)).fillna("")
+                                ).str.strip()
+
+                                # to_date source indicator: shows where the end date came from
+                                def _to_date_source(row):
+                                    raw = row.get("_raw_to_date")
+                                    mo = row.get("_move_out_dt")
+                                    lt = row.get("_lease_to_dt")
+                                    if raw is not None and not pd.isna(raw):
+                                        return "charge"
+                                    if mo is not None and not pd.isna(mo):
+                                        return "move_out"
+                                    if lt is not None and not pd.isna(lt):
+                                        return "lease_end"
+                                    return ""
+                                if "_raw_to_date" in display_df.columns:
+                                    display_df["to_date_src"] = display_df.apply(_to_date_source, axis=1)
+                                else:
+                                    display_df["to_date_src"] = ""
+
+                                show_cols = ["tenant_code", "tenant", "tenant_status",
+                                             "charge_code", "charge_type", "amount",
+                                             "from_date", "to_date", "to_date_src"]
+                                # Only show columns that exist
+                                show_cols = [c for c in show_cols if c in display_df.columns]
+
+                                st.caption(
+                                    f"**{explorer_prop}** — {len(display_df)} charge line items "
+                                    f"({display_df['tenant_code'].nunique() if 'tenant_code' in display_df.columns else '?'} unique tenants)"
+                                )
+                                _render_table(display_df[show_cols], height=500)
+
+                                # Download with all columns
+                                st.download_button(
+                                    f"Download {explorer_prop} charges",
+                                    data=display_df[show_cols].to_csv(index=False),
+                                    file_name=f"charges_{explorer_prop.replace(' ', '_')}.csv",
+                                    mime="text/csv",
+                                    key="explorer_dl",
+                                )
                             else:
-                                display_df["to_date_src"] = ""
-
-                            show_cols = ["tenant_code", "tenant", "tenant_status",
-                                         "charge_code", "charge_type", "amount",
-                                         "from_date", "to_date", "to_date_src"]
-                            # Only show columns that exist
-                            show_cols = [c for c in show_cols if c in display_df.columns]
-
-                            st.caption(
-                                f"**{explorer_prop}** — {len(display_df)} charge line items "
-                                f"({display_df['tenant_code'].nunique() if 'tenant_code' in display_df.columns else '?'} unique tenants)"
-                            )
-                            _render_table(display_df[show_cols], height=500)
-
-                            # Download with all columns
-                            st.download_button(
-                                f"Download {explorer_prop} charges",
-                                data=display_df[show_cols].to_csv(index=False),
-                                file_name=f"charges_{explorer_prop.replace(' ', '_')}.csv",
-                                mime="text/csv",
-                                key="explorer_dl",
-                            )
-                        else:
-                            st.info("No charge rows found for this property.")
+                                st.info("No charge rows found for this property.")
 
         # ─── TAB 2: Summary ──────────────────────────────────────
         with tab_next:
@@ -2512,8 +10966,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 
-                # Latest month revenue
-                _latest_month = _months[-1] if _months else None
+                # Latest observed month revenue
+                _latest_month = _latest_observed_revenue_month(_monthly_by_prop, _months) if _months else None
                 _current_monthly_rev = sum(
                     _monthly_by_prop[p].get(_latest_month, 0) for p in _monthly_by_prop
                 ) if _latest_month else 0
@@ -2525,9 +10979,24 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 # NOTE: property_doors_by_name is rebuilt AFTER the doors query below
 
-                # Determine adoption type from Charts tab overlay selection
+                # Adoption basis — an explicit control here instead of
+                # silently inheriting from the Charts overlay radio (which
+                # defaults to "None" → Unit without the user ever choosing).
                 _overlay_sel = st.session_state.get("adoption_overlay", "None")
-                if _overlay_sel == "Resident Adoption %":
+                _adopt_choice = st.radio(
+                    "Adoption basis for this summary and the PDF:",
+                    ["Unit Adoption", "Resident Adoption"],
+                    index=1 if _overlay_sel == "Resident Adoption %" else 0,
+                    horizontal=True,
+                    key="summary_adoption_basis",
+                    help=(
+                        "Unit adoption = % of units with a completed PetScreening "
+                        "profile; resident adoption = % of residents. Drives the "
+                        "adoption KPI and the projected-at-100% numbers everywhere "
+                        "in this summary and the generated reports."
+                    ),
+                )
+                if _adopt_choice == "Resident Adoption":
                     _adopt_key = "resident_adoption"
                     _adopt_type_label = "Resident"
                 else:
@@ -2569,7 +11038,11 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     / len(_projected_100)
                 ) if _projected_100 else None
 
-                # Missing pet rent summary (quick fetch if not cached)
+                # Missing pet rent summary. Previously this only read the
+                # session cache written by the Charts-tab toggles, so a user
+                # who never flipped "Show uncollected pet rent" got a PDF
+                # with no missing-rent tranche. Now the Summary tab computes
+                # it itself when absent (and shares the same cache keys).
                 _mr_total_profiles = 0
                 _mr_current_mo = 0
                 _mr_data = {}
@@ -2577,13 +11050,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     if k.startswith("missing_rent_") and isinstance(st.session_state[k], dict):
                         _mr_data = st.session_state[k]
                         break
+                if not _mr_data and selected_codes and _prop_ids:
+                    with st.spinner("Matching PetScreening tenants to charge data (uncollected pet rent)..."):
+                        _mr_data = fetch_missing_pet_rent_by_property(
+                            df, selected_codes, _prop_ids, _launch_dates, _months,
+                        )
+                    st.session_state[f"missing_rent_{hash(tuple(sorted(selected_codes)))}"] = _mr_data
                 if _mr_data:
                     _mr_total_profiles = sum(v["missing_count"] for v in _mr_data.values())
                     _mr_current_mo = sum(
                         v["monthly_missing"].get(_latest_month, 0) for v in _mr_data.values()
                     ) if _latest_month else 0
 
-                # Suspected undisclosed summary
+                # Suspected undisclosed summary — same auto-compute behavior.
                 _su_total_profiles = 0
                 _su_current_mo = 0
                 _su_data = {}
@@ -2591,6 +11070,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     if k.startswith("suspected_") and isinstance(st.session_state[k], dict):
                         _su_data = st.session_state[k]
                         break
+                if not _su_data and selected_codes and _prop_ids:
+                    with st.spinner("Computing suspected undisclosed pets..."):
+                        _su_data = fetch_suspected_undisclosed_by_property(
+                            df, selected_codes, _prop_ids, _launch_dates, _months,
+                        )
+                    st.session_state[f"suspected_{hash(tuple(sorted(selected_codes)))}"] = _su_data
                 if _su_data:
                     _su_total_profiles = sum(v["missing_count"] for v in _su_data.values())
                     _su_current_mo = sum(
@@ -2637,20 +11122,24 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     _prop_names_for_doors = list(_monthly_by_prop.keys())
                     _pid_list = [int(p) for p in st.session_state.get("property_ids", []) if str(p).strip()]
                     if _prop_names_for_doors or _pid_list:
+                        _doors_conn = get_snowflake_connection()
+                        _doors_cur = _doors_conn.cursor(snowflake.connector.DictCursor)
+
                         # Primary: QBR reporting table (most accurate unit counts)
                         if _prop_names_for_doors:
-                            _name_in = ", ".join(f"'{n.replace(chr(39), chr(39)+chr(39))}'" for n in _prop_names_for_doors)
-                            _doors_rows = run_query(f"""
+                            _name_placeholders = ", ".join(["%s"] * len(_prop_names_for_doors))
+                            _doors_cur.execute(f"""
                                 SELECT PROPERTY_NAME, PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
                                 FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
-                                WHERE PROPERTY_NAME IN ({_name_in})
+                                WHERE PROPERTY_NAME IN ({_name_placeholders})
                                   AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
                                   AND PROPERTY_NUMBER_OF_DOORS > 0
                                 QUALIFY ROW_NUMBER() OVER (
                                     PARTITION BY PROPERTY_NAME
                                     ORDER BY PROPERTY_NUMBER_OF_DOORS DESC
                                 ) = 1
-                            """)
+                            """, _prop_names_for_doors)
+                            _doors_rows = _doors_cur.fetchall()
                             if _doors_rows:
                                 for r in _doors_rows:
                                     _pid = int(r["PROPERTY_ID"]) if r.get("PROPERTY_ID") else None
@@ -2666,19 +11155,21 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         # Fallback: D_PROPERTIES by property_id (less accurate but works)
                         if not _units_from_doors and _pid_list:
                             _doors_ids = ", ".join(str(p) for p in _pid_list)
-                            _doors_rows = run_query(f"""
+                            _doors_cur.execute(f"""
                                 SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
                                 FROM PROD.COMMON.D_PROPERTIES
                                 WHERE PROPERTY_ID IN ({_doors_ids})
                                   AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
                                   AND PROPERTY_NUMBER_OF_DOORS > 0
                             """)
+                            _doors_rows = _doors_cur.fetchall()
                             if _doors_rows:
                                 for r in _doors_rows:
                                     _property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
                                 _total_units = sum(_property_doors.values())
                                 _units_from_doors = True
 
+                        _doors_cur.close()
                 except Exception:
                     pass
                 if not _units_from_doors:
@@ -2884,7 +11375,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     _glance_row1.append({
                         "value": f"{_total_units:,}",
                         "label": "Live Units",
-                        "sub": f"Across {n_props_with_data} properties",
+                        "sub": f"Across {_n_props(n_props_with_data)}",
                         "color": _dark_blue,
                     })
                 else:
@@ -3251,6 +11742,72 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 # ═══════════════════════════════════════════════════════════════
 
                 st.markdown("---")
+                # ═══════════════════════════════════════════════════════
+                #  PET RENT PRICING — what this portfolio charges (own data)
+                # ═══════════════════════════════════════════════════════
+                _benchmarks = None
+                _bm_key = f"benchmarks_{hash(tuple(sorted(str(p) for p in _prop_ids)))}_{hash(tuple(sorted(selected_codes or [])))}"
+                if _bm_key not in st.session_state:
+                    try:
+                        from benchmarks import build_pet_rent_pricing
+                        _bm_pet = df[df['charge_code'].isin(selected_codes)].copy()
+                        if not _bm_pet.empty:
+                            _bm_pet['_amt'] = pd.to_numeric(_bm_pet['charge_amount'], errors='coerce').fillna(0)
+                            _bm_pet['_from'] = _bm_pet['charge_from_date'].apply(parse_date)
+                            _bm_pet['_to'] = _bm_pet['charge_to_date'].apply(parse_date)
+                            _bm_class = _classify_pet_charge_codes(
+                                _bm_pet, st.session_state.get("pmc_system", "yardi"),
+                                st.session_state.get("charge_type_overrides", {}),
+                                system_by_pid=st.session_state.get("property_system_by_pid"),
+                            )
+                            _bm_rec_by_prop, _ = _estimate_property_fees(_bm_pet, _bm_class)
+                            _bm_recent = _recent_paying_charges(_bm_pet)
+                            _bm_rec_codes = {c for (_pn, c), cls in _bm_class.items() if cls == 'recurring'}
+                            _bm_paying = _bm_recent[_bm_recent['charge_code'].isin(_bm_rec_codes)]
+                            _bm_n_paying = (
+                                _bm_paying.groupby(['property_id', 'tenant_code']).ngroups
+                                if not _bm_paying.empty else 0
+                            )
+                            _bm_pricing = build_pet_rent_pricing(_bm_rec_by_prop, _bm_n_paying)
+                            st.session_state[_bm_key] = {"pricing": _bm_pricing} if _bm_pricing else None
+                        else:
+                            st.session_state[_bm_key] = None
+                    except Exception as _bm_exc:  # noqa: BLE001
+                        st.session_state[_bm_key] = None
+                        st.caption(f"Pricing summary unavailable: {str(_bm_exc)[:150]}")
+                _benchmarks = st.session_state.get(_bm_key)
+
+                if _benchmarks and _benchmarks.get("pricing"):
+                    _bmp = _benchmarks["pricing"]
+                    st.markdown(
+                        '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                        'color:#1F2257;margin:12px 0 4px 0">Pet Rent Pricing</p>'
+                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        'margin:0 0 8px 0">What this portfolio charges for recurring pet rent, from its own data.</p>',
+                        unsafe_allow_html=True,
+                    )
+                    if _bmp["n_props"] > 1:
+                        _f1, _f2, _f3 = st.columns(3)
+                        _f1.metric("Typical pet rent", f"${_bmp['median']:,.0f}/mo",
+                                   help=f"Median across {_bmp['n_props']:,} properties with recurring pet rent.")
+                        _f2.metric("Full range", f"${_bmp['min']:,.0f}–${_bmp['max']:,.0f}",
+                                   help="Lowest to highest property typical fee.")
+                        _f3.metric("Middle 50%", f"${_bmp['p25']:,.0f}–${_bmp['p75']:,.0f}",
+                                   help="25th–75th percentile of property typical fees.")
+                        if _bmp["max"] - _bmp["min"] > 10:
+                            st.caption(
+                                f"Fees span ${_bmp['min']:,.0f}–${_bmp['max']:,.0f}/mo across "
+                                f"{_bmp['n_props']:,} properties. A wide spread can be a pricing "
+                                f"opportunity — low-end properties may support rates closer to the "
+                                f"portfolio median of ${_bmp['median']:,.0f}/mo."
+                            )
+                    else:
+                        st.metric("Typical pet rent", f"${_bmp['median']:,.0f}/mo",
+                                  help="Recurring pet rent at this property.")
+                    st.caption("Basis: recurring pet-rent charges pulled live from your property "
+                               "management system for this report.")
+                    st.divider()
+
                 st.markdown(
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
                     'color:#1F2257;margin:0 0 4px 0">Download Impact Analysis</p>'
@@ -3274,6 +11831,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     help="Default uses simple lift (current - pre). Check this for portfolios "
                          "where current-month comparisons distort the story due to seasonality.",
                 )
+                _include_prop_charts = st.checkbox(
+                    "Include individual property charts in the PDF (appendix)",
+                    value=False,
+                    key="include_prop_charts_pdf",
+                    help="Appends the per-property before/after fee collection charts "
+                         "(same as the Fee Collection tab) for every comparable property, "
+                         "sorted by monthly lift. Adds ~1 page per 4 properties.",
+                )
 
                 _exec_col1, _exec_col2, _exec_col3 = st.columns(3)
 
@@ -3283,6 +11848,27 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                  key="gen_exec_btn",
                                  help="Build branded PDF and HTML reports"):
                         _pm_for_report = _pm_cache if _include_pm_in_report else None
+
+                        # Snapshot metrics (current + previous) — used for the
+                        # PDF "Progress Since Last Report" section and the
+                        # in-app delta table further below.
+                        _snap_label = f"{st.session_state.get('pmc_system', '')}::{_label}"
+                        _prev_snap, _prev_ts = (None, None)
+                        try:
+                            from fetch_cache import load_last_report_snapshot
+                            _prev_snap, _prev_ts = load_last_report_snapshot(_snap_label)
+                        except Exception:
+                            pass
+                        _simple_lift_now = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
+                        _now_snap = {
+                            "current_monthly_rev": float(_current_monthly_rev or 0),
+                            "monthly_lift": float((_agg_diff_mo if _use_avg_lift else _simple_lift_now) or 0),
+                            "missing_tenants": int(_mr_total_profiles or 0),
+                            "missing_monthly": float(_mr_current_mo or 0),
+                            "suspected_tenants": int(_su_total_profiles or 0),
+                            "avg_adoption": float(_avg_adoption) if _avg_adoption is not None else None,
+                            "comparable_count": int(len(_comparable) if _comparable else 0),
+                        }
 
                         # Generate PDF
                         # Build monthly revenue series for PDF chart
@@ -3333,13 +11919,15 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                         _interp = _prev_val + (_next_val - _prev_val) * _frac
                                         _pdf_monthly_series[_i] = (_pdf_monthly_series[_i][0], _interp)
 
-                        # Compute comparable-only current month revenue (apples-to-apples)
+                        # Compute comparable-only latest observed revenue (apples-to-apples)
                         _comp_current_rev_latest = 0
-                        if _comparable and _latest_month:
-                            _comp_current_rev_latest = sum(
-                                _monthly_by_prop.get(p, {}).get(_latest_month, 0)
-                                for p in _comparable
-                            )
+                        if _comparable:
+                            _comp_latest_month = _latest_observed_revenue_month(_monthly_by_prop, _months, _comparable.keys())
+                            if _comp_latest_month:
+                                _comp_current_rev_latest = sum(
+                                    _monthly_by_prop.get(p, {}).get(_comp_latest_month, 0)
+                                    for p in _comparable
+                                )
 
                         pdf_bytes = generate_tranche_pdf(
                             label=_label,
@@ -3374,6 +11962,18 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             latest_month=_latest_month,
                             selected_charge_codes=selected_codes,
                             avg_pet_fee=_avg_fee,
+                            include_property_charts=_include_prop_charts,
+                            benchmarks=_benchmarks,
+                            prev_snapshot=_prev_snap,
+                            prev_snapshot_ts=_prev_ts,
+                            current_snapshot=_now_snap,
+                            realpage_prop_count=sum(
+                                1 for v in (st.session_state.get("property_system_by_pid") or {}).values()
+                                if v == "real_page"
+                            ) if st.session_state.get("pmc_system") == "all" else (
+                                len(st.session_state.get("property_ids", []))
+                                if st.session_state.get("pmc_system") == "real_page" else 0
+                            ),
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
@@ -3417,6 +12017,164 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         )
                         st.session_state["exec_html"] = exec_html
                         st.session_state["exec_label"] = _label
+
+                        # Also build the Missing / Suspected CSVs here so all
+                        # three outputs (PDF + both CSVs) download from one
+                        # place — no tab-hopping.
+                        with st.spinner("Building Missing Pet Rent CSV..."):
+                            try:
+                                _csv_missing_df = generate_missing_pet_rent_report(df, selected_codes, _prop_ids)
+                                st.session_state["exec_missing_csv"] = (
+                                    _csv_missing_df.to_csv(index=False)
+                                    if _csv_missing_df is not None and not _csv_missing_df.empty else ""
+                                )
+                            except Exception as _csv_err:
+                                st.session_state["exec_missing_csv"] = ""
+                                st.warning(f"Missing Pet Rent CSV failed: {str(_csv_err)[:200]}")
+                        with st.spinner("Building Suspected Undisclosed CSV..."):
+                            try:
+                                _csv_susp_df = generate_suspected_undisclosed_report(df, selected_codes, _prop_ids)
+                                st.session_state["exec_suspected_csv"] = (
+                                    _csv_susp_df.to_csv(index=False)
+                                    if _csv_susp_df is not None and not _csv_susp_df.empty else ""
+                                )
+                            except Exception as _csv_err:
+                                st.session_state["exec_suspected_csv"] = ""
+                                st.warning(f"Suspected Undisclosed CSV failed: {str(_csv_err)[:200]}")
+
+                        # ── "Since last report" deltas + snapshot ──
+                        try:
+                            from fetch_cache import save_report_snapshot
+                            if _prev_snap:
+                                _delta_specs = [
+                                    ("current_monthly_rev", "Current revenue", "${:,.0f}/mo"),
+                                    ("monthly_lift", "Monthly lift", "${:,.0f}/mo"),
+                                    ("missing_tenants", "Missing pet rent tenants", "{:,.0f}"),
+                                    ("missing_monthly", "Uncollected revenue", "${:,.0f}/mo"),
+                                    ("suspected_tenants", "Suspected undisclosed", "{:,.0f}"),
+                                    ("avg_adoption", "Avg adoption", "{:.1f}%"),
+                                ]
+                                _delta_rows = []
+                                for _dk, _dl, _df_fmt in _delta_specs:
+                                    _new_v = _now_snap.get(_dk)
+                                    _old_v = _prev_snap.get(_dk)
+                                    if _new_v is None or _old_v is None:
+                                        continue
+                                    try:
+                                        _old_v = float(_old_v)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    _d = _new_v - _old_v
+                                    _delta_rows.append({
+                                        "Metric": _dl,
+                                        "Last report": _df_fmt.format(_old_v),
+                                        "Now": _df_fmt.format(_new_v),
+                                        "Change": ("+" if _d >= 0 else "") + _df_fmt.format(_d).replace("$-", "-$"),
+                                    })
+                                if _delta_rows:
+                                    st.markdown(
+                                        f"**Since last report ({str(_prev_ts)[:10]}):**"
+                                    )
+                                    _render_table(pd.DataFrame(_delta_rows))
+                            save_report_snapshot(_snap_label, _now_snap)
+                        except Exception as _snap_err:
+                            st.caption(f"Report deltas unavailable: {str(_snap_err)[:120]}")
+
+                        # ── Flag cohort for the reclaim-rate OKR ──
+                        # Persist WHO was flagged (with reason) so the next
+                        # quarter's run can measure how many started paying.
+                        try:
+                            from fetch_cache import save_flagged_tenants
+                            _flag_rows = []
+                            for _fpn, _fv in (_mr_data or {}).items():
+                                _fpid = _pid_lookup.get(_fpn)
+                                for _ft in _fv.get("missing_tenants", []):
+                                    _flag_rows.append({
+                                        "property_id": _fpid,
+                                        "property_name": _fpn,
+                                        "email": str(_ft.get("email") or "").lower().strip(),
+                                        "name": _ft.get("name", ""),
+                                        "reason": "missing_pet_rent",
+                                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                                    })
+                            for _fpn, _fv in (_su_data or {}).items():
+                                _fpid = _pid_lookup.get(_fpn)
+                                for _ft in _fv.get("missing_tenants", []):
+                                    _flag_rows.append({
+                                        "property_id": _fpid,
+                                        "property_name": _fpn,
+                                        "email": str(_ft.get("email") or "").lower().strip(),
+                                        "name": _ft.get("name", ""),
+                                        "reason": _ft.get("suspected_reason", "Other suspected"),
+                                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                                    })
+                            if _flag_rows:
+                                save_flagged_tenants(
+                                    _snap_label,
+                                    st.session_state.get("pmc_system", ""),
+                                    _prop_ids,
+                                    _flag_rows,
+                                )
+                                st.caption(
+                                    f"Reclaim tracking: {len(_flag_rows)} flagged tenants "
+                                    f"saved as this run's cohort."
+                                )
+                        except Exception as _flag_err:
+                            st.caption(f"Flag cohort not saved: {str(_flag_err)[:120]}")
+
+                        # ── Auto-append to the analytics snapshot tables ──
+                        # (RAW.MISC.PET_VALUE_*) — every Generate Report run
+                        # lands in Snowflake, same pattern as the fetch cache.
+                        try:
+                            import snapshot_tables as _snap_tbl
+                            _sel_parent_id = str(st.session_state.get("selected_ancestry_id") or "")
+                            _sel_parent_name = _label if _sel_parent_id else ""
+                            _n_users = _snap_tbl.append_users_snapshot(
+                                missing_df=locals().get("_csv_missing_df"),
+                                suspected_df=locals().get("_csv_susp_df"),
+                                pmc_system=st.session_state.get("pmc_system", ""),
+                                run_label=_snap_label,
+                                parent_id=_sel_parent_id,
+                                parent_name=_sel_parent_name,
+                            )
+                            _prop_rows = _snap_tbl.build_property_rows_from_report(
+                                st.session_state.get("pmc_system", ""),
+                                _mr_data, _su_data, _monthly_by_prop,
+                                _latest_month, _pid_lookup,
+                                doors_by_name=_property_doors_by_name,
+                                parent_id=_sel_parent_id,
+                                parent_name=_sel_parent_name,
+                            )
+                            _n_props_snap = _snap_tbl.append_property_snapshot(_prop_rows)
+                            if _sel_parent_id or st.session_state.get("selected_parent"):
+                                _snap_tbl.append_parent_snapshot({
+                                    "PMC": st.session_state.get("pmc_system", ""),
+                                    "PARENT_ID": _sel_parent_id,
+                                    "PARENT_NAME": _label,
+                                    "PROPERTY_COUNT": n_props_total,
+                                    "UNIT_COUNT": _total_units or None,
+                                    "COMPARABLE_COUNT": len(_comparable) if _comparable else None,
+                                    "PRE_REVENUE": _pre_baseline_total,
+                                    "CURRENT_REVENUE": _current_monthly_rev,
+                                    "MONTHLY_LIFT": _t1_mo,
+                                    "UNCOLLECTED_TENANTS": _t2_tenants,
+                                    "MISSING_MONTHLY_RENT": _t2_mo,
+                                    "SUSPECTED_UNDISCLOSED": _su_total_profiles,
+                                    "SUSPECTED_MONTHLY": _su_current_mo,
+                                    "AVG_UNIT_ADOPTION_PCT": _avg_adoption,
+                                    "PROPERTIES_WITH_LAUNCH": n_with_launch,
+                                    "PROPERTIES_WITH_DATA": n_props_with_data,
+                                    "TOTAL_PROPERTIES": n_props_total,
+                                    "ANNUALIZED_LIFT": (_t1_mo * 12) if _t1_mo else None,
+                                })
+                            if _n_users or _n_props_snap:
+                                st.caption(
+                                    f"Snapshot tables: +{_n_users} people, "
+                                    f"+{_n_props_snap} property rows appended to Snowflake."
+                                )
+                        except Exception as _snap_tbl_err:
+                            st.caption(f"Snapshot tables not appended: {str(_snap_tbl_err)[:120]}")
+
                         st.toast("Reports ready for download!")
 
                 # ── Enhanced PDF download ──
@@ -3453,6 +12211,47 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     else:
                         st.button("Download HTML", disabled=True,
                                   use_container_width=True, key="dl_html_disabled")
+
+                # ── Missing / Suspected CSVs (same outputs as the report tabs) ──
+                _csv_col1, _csv_col2 = st.columns(2)
+                _safe_csv_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
+                _csv_date = datetime.now().strftime('%Y%m%d')
+                with _csv_col1:
+                    if st.session_state.get("exec_missing_csv"):
+                        st.download_button(
+                            label="Missing Pet Rent CSV",
+                            data=st.session_state["exec_missing_csv"],
+                            file_name=f"missing_pet_rent_{_safe_csv_name}_{_csv_date}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_exec_missing_csv",
+                            help="Tenants with active household pet profiles who aren't paying the selected pet charges",
+                        )
+                    elif "exec_missing_csv" in st.session_state:
+                        st.button("Missing Pet Rent CSV — no rows", disabled=True,
+                                  use_container_width=True, key="dl_missing_csv_empty")
+                    else:
+                        st.button("Missing Pet Rent CSV", disabled=True,
+                                  use_container_width=True, key="dl_missing_csv_disabled",
+                                  help="Click 'Generate Report' first")
+                with _csv_col2:
+                    if st.session_state.get("exec_suspected_csv"):
+                        st.download_button(
+                            label="Suspected Undisclosed CSV",
+                            data=st.session_state["exec_suspected_csv"],
+                            file_name=f"suspected_undisclosed_{_safe_csv_name}_{_csv_date}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_exec_suspected_csv",
+                            help="Residents whose PetScreening signals suggest an undisclosed pet",
+                        )
+                    elif "exec_suspected_csv" in st.session_state:
+                        st.button("Suspected Undisclosed CSV — no rows", disabled=True,
+                                  use_container_width=True, key="dl_suspected_csv_empty")
+                    else:
+                        st.button("Suspected Undisclosed CSV", disabled=True,
+                                  use_container_width=True, key="dl_suspected_csv_disabled",
+                                  help="Click 'Generate Report' first")
 
 
         # ─── TAB 3: Missing Pet Rent Report ─────────────────────────
@@ -3741,10 +12540,29 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
             st.header("Documentation & SQL Reference")
             st.markdown("Everything that happens behind the scenes. Organized by **Shared Logic**, **Yardi-specific**, **Entrata-specific**, and **RealPage-specific**.")
 
+            with st.expander("**What's new — July 2026 overhaul**", expanded=True):
+                st.markdown("""
+| Area | Change |
+|---|---|
+| **All Systems mode** | One pull combines Yardi + Entrata + RealPage for a parent company: one dataset, one PDF, one CSV set. Fetch Results shows each property's source system. |
+| **RealPage** | Live OneSite API, **current-state only** (2 calls per property). No synthetic history → no lift for RealPage until RealPage authorizes `getresidentledger`. Missing/suspected candidates are filtered against the live resident roster. |
+| **Fetch cache** | Every pull appends to `RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA` and is reused for 7 days (sidebar → *Data reuse*). Append-only, so it doubles as our own history of what the APIs returned on each date. |
+| **Pet rent pricing** | The portfolio's own recurring pet-rent distribution (median, middle 50%, full range across its properties) — Summary tab + PDF. Replaced the earlier network benchmark + assistance-animal ratio. |
+| **Progress deltas** | Every *Generate Report* snapshots the headline metrics; the next report on the same selection shows a *Since Last Report* table (app + PDF). |
+| **Data health checks** | Six automated sanity checks on the Charts tab (launch dates, duplicates, cross-property emails, ...). |
+| **Calculation fixes** | Per-tenant **median** fee estimation, per-person dollar dedup, 90-day recency rule for "paying" matching. |
+| **AppFolio** | Hidden until API access (MFA) is resolved; provider code kept as a placeholder. |
+| **Developer view** | Sidebar toggle reveals raw exports, AR reconciliation, detail tables, and the property data explorer. |
+
+Deep-dive write-ups live in the repo: `docs/realpage-accuracy-audit.md`,
+`docs/yardi-entrata-staging-audit.md`, `docs/calc-audit-2026-07.md`,
+`docs/property-manager-endpoints.md`.
+                """)
+
             # ══════════════════════════════════════════════════════════
             #  SECTION: BOTH SYSTEMS
             # ══════════════════════════════════════════════════════════
-            st.subheader("Both Systems — Shared Logic")
+            st.subheader("Shared Logic — All Systems")
 
             with st.expander("**Property Selection — How properties are loaded**", expanded=False):
                 st.markdown("""
@@ -3849,6 +12667,58 @@ or **one-time deposit**. This determines how uncollected revenue is estimated:
 The estimated uncollected amount per missing tenant uses the **average (mean)** charge
 amount from tenants who ARE paying at that specific property (with portfolio-wide
 average as fallback if no payers at that property).
+                """)
+
+            with st.expander("**Fetch Cache — `CACHED_PET_VALUE_DATA` (reuse + our own history)**"):
+                st.markdown("""
+Every per-property API pull is appended to an **append-only Snowflake
+table** and reused for 7 days (configurable in the sidebar → *Data
+reuse*). Errors are never cached; partial cache hits fetch only the
+missing properties. Because nothing is deleted, the table doubles as our
+own record of what each PMS API returned on each date — independent of
+the EKS/Airbyte staging jobs.
+
+Query it directly:
+
+```sql
+SELECT PROPERTY_ID, FETCHED_AT,
+       DATA:charge_code::STRING      AS charge_code,
+       DATA:charge_amount::FLOAT     AS amount,
+       DATA:charge_from_date::STRING AS month
+FROM RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA
+WHERE RECORD_TYPE = 'charge'
+QUALIFY FETCH_ID = FIRST_VALUE(FETCH_ID) OVER (
+    PARTITION BY PROPERTY_ID ORDER BY FETCHED_AT DESC);
+```
+
+Row types: `charge`, `ar_charge`, `raw_lease`, `meta` (one per
+property-fetch: log row + counts + the RealPage live resident roster),
+and `snapshot` (report metrics powering the *Since Last Report* deltas;
+`PMC_SYSTEM = '_report'`). Table name is the `PET_VALUE_CACHE_TABLE` env
+var — move it to `RAW.MISC` once DEVELOPER gets `CREATE TABLE` there.
+                """)
+
+            with st.expander("**Pet Rent Pricing — methodology**"):
+                st.markdown("""
+The Summary tab / PDF **Pet Rent Pricing** section is built entirely from
+the portfolio's **own pulled data** (`benchmarks.py` →
+`build_pet_rent_pricing`) — no external market pool:
+
+- Each property's **typical recurring pet fee** comes from the same
+  `_estimate_property_fees` per-tenant-median logic used for missing-rent
+  estimation ($5–$200 plausibility band).
+- Across those per-property fees the section reports the **median**, the
+  **middle 50%** (p25–p75), and the **full range** (min–max), always with
+  the property count.
+- Single-property reports show just the property's typical fee — a range
+  over one property would be meaningless.
+
+The earlier network benchmark ("your state's median is $Y") and the
+assistance-animal share comparison were removed in July 2026: the fee
+pool's provenance was hard to defend and one state number is misleading
+for multi-state parents. A future own-book benchmark (state/zip
+percentiles materialized from the `RAW.MISC` snapshot tables) is the
+planned replacement; the old pool SQL lives in git history.
                 """)
 
             with st.expander("**Launch Date Handling — Charts & Impact Calculation**"):
@@ -4099,24 +12969,34 @@ This matches the Yardi behavior. Properties without active integrations are skip
 
             with st.expander("**RealPage / OneSite — Where the data comes from**", expanded=True):
                 st.markdown("""
-Unlike Yardi (live SOAP) or Entrata (live REST), RealPage data is read from
-Snowflake staging tables that are populated by a daily EKS job calling the
-OneSite SOAP API:
+**RealPage is fetched LIVE from the OneSite SOAP API** — 2 calls per property:
 
-| What | Source |
+| Call | What it returns |
 |---|---|
-| Scheduled charges | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES` |
-| Resident roster | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST` |
+| `getscheduledcharges` | Current residents' scheduled charges (today's snapshot) |
+| `getresidentlist` | ALL residents — Current + Former + Applicants — incl. balance fields |
 
-**Why we don't call the API live:**
+**Current-state only, by design.** Empirical testing
+(`docs/realpage-accuracy-audit.md`) proved the API cannot return history:
+the `postmonth` parameter is silently ignored (byte-identical responses
+for any value) and Former residents' charges return zero rows. Charge
+rows are therefore emitted for the **current month only** (plus one
+future month when pet rent is scheduled to start), and RealPage
+properties are excluded from the before/after lift analysis.
 
-1. RealPage's `getscheduledcharges` endpoint requires one SOAP call per
-   `(property, post_month)`. For a 100-property parent across 12 months
-   that's 1,200 calls per refresh — too slow for an interactive app.
-2. The two staging tables already give us everything we need: scheduled
-   charges (with their full `BillStart`/`BillEnd` lifetime ranges) and
-   the resident roster.
-3. The EKS job runs daily, so the data is fresh enough for analyst use.
+**Live resident roster filtering:** missing/suspected candidates must
+match a current (non-Former, not-moved-out) resident from
+`getresidentlist` — the reports reflect who lives there *today*, with no
+stale staging dependency. The roster is persisted with the cache payload
+so cached runs produce identical reports.
+
+**History (July 2026):** the app previously read Snowflake staging tables
+populated by a daily EKS job; audits found stale ingestion and properties
+with zero usable rows. A hybrid staging+live mode was built and then
+retired in favor of honest current-state reporting. `getresidentledger`
+**exists** on the RealPage gateway but our license key is not authorized —
+once RealPage grants it, true per-month history (including former
+residents) unlocks lift for RealPage.
 
 **Property identifier is composite:** `pmcid` + `siteid`, both extracted
 from `D_PROPERTIES.property_source_id` JSON. `property_source_name` is
@@ -4131,9 +13011,9 @@ against the integration table.
 
             with st.expander("**RealPage — Charge ↔ Resident Join Logic**"):
                 st.markdown("""
-The two staging tables are joined in a single SQL roundtrip in
-`fetch_realpage_for_properties`. The join logic mirrors the canonical
-pet-signals query used internally:
+Charges and residents are joined in Python
+(`realpage_live_api._join_and_emit`) using the same priority order as the
+canonical pet-signals SQL used internally (shown here for reference):
 
 ```sql
 -- Pick the representative resident per (pmc, site, lease)
@@ -4210,43 +13090,6 @@ This excludes it from the comparable set.
 than typical launch dates, so the guard never triggers.
                 """)
 
-            with st.expander("**RealPage — BillEnd Clipping (Bug 1 Fix)**"):
-                st.markdown("""
-OneSite stores open-ended (currently active) charges with `BillEnd =
-'2099-12-31'`. Without clipping, the existing revenue spreading code
-would count those charges into perpetuity — inflating both "current
-revenue" and (for properties that did have pre-PS data) the lift
-calculation.
-
-In a sample of 43 pet charges at Drift at the Forum, **41 (95%)** had
-`BillEnd = 2099-12-31`. The fix clips the effective end date in the
-SQL itself:
-
-```sql
-TO_CHAR(
-    LEAST(
-        bill_end,
-        COALESCE(move_out_date::TIMESTAMP_NTZ, bill_end),
-        CURRENT_TIMESTAMP::TIMESTAMP_NTZ
-    ),
-    'YYYY-MM-DD'
-) AS charge_to_date
-```
-
-**For Past tenants:** charge_to_date is clipped to their `move_out_date`,
-preserving their real historical revenue contribution while preventing
-phantom revenue accruing post-moveout.
-
-**For Current tenants:** charge_to_date is clipped to today, so we never
-count future months as observed revenue.
-
-**Future scheduled charges are preserved carefully.** Applicant/pending
-residents are not counted as current revenue, but if RealPage returns a
-future scheduled `PETRENT` row, the app keeps one future-month row so a
-resident already set up for pet rent does not look missing just because
-billing begins after today.
-                """)
-
             with st.expander("**RealPage — Charge Code Filter (CatCode='C' only)**"):
                 st.markdown("""
 OneSite uses two `CatCode` values that look superficially similar but
@@ -4273,8 +13116,10 @@ as pet-related.
 
             with st.expander("**RealPage — Known DevOps / Pipeline Issues**"):
                 st.markdown("""
-Flagged for the data engineering team to address; the app code mitigates
-where possible:
+**Historical context** — since July 2026 the app calls the OneSite API
+live and no longer reads these staging tables. The pipeline issues below
+remain open for the data engineering team (they matter for anyone else
+building on the staging layer):
 
 1. **`getscheduledcharges` parameter is silently ignored.**
    The EKS job's `MONTHS_BACK=2` setting does nothing — calling the
@@ -4458,8 +13303,8 @@ The **Summary** tab is designed for **VP-level skimming** — high-level numbers
 - **Projected at 100% Adoption** — what total revenue could be if every property reached 100% adoption
 
 **KPIs shown (Row 2 — Compliance):**
-- **Average Adoption** — mean adoption across properties with both revenue and adoption data. The adoption type (unit/resident) **matches your Charts tab overlay selection**.
-- **Tenants Not Paying Pet Rent** — total count from the uncollected pet rent analysis (requires toggle on Charts tab)
+- **Average Adoption** — mean adoption across properties with both revenue and adoption data. The adoption type (unit/resident) is set by the **radio on the Summary tab** (it defaults from the Charts overlay).
+- **Tenants Not Paying Pet Rent** — total count from the uncollected pet rent analysis (computed automatically; the Charts-tab toggle only controls the orange chart overlay)
 
 **Natural language story:** Auto-generated paragraph summarizing the key numbers in plain English.
 
@@ -4480,7 +13325,7 @@ Where `projected_100` = properties that have **both**:
 1. Latest-month revenue > $0 (from selected charge codes)
 2. Latest-month adoption data (from `R_QUARTERLY_BUSINESS_REVIEW_REPORTING`)
 
-If they ever differ, it means the data changed between tab renders (e.g., Streamlit reran with different slider settings). The adoption type (unit vs. resident) is controlled by the Charts tab overlay radio button and applies to both tabs.
+If they ever differ, it means the data changed between tab renders (e.g., Streamlit reran with different slider settings). The adoption type (unit vs. resident) is set by the radio on the Summary tab, which defaults from the Charts overlay selection.
                 """)
 
             with st.expander("**What is the lookback window slider and how does it affect results?**"):
@@ -4558,7 +13403,7 @@ The estimated revenue methodology is the same as confirmed missing rent (orange 
 
             with st.expander("Data Sources & Key Tables"):
                 st.markdown("""
-**Shared tables (both Yardi & Entrata):**
+**Shared tables (all systems):**
 
 | Table | Purpose |
 |-------|---------|
@@ -4585,6 +13430,18 @@ The estimated revenue methodology is the same as confirmed missing rent (orange 
 | Table | Purpose |
 |-------|---------|
 | `RAW.PMC_EXTERNAL_INTEGRATIONS.ENTRATA_GETLEASES` | Raw Entrata getLeases responses (fallback historical data) |
+
+**RealPage-only:**
+
+| Table | Purpose |
+|-------|---------|
+| `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST` | SQL fallback for the current-resident check when no live roster is available (cache hits use the roster persisted with the payload) |
+
+**Written by this app:**
+
+| Table | Purpose |
+|-------|---------|
+| `RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA` | Append-only per-property fetch cache + report snapshots (see the Fetch Cache expander above) |
                 """)
 
             with st.expander("Yardi GetRentroll API Call"):
@@ -4760,7 +13617,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        SIDEBAR SELECTION                            │
-│  User picks: System (Yardi/Entrata)                                 │
+│  User picks: System (All Systems / Yardi / Entrata / RealPage)      │
 │  + Parent Company Name / Ancestry ID / Property ID                  │
 └─────────────────┬───────────────────────────────────────────────────┘
                   │
@@ -4811,7 +13668,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
             st.subheader("Assumptions & Limitations")
             st.markdown("""
 **Both Systems:**
-- **Live API data only:** All charge data comes from the PMC API in real-time (Yardi GetRentroll SOAP or Entrata getLeases REST). We do NOT use stale Snowflake staging tables. If the API returns incomplete data (e.g., during maintenance windows), charts will reflect that.
+- **Live API data only:** All charge data comes from the PMC APIs in real time (Yardi GetRentroll SOAP, Entrata getLeases REST, RealPage OneSite SOAP). We do NOT read the PMC staging tables. RealPage is a current-state snapshot (no history — see the RealPage section). If an API returns incomplete data (e.g., during maintenance windows), charts will reflect that.
 - **Charge duration assumption:** A charge is assumed active for every month between its `charge_from_date` and `charge_to_date`. If `charge_to_date` is null and the tenant is "Current", the charge is assumed ongoing.
 - **Adoption = linear proxy for revenue:** The "projected at 100%" calculation assumes revenue scales linearly with adoption. The last units to comply may have fewer pets, so actual revenue at 100% may be lower.
 - **Uncollected pet rent estimate:** Uses the **average (mean) charge amount** from tenants who ARE paying at each specific property. Falls back to portfolio-wide average if no payers at a property.

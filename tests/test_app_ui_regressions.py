@@ -12,13 +12,20 @@ class _PandasStub:
 
 
 def _load_app_function(name):
+    return _load_app_functions(name)[name]
+
+
+def _load_app_functions(*names):
     module = ast.parse(APP_SOURCE)
-    for node in module.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            namespace = {"datetime": datetime, "pd": _PandasStub}
-            exec(compile(ast.Module(body=[node], type_ignores=[]), "app.py", "exec"), namespace)
-            return namespace[name]
-    raise AssertionError(f"{name} not found in app.py")
+    wanted = set(names)
+    nodes = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    found = {node.name for node in nodes}
+    missing = wanted - found
+    if missing:
+        raise AssertionError(f"Missing functions in app.py: {sorted(missing)}")
+    namespace = {"datetime": datetime, "pd": _PandasStub}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "app.py", "exec"), namespace)
+    return {name: namespace[name] for name in names}
 
 
 def test_compute_launch_analysis_uses_observed_pre_months_not_missing_calendar_zeroes():
@@ -67,9 +74,49 @@ def test_fee_collection_aggregate_uses_same_comparable_rule_as_individual_lift_b
     assert 'a.get("baseline_reliable", True)' not in comparable_source
 
 
+def test_latest_observed_month_falls_back_when_calendar_current_month_has_no_realpage_snapshot():
+    """RealPage snapshots may stop before the current calendar month; don't report false $0 current revenue."""
+    latest = _load_app_function("_latest_observed_revenue_month")
+    months = [
+        datetime(2026, 4, 1),
+        datetime(2026, 5, 1),
+        datetime(2026, 6, 1),
+    ]
+    monthly_by_prop = {
+        "AR Building": {
+            months[0]: 1200,
+            months[1]: 1300,
+        }
+    }
+
+    assert latest(monthly_by_prop, months) == months[1]
+    assert latest(monthly_by_prop, months, ["AR Building"]) == months[1]
+
+
+def test_current_monthly_revenue_uses_latest_observed_month_not_empty_calendar_month():
+    helpers = _load_app_functions("_latest_observed_revenue_month", "_current_monthly_revenue")
+    current_rev = helpers["_current_monthly_revenue"]
+    months = [
+        datetime(2026, 4, 1),
+        datetime(2026, 5, 1),
+        datetime(2026, 6, 1),
+    ]
+    monthly_by_prop = {
+        "AR Building": {
+            months[0]: 1200,
+            months[1]: 1300,
+        }
+    }
+
+    value, month = current_rev(monthly_by_prop, months, ["AR Building"])
+
+    assert value == 1300
+    assert month == months[1]
+
+
 def test_property_monthly_lift_for_display_uses_latest_month_minus_pre_baseline():
-    """Property chart lift should match default summary methodology: latest month - pre baseline."""
-    calc = _load_app_function("_property_monthly_lift_for_display")
+    """Property chart lift should match default summary methodology: latest observed month - pre baseline."""
+    calc = _load_app_functions("_latest_observed_revenue_month", "_current_monthly_revenue", "_property_monthly_lift_for_display")["_property_monthly_lift_for_display"]
     months = [
         datetime(2024, 1, 1),
         datetime(2024, 2, 1),
@@ -91,7 +138,7 @@ def test_property_monthly_lift_for_display_uses_latest_month_minus_pre_baseline(
 
 
 def test_property_monthly_lift_is_zero_when_only_real_pre_bar_matches_latest_month():
-    calc = _load_app_function("_property_monthly_lift_for_display")
+    calc = _load_app_functions("_latest_observed_revenue_month", "_current_monthly_revenue", "_property_monthly_lift_for_display")["_property_monthly_lift_for_display"]
     months = [datetime(2026, 6, 1), datetime(2026, 7, 1)]
     prop_data = {months[0]: 50, months[1]: 50}
 
@@ -176,3 +223,16 @@ def test_summary_tab_uses_at_a_glance_cards_instead_of_old_three_section_layout(
     assert "SECTION 1: VALUE CREATED" not in at_a_glance_source
     assert "SECTION 2: REVENUE OPPORTUNITY" not in at_a_glance_source
     assert "SECTION 3: PORTFOLIO HEALTH" not in at_a_glance_source
+
+
+def test_how_this_scales_is_opt_in_on_manual_portfolio_units():
+    """The PDF portfolio extrapolation ("How This Scales" + the ALL-units
+    callout) must only render when Total Portfolio Units was entered
+    manually — never fall back to data-derived total_units."""
+    assert "_effective_portfolio_units = total_portfolio_units if total_portfolio_units and total_portfolio_units > 0 else 0" in APP_SOURCE
+    assert "total_portfolio_units if total_portfolio_units > 0 else total_units" not in APP_SOURCE
+    assert "_effective_portfolio_units > 0 and _noncomp_count > 0" in APP_SOURCE
+
+    batch_source = Path("batch_pdf.py").read_text()
+    assert "total_portfolio_units=total_units" not in batch_source
+    assert "--portfolio-units" in batch_source
