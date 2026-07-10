@@ -1,36 +1,19 @@
-"""Chart builder functions for the Pet Rent analysis app."""
+"""Plotly chart builders for the portfolio and per-property views."""
 
-from datetime import datetime, timedelta
-
-import plotly.express as px
+from datetime import datetime
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.express as px
+from datetime import timedelta
 
-from analytics.launch_analysis import _resolve_launch_dt  # noqa: F401 (re-exported)
-
-
-def _property_monthly_lift_for_display(prop_data, months, analysis):
-    """Return one property's default Monthly Lift: latest revenue minus pre-PS baseline.
-
-    The portfolio headline uses current/latest month revenue minus the pre-PS
-    baseline. Individual property trend badges should use the same methodology
-    property-by-property, not the post-launch average stored in diff_monthly.
-    """
-    if not prop_data or not months or not analysis:
-        return 0
-    latest_month = months[-1]
-    return prop_data.get(latest_month, 0) - analysis.get("pre_avg", 0)
-
-
-# ─── Portfolio-level charts ───────────────────────────────────────────
-
+# ─── Chart builders ──────────────────────────────────────────────────
 def build_portfolio_chart(monthly_data, monthly_counts, months, title_prefix, cumulative=False, launch_analysis=None):
     """Build the aggregated portfolio bar + line chart."""
-    import itertools
     portfolio_values = [monthly_data.get(m, 0) for m in months]
     portfolio_counts = [monthly_counts.get(m, 0) for m in months]
 
     if cumulative:
+        import itertools
         portfolio_values = list(itertools.accumulate(portfolio_values))
         portfolio_counts = list(itertools.accumulate(portfolio_counts))
         mode_label = "Cumulative"
@@ -126,59 +109,71 @@ def build_stacked_area_chart(monthly_by_prop, months, title_prefix, cumulative=F
     return fig
 
 
-def build_current_snapshot_chart(monthly_by_prop, months, title_prefix):
-    """Horizontal bar chart of current month's revenue by property."""
-    latest_month = months[-1]
-    current = {}
-    for prop, month_data in monthly_by_prop.items():
-        val = month_data.get(latest_month, 0)
-        if val > 0:
-            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-            current[short] = val
+def _resolve_launch_dt(launch):
+    """Parse a launch date value into a datetime or None."""
+    if not launch:
+        return None
+    if isinstance(launch, str):
+        try:
+            return datetime.strptime(launch[:10], "%Y-%m-%d")
+        except:
+            return None
+    if hasattr(launch, 'year'):
+        return launch
+    return None
 
-    sorted_items = sorted(current.items(), key=lambda x: x[1], reverse=True)
-    if not sorted_items:
+
+def _latest_observed_revenue_month(monthly_by_prop, months, property_names=None):
+    """Return the latest month with observed revenue data in the requested scope.
+
+    `months[-1]` is the display/calendar window, not proof that every provider has
+    loaded data for that month. RealPage scheduled-charge rows are monthly
+    PostMonth snapshots; if the latest loaded snapshot is last month, asking for
+    the current calendar month fabricates a false $0 current revenue. Prefer the
+    calendar latest month only when it is actually present in the scoped revenue
+    series, otherwise fall back to the latest observed month.
+    """
+    if not monthly_by_prop or not months:
+        return None
+    scoped_names = list(property_names) if property_names is not None else list(monthly_by_prop.keys())
+    scoped_data = [monthly_by_prop.get(name, {}) for name in scoped_names]
+    scoped_data = [data for data in scoped_data if data]
+    if not scoped_data:
         return None
 
-    props = [x[0] for x in sorted_items]
-    vals = [x[1] for x in sorted_items]
+    calendar_latest = months[-1]
+    if any(calendar_latest in data for data in scoped_data):
+        return calendar_latest
 
-    fig = go.Figure(go.Bar(
-        x=vals,
-        y=props,
-        orientation='h',
-        marker_color='#677848',
-        text=[f"${v:,.0f}" for v in vals],
-        textposition='outside',
-        textfont=dict(size=12, color="#1F2257", family="Poppins, Arial, sans-serif"),
-    ))
-    # Dynamic left margin — enough for labels but not too wide for mobile
-    max_label_len = max((len(p) for p in props), default=10)
-    left_margin = min(200, max(80, max_label_len * 7))
-
-    fig.update_layout(
-        title=dict(
-            text=f"{title_prefix}: Current Monthly Fee Revenue by Property ({latest_month.strftime('%b %Y')})",
-            font=dict(size=14, color="#1F2257"),
-        ),
-        height=max(400, len(props) * 28),
-        autosize=True,
-        template="plotly_white",
-        xaxis_title="Monthly Revenue ($)",
-        yaxis=dict(
-            autorange="reversed",
-            tickfont=dict(size=12, color="#4F5155"),
-        ),
-        xaxis=dict(tickfont=dict(color="#4F5155")),
-        margin=dict(l=left_margin),
-        plot_bgcolor="white",
-        paper_bgcolor="#FAFAF8",
-        font=dict(family="Poppins, Arial, sans-serif", size=11, color="#4F5155"),
-    )
-    return fig
+    month_set = set(months)
+    observed = []
+    for data in scoped_data:
+        observed.extend(m for m in data.keys() if m in month_set)
+    return max(observed) if observed else calendar_latest
 
 
-# ─── Individual property charts ───────────────────────────────────────
+def _current_monthly_revenue(monthly_by_prop, months, property_names=None):
+    """Return (current revenue, month used), using latest observed data when needed."""
+    revenue_month = _latest_observed_revenue_month(monthly_by_prop, months, property_names)
+    if revenue_month is None:
+        return 0, None
+    scoped_names = list(property_names) if property_names is not None else list(monthly_by_prop.keys())
+    return sum(monthly_by_prop.get(name, {}).get(revenue_month, 0) for name in scoped_names), revenue_month
+
+
+def _property_monthly_lift_for_display(prop_data, months, analysis):
+    """Return one property's default Monthly Lift: latest observed revenue minus pre-PS baseline.
+
+    The portfolio headline uses current/latest observed month revenue minus the
+    pre-PS baseline. Individual property trend badges should use the same
+    methodology property-by-property, not the post-launch average stored in
+    diff_monthly.
+    """
+    if not prop_data or not months or not analysis:
+        return 0
+    current_rev, _revenue_month = _current_monthly_revenue({"_property": prop_data}, months, ["_property"])
+    return current_rev - analysis.get("pre_avg", 0)
+
 
 def build_individual_property_charts(
     monthly_by_prop, months, launch_dates, title_prefix,
@@ -545,4 +540,56 @@ def build_individual_property_charts(
     for ann in fig.layout.annotations:
         if ann.text and not ann.text.startswith("<"):
             ann.font = dict(size=12, color="#1F2257", family="Poppins, Arial, sans-serif")
+    return fig
+def build_current_snapshot_chart(monthly_by_prop, months, title_prefix):
+    """Horizontal bar chart of latest observed monthly revenue by property."""
+    latest_month = _latest_observed_revenue_month(monthly_by_prop, months)
+    if latest_month is None:
+        return None
+    current = {}
+    for prop, month_data in monthly_by_prop.items():
+        val = month_data.get(latest_month, 0)
+        if val > 0:
+            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+            current[short] = val
+
+    sorted_items = sorted(current.items(), key=lambda x: x[1], reverse=True)
+    if not sorted_items:
+        return None
+
+    props = [x[0] for x in sorted_items]
+    vals = [x[1] for x in sorted_items]
+
+    fig = go.Figure(go.Bar(
+        x=vals,
+        y=props,
+        orientation='h',
+        marker_color='#677848',
+        text=[f"${v:,.0f}" for v in vals],
+        textposition='outside',
+        textfont=dict(size=12, color="#1F2257", family="Poppins, Arial, sans-serif"),
+    ))
+    # Dynamic left margin — enough for labels but not too wide for mobile
+    max_label_len = max((len(p) for p in props), default=10)
+    left_margin = min(200, max(80, max_label_len * 7))
+
+    fig.update_layout(
+        title=dict(
+            text=f"{title_prefix}: Current Monthly Fee Revenue by Property ({latest_month.strftime('%b %Y')})",
+            font=dict(size=14, color="#1F2257"),
+        ),
+        height=max(400, len(props) * 28),
+        autosize=True,
+        template="plotly_white",
+        xaxis_title="Monthly Revenue ($)",
+        yaxis=dict(
+            autorange="reversed",
+            tickfont=dict(size=12, color="#4F5155"),
+        ),
+        xaxis=dict(tickfont=dict(color="#4F5155")),
+        margin=dict(l=left_margin),
+        plot_bgcolor="white",
+        paper_bgcolor="#FAFAF8",
+        font=dict(family="Poppins, Arial, sans-serif", size=11, color="#4F5155"),
+    )
     return fig

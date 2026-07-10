@@ -1,12 +1,11 @@
-"""HTML report generators (client-facing and executive summary)."""
+"""Branded HTML report + executive summary HTML."""
 
-import urllib.parse
-from collections import defaultdict
 from datetime import datetime
-
+from collections import defaultdict
+import urllib.parse
 from analytics.launch_analysis import _launch_analysis_is_comparable
-from components.ui_helpers import _PS_LOGO_WHITE_URI, _PS_LOGO_DARK_URI
-
+from components.charts import _latest_observed_revenue_month
+from components.ui_helpers import _PS_LOGO_DARK_URI, _PS_LOGO_WHITE_URI
 
 def generate_html_report(
     label, fig_individual, fig_snapshot, launch_analysis, monthly_by_prop, months,
@@ -38,7 +37,7 @@ def generate_html_report(
 
     # Simple lift: current month - pre baseline (across comparable)
     _html_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
-    _html_latest = months[-1] if months else None
+    _html_latest = _latest_observed_revenue_month(monthly_by_prop, months, comparable.keys()) if months else None
     _html_current_rev = sum(monthly_by_prop[p].get(_html_latest, 0) for p in comparable.keys()) if comparable and _html_latest else 0
     _html_simple_lift = _html_current_rev - _html_pre_baseline if _html_pre_baseline > 0 else 0
 
@@ -724,8 +723,6 @@ window.addEventListener('resize', resizePlotlyCharts);
 </body>
 </html>"""
     return html
-
-
 def generate_exec_summary_html(
     label, rev_change_mo, rev_change_total, avg_adoption, adopt_type_label,
     total_projected, total_additional, n_proj_props,

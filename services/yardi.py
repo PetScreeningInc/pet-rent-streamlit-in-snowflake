@@ -1,12 +1,18 @@
-"""Yardi SOAP helpers, Snowflake queries, and API fetch."""
+"""Yardi: Snowflake property/parent queries + live GetRentroll SOAP fetch."""
 
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
-
+from services.snowflake_io import get_app_secret as _get_app_secret
+from datetime import datetime
 import requests
+import snowflake.connector
 import streamlit as st
+from datetime import timedelta
+from datetime import timezone
+from services.snowflake_io import get_snowflake_connection
 
-from services.snowflake_io import run_query, get_secret
+YARDI_LICENSE_TOKEN = _get_app_secret("YARDI_LICENSE_TOKEN", "")
+
+# ─── SOAP / API helpers ─────────────────────────────────────────────
 SOAP_ACTION = "http://tempuri.org/YSI.Interfaces.WebServices/ItfResidentData/GetRentroll"
 SOAP_HEADERS = {
     "Content-Type": "text/xml; charset=utf-8",
@@ -14,11 +20,16 @@ SOAP_HEADERS = {
 }
 
 
-# ─── SOAP / XML helpers ──────────────────────────────────────────────
-
 def build_soap_payload(row: dict, license_token: str,
                        move_date: str, charge_from: str, charge_to: str) -> str:
-    """Build SOAP XML for GetRentroll."""
+    """Build SOAP XML for GetRentroll.
+
+    Parameters
+    ----------
+    move_date : str   – earliest MoveIn/MoveOut date (tenant filter)
+    charge_from : str – earliest lease-charge FromDate to return
+    charge_to : str   – latest date for lease-charge range (usually today)
+    """
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -166,14 +177,13 @@ def extract_charges_from_property(prop_data, property_row):
                     "charge_to_date": charge.get("ToDate", ""),
                 })
     return rows
-
-
-# ─── Snowflake queries ────────────────────────────────────────────────
-
+# ─── Snowflake queries ───────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_parent_companies():
     """Count ALL properties per parent company from d_properties (total + yardi-integrated)."""
-    return run_query("""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT
             p.parent_company_name,
             MAX(p.parent_company_ancestry_id)    AS ancestry_id,
@@ -192,11 +202,14 @@ def load_parent_companies():
         HAVING api_props > 0
         ORDER BY 1
     """)
+    return cur.fetchall()
 
 
 @st.cache_data(ttl=300)
 def load_all_properties():
-    return run_query("""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT DISTINCT
             p.property_id,
             p.property_name,
@@ -206,9 +219,13 @@ def load_all_properties():
         WHERE p.property_source_name = 'yardi'
         ORDER BY p.property_name
     """)
+    return cur.fetchall()
 
 
 def load_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
     where_clause = """
         WHERE i.system = 'yardi'
           AND p.property_source_name = 'yardi'
@@ -220,7 +237,7 @@ def load_properties_for_selection(parent_company_name=None, property_id=None, an
     if ancestry_id:
         where_clause += f" AND p.parent_company_ancestry_id = '{ancestry_id}'"
 
-    return run_query(f"""
+    cur.execute(f"""
         SELECT DISTINCT
             i.integration_id,
             PARSE_JSON(i.settings):"resident_data_url"::STRING AS resident_data_url,
@@ -247,10 +264,8 @@ def load_properties_for_selection(parent_company_name=None, property_id=None, an
         {where_clause}
         ORDER BY p.property_name
     """)
-
-
-# ─── Yardi API fetch ──────────────────────────────────────────────────
-
+    return cur.fetchall()
+# ─── Yardi API fetch ─────────────────────────────────────────────────
 def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months=24):
     """Call GetRentroll API for each property, return all charge rows.
 
@@ -280,7 +295,7 @@ def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookbac
         status_text.text(f"[{i+1}/{len(properties)}] Fetching {prop_name} ({prop_code})...")
 
         try:
-            payload = build_soap_payload(prop, get_secret("YARDI_LICENSE_TOKEN"), move_date, charge_from, charge_to)
+            payload = build_soap_payload(prop, YARDI_LICENSE_TOKEN, move_date, charge_from, charge_to)
             resp = requests.post(
                 prop['RESIDENT_DATA_URL'],
                 data=payload,
@@ -299,7 +314,7 @@ def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookbac
                 error_msg = "No data"
                 for m in ET.fromstring(resp.text).iter():
                     if "Message" in m.tag and m.text:
-                        error_msg = m.text.strip()[:200]
+                        error_msg = m.text.strip()[:60]
                         break
                 results_log.append({"property": prop_name, "code": prop_code, "status": f"Warning: {error_msg}", "charges": 0})
                 continue
@@ -311,7 +326,7 @@ def fetch_rentroll_for_properties(properties, progress_bar, status_text, lookbac
         except requests.exceptions.Timeout:
             results_log.append({"property": prop_name, "code": prop_code, "status": "Error: Timeout", "charges": 0})
         except Exception as exc:
-            results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: {str(exc)[:500]}", "charges": 0})
+            results_log.append({"property": prop_name, "code": prop_code, "status": f"Error: {str(exc)[:50]}", "charges": 0})
 
     progress_bar.progress(1.0)
     status_text.text("Done!")

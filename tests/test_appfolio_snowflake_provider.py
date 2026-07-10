@@ -2,7 +2,7 @@ import ast
 from datetime import date, datetime
 from pathlib import Path
 
-APP_SOURCE = Path("app.py").read_text()
+from app_source import APP_SOURCE  # modular layout: ordered source concatenation
 
 
 def _load_app_function(name):
@@ -101,13 +101,14 @@ def test_appfolio_is_routed_as_snowflake_backed_provider_with_live_api_toggle_pl
     assert "return load_appfolio_properties_for_selection(**kwargs)" in routing_source
     assert "appfolio_use_live_api" in routing_source
     assert "AppFolio live API is not enabled yet" in routing_source
-    assert "fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months)" in APP_SOURCE
+    assert "fetch_appfolio_for_properties(props, progress_bar, status_text, lookback_months)" in APP_SOURCE
     assert "t.tenant_unit_id" not in APP_SOURCE
     assert "LEFT JOIN latest_units u ON u.unit_id = t.unit_id" in APP_SOURCE
 
 
 def test_appfolio_recurring_classification_matches_realpage_provider_override():
-    assert 'pmc_system in ("real_page", "appfolio")' in APP_SOURCE
+    assert '_grp_system in ("real_page", "appfolio")' in APP_SOURCE
+    assert '_grp_sys in ("real_page", "appfolio")' in APP_SOURCE
     assert "AppFolio getrecurringcharges rows are recurring by endpoint semantics" in APP_SOURCE
 
 

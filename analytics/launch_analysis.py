@@ -1,14 +1,12 @@
-"""Launch analysis and compliance/adoption helpers."""
+"""Launch (before/after) analysis, data health checks, compliance/QBR data."""
 
-import streamlit as st
-import pandas as pd
 from datetime import datetime
+import pandas as pd
+import snowflake.connector
+import streamlit as st
+from services.snowflake_io import get_snowflake_connection
 
-from services.snowflake_io import run_query
-
-
-# ─── Date parsing helpers ─────────────────────────────────────────────
-
+# ─── Date parsing helper ─────────────────────────────────────────────
 def parse_date(d):
     if pd.isna(d) or not d or str(d).strip() == "":
         return None
@@ -20,22 +18,7 @@ def parse_date(d):
     return None
 
 
-def _resolve_launch_dt(launch):
-    """Parse a launch date value into a datetime or None."""
-    if not launch:
-        return None
-    if isinstance(launch, str):
-        try:
-            return datetime.strptime(launch[:10], "%Y-%m-%d")
-        except Exception:
-            return None
-    if hasattr(launch, 'year'):
-        return launch
-    return None
-
-
-# ─── Launch analysis ──────────────────────────────────────────────────
-
+# ─── Launch analysis ─────────────────────────────────────────────────
 def compute_launch_analysis(monthly_by_prop, months, launch_dates):
     """
     For each property with a launch date, compute:
@@ -70,7 +53,7 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
         if isinstance(launch, str):
             try:
                 launch = datetime.strptime(launch[:10], "%Y-%m-%d")
-            except Exception:
+            except:
                 continue
         # Convert pandas Timestamp / numpy datetime to pure Python datetime
         if hasattr(launch, 'to_pydatetime'):
@@ -190,6 +173,88 @@ def compute_launch_analysis(monthly_by_prop, months, launch_dates):
     return analysis
 
 
+def _run_data_health_checks(charges_df, monthly_by_prop, months, launch_dates):
+    """Automated sanity checks surfaced before presenting results.
+
+    Returns a list of {label, status: 'pass'|'warn', detail}. These catch
+    the data problems that erode trust when a client spots them first:
+    implausible launch dates, duplicate charges, tenants in two properties,
+    dead properties.
+    """
+    checks = []
+    now = datetime.now()
+
+    def _add(label, ok, detail_ok, detail_warn):
+        checks.append({
+            "label": label,
+            "status": "pass" if ok else "warn",
+            "detail": detail_ok if ok else detail_warn,
+        })
+
+    # 1. Launch dates plausible
+    bad_launch = []
+    for pname, ld in (launch_dates or {}).items():
+        try:
+            if ld is None or pd.isna(ld):
+                continue
+            y = int(getattr(ld, "year", 0))
+            if y and (y < 2018 or datetime(y, int(ld.month), 1) > now):
+                bad_launch.append(pname)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    _add("Launch dates plausible (2018 -> today)", not bad_launch,
+         "all within range",
+         f"{len(bad_launch)} suspicious: {', '.join(bad_launch[:3])}")
+
+    # 2. Charge data implies a launch date
+    no_launch = [p for p in (monthly_by_prop or {}) if p not in (launch_dates or {})]
+    _add("Every property with charge data has a launch date", not no_launch,
+         "no gaps",
+         f"{len(no_launch)} without launch date: {', '.join(no_launch[:3])}")
+
+    # 3. Same email active at multiple properties
+    multi_prop_emails = 0
+    if charges_df is not None and {"email", "property_id"}.issubset(charges_df.columns):
+        _em = charges_df[["email", "property_id"]].copy()
+        _em["email"] = _em["email"].astype(str).str.strip().str.lower()
+        _em = _em[~_em["email"].isin(("", "nan", "none"))]
+        if not _em.empty:
+            multi_prop_emails = int((_em.groupby("email")["property_id"].nunique() > 1).sum())
+    _add("Tenant emails unique to one property", multi_prop_emails == 0,
+         "no cross-property duplicates",
+         f"{multi_prop_emails} emails appear at 2+ properties (roommate moves or data issue)")
+
+    # 4. Exact duplicate charge rows
+    dup_rows = 0
+    if charges_df is not None and not charges_df.empty:
+        _dc = [c for c in ("property_id", "tenant_code", "charge_code",
+                           "charge_from_date", "charge_to_date", "charge_amount")
+               if c in charges_df.columns]
+        if _dc:
+            dup_rows = int(charges_df.duplicated(subset=_dc).sum())
+    _pct = (dup_rows / len(charges_df) * 100) if charges_df is not None and len(charges_df) else 0
+    _add("No duplicate charge rows", _pct < 1.0,
+         f"{dup_rows} exact duplicates ({_pct:.1f}%)",
+         f"{dup_rows} exact duplicates ({_pct:.1f}% of rows) -- check the source data")
+
+    # 5. Properties with $0 in every displayed month
+    zero_props = [p for p, d in (monthly_by_prop or {}).items()
+                  if d and not any(v > 0 for v in d.values())]
+    _add("No properties with $0 revenue in every month", not zero_props,
+         "all properties show revenue",
+         f"{len(zero_props)} all-zero: {', '.join(zero_props[:3])}")
+
+    # 6. Charge amounts parse as numbers
+    bad_amounts = 0
+    if charges_df is not None and "charge_amount" in charges_df.columns and len(charges_df):
+        bad_amounts = int(pd.to_numeric(charges_df["charge_amount"], errors="coerce").isna().sum())
+    _add("All charge amounts numeric", bad_amounts == 0,
+         "no parse failures",
+         f"{bad_amounts} rows with unparseable amounts (dropped from revenue)")
+
+    return checks
+
+
 def _launch_analysis_is_comparable(a):
     """Return True when a property can contribute to pre/post lift metrics.
 
@@ -201,8 +266,7 @@ def _launch_analysis_is_comparable(a):
     return bool(a and a.get("n_pre", 0) > 0 and a.get("baseline_meaningful", True))
 
 
-# ─── Compliance / adoption data from QBR table ───────────────────────
-
+# ─── Compliance / adoption data from QBR table ──────────────────────
 @st.cache_data(ttl=600)
 def fetch_compliance_data(property_ids_tuple):
     """
@@ -224,8 +288,10 @@ def fetch_compliance_data(property_ids_tuple):
     property_ids = list(property_ids_tuple)
     if not property_ids:
         return {}
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
     ids_str = ", ".join(str(int(pid)) for pid in property_ids)
-    rows = run_query(f"""
+    cur.execute(f"""
         SELECT
             PROPERTY_ID,
             PROPERTY_NAME,
@@ -240,6 +306,8 @@ def fetch_compliance_data(property_ids_tuple):
           AND (TOTAL_UNITS > 0 OR TOTAL_USERS > 0)
         ORDER BY PROPERTY_ID, PERIOD_MONTH
     """)
+    rows = cur.fetchall()
+    cur.close()
     result = {}
     for r in rows:
         pid = int(r["PROPERTY_ID"])  # normalize to Python int
@@ -249,7 +317,7 @@ def fetch_compliance_data(property_ids_tuple):
         elif isinstance(pm, str):
             try:
                 pm = datetime.strptime(pm[:10], "%Y-%m-%d")
-            except Exception:
+            except:
                 continue
         month_key = datetime(pm.year, pm.month, 1)
         au = r["ACTIVE_UNITS"] or 0

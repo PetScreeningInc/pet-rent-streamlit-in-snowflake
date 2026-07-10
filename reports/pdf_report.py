@@ -1,8 +1,25 @@
-"""PDF report generator (tranche/branded PDF)."""
+"""Branded executive PDF (fpdf2) — cards, narratives, charts, appendices."""
 
 from datetime import datetime
+from collections import defaultdict
+import io
+from datetime import timedelta
 
-from components.ui_helpers import _PS_LOGO_WHITE_URI, _PS_LOGO_DARK_URI  # noqa: F401
+def _n_props(n):
+    """'1 property' / '3 properties' — avoids '1 properties' in reports."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"{n} properties"
+    return f"{n} propert{'y' if n == 1 else 'ies'}"
+
+
+def _n_tenants(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f"{n} tenants"
+    return f"{n:,} tenant{'' if n == 1 else 's'}"
 
 
 def generate_tranche_pdf(
@@ -27,6 +44,12 @@ def generate_tranche_pdf(
     latest_month=None,
     selected_charge_codes=None,
     avg_pet_fee=0,
+    include_property_charts=False,
+    realpage_prop_count=0,
+    benchmarks=None,
+    prev_snapshot=None,
+    prev_snapshot_ts=None,
+    current_snapshot=None,
 ):
     """Generate a branded PDF with card-based KPIs + narrative storytelling.
 
@@ -465,7 +488,7 @@ def generate_tranche_pdf(
     _glance_parts = []
     if _has_comparable and _headline_units > 0:
         _glance_parts.append(
-            f"Across {comparable_count} comparable properties ({_headline_units:,} units) with "
+            f"Across {_n_props(comparable_count).replace('propert', 'comparable propert')} ({_headline_units:,} units) with "
             f"pre- and post-launch data, pet revenue before PetScreening was "
             f"${_headline_pre:,.0f}/mo."
         )
@@ -522,6 +545,36 @@ def generate_tranche_pdf(
 
     narrative("".join(_glance_parts))
 
+    # ── RealPage current-state disclosure ──
+    # Keeps the story straight when the selection includes RealPage
+    # properties: they contribute current revenue and the opportunity
+    # numbers (missing + suspected), but no before/after lift, because the
+    # RealPage API only exposes today's snapshot (ledger access pending).
+    if realpage_prop_count and realpage_prop_count > 0:
+        pdf.ln(1)
+        _rp_note_y = pdf.get_y()
+        pdf.set_fill_color(249, 244, 230)  # Dog Bone White accent
+        pdf.set_draw_color(226, 171, 88)   # golden accent bar
+        pdf.rect(PAGE_L, _rp_note_y, PAGE_R - PAGE_L, 11, style='F')
+        pdf.rect(PAGE_L, _rp_note_y, 1.2, 11, style='F')
+        pdf.set_line_width(0.8)
+        pdf.line(PAGE_L, _rp_note_y, PAGE_L, _rp_note_y + 11)
+        pdf.set_line_width(0.2)
+        pdf.set_xy(PAGE_L + 3, _rp_note_y + 1.5)
+        pdf.set_font('Helvetica', 'B', 8)
+        pdf.set_text_color(*dark_blue)
+        pdf.cell(0, 4, _pdf_safe('Data note - RealPage properties'), ln=True)
+        pdf.set_x(PAGE_L + 3)
+        pdf.set_font('Helvetica', '', 7.5)
+        pdf.set_text_color(*body_gray)
+        pdf.multi_cell(PAGE_R - PAGE_L - 6, 3.2, _pdf_safe(
+            f"{_n_props(realpage_prop_count)} in this report run{'s' if realpage_prop_count == 1 else ''} "
+            f"on RealPage, which provides a current-state snapshot only. RealPage data is "
+            f"included at today's collected revenue and in the uncollected/suspected "
+            f"opportunity figures, and is excluded from the before/after lift analysis."
+        ))
+        pdf.ln(2)
+
     pdf.ln(1)
 
     # ── KPI cards: 3 summary cards ──
@@ -537,7 +590,7 @@ def generate_tranche_pdf(
         _glance_row1.append({
             "value": f"{total_units:,}",
             "label": "Live Units",
-            "sub": f"Across {n_props_with_data} properties",
+            "sub": f"Across {_n_props(n_props_with_data)}",
             "color": dark_blue,
         })
     else:
@@ -730,9 +783,11 @@ def generate_tranche_pdf(
         )
 
     # ── Portfolio extrapolation callout (if non-comparable properties exist) ──
-    # Use total_units from the data when total_portfolio_units isn't manually set
-    _effective_portfolio_units = total_portfolio_units if total_portfolio_units > 0 else total_units
-    if _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
+    # Portfolio-wide extrapolation ("how this scales") is OPT-IN: it only
+    # renders when the Total Portfolio Units optional input was filled in
+    # before fetching. No manual value -> no projection anywhere in the PDF.
+    _effective_portfolio_units = total_portfolio_units if total_portfolio_units and total_portfolio_units > 0 else 0
+    if _effective_portfolio_units > 0 and _noncomp_count > 0 and _noncomp_units > 0 and _lift_per_unit > 0:
         pdf.ln(2)
         # Use the combined per-unit (actuals lift + found) so the zinger reflects
         # the same number we surface in the Total Opportunity row when possible.
@@ -782,8 +837,9 @@ def generate_tranche_pdf(
     # ═══════════════════════════════════════════════════════════
     # Use combined lift per unit (actuals + found) for scaling
     # Skip "How This Scales" for single-property PDFs -- only show for parent company reports
+    # Opt-in: requires the manually-entered Total Portfolio Units (see above).
     _scale_lift_per_unit = _cumulative_lift_per_unit if _leakage_mo > 0 and _cumulative_lift_per_unit > 0 else _lift_per_unit
-    _show_scaling = (n_props_total > 1 and _effective_portfolio_units and _effective_portfolio_units > 0 
+    _show_scaling = (n_props_total > 1 and _effective_portfolio_units > 0
                      and _scale_lift_per_unit != 0 and _scale_lift_per_unit > 0)
     if _show_scaling:
         pdf.ln(2)
@@ -1002,7 +1058,7 @@ def generate_tranche_pdf(
         {
             "value": f"{t2_tenants:,}" if t2_tenants > 0 else "0",
             "label": "Tenants Not Paying",
-            "sub": f"Across {t2_props} properties" if t2_tenants > 0 else "All tenants compliant",
+            "sub": f"Across {_n_props(t2_props)}" if t2_tenants > 0 else "All tenants compliant",
             "color": orange if t2_tenants > 0 else green,
         },
         {
@@ -1044,13 +1100,13 @@ def generate_tranche_pdf(
         if su_total_profiles and su_total_profiles > 0:
             if avg_pet_fee and avg_pet_fee > 0:
                 narrative(
-                    f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
+                    f"Additionally, {_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets "
                     f"(abandoned screening, unresolved requests). Using the same ${avg_pet_fee:,.0f}/mo "
                     f"avg fee, that represents ~${su_current_mo:,.0f}/mo in potential additional revenue."
                 )
             else:
                 narrative(
-                    f"Additionally, {su_total_profiles:,} tenants show signals of undisclosed pets "
+                    f"Additionally, {_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets "
                     f"(abandoned screening, unresolved requests), representing an estimated "
                     f"${su_current_mo:,.0f}/mo in potential additional revenue."
                 )
@@ -1058,14 +1114,14 @@ def generate_tranche_pdf(
         if avg_pet_fee and avg_pet_fee > 0:
             narrative(
                 f"No confirmed tenants are missing pet rent charges. However, "
-                f"{su_total_profiles:,} tenants show signals of undisclosed pets. Using the same "
+                f"{_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets. Using the same "
                 f"${avg_pet_fee:,.0f}/mo avg fee, that represents ~${su_current_mo:,.0f}/mo in "
                 f"potential additional revenue."
             )
         else:
             narrative(
                 f"No confirmed tenants are missing pet rent charges. However, "
-                f"{su_total_profiles:,} tenants show signals of undisclosed pets, representing "
+                f"{_n_tenants(su_total_profiles)} show{'s' if su_total_profiles == 1 else ''} signals of undisclosed pets, representing "
                 f"an estimated ${su_current_mo:,.0f}/mo in potential additional revenue."
             )
     else:
@@ -1098,7 +1154,7 @@ def generate_tranche_pdf(
         {
             "value": _adopt_str,
             "label": f"Avg {adopt_type_label} Adoption",
-            "sub": f"Across {n_props_with_data} properties",
+            "sub": f"Across {_n_props(n_props_with_data)}",
             "color": green if t3_adoption is not None and t3_adoption >= 50 else orange,
         },
         {
@@ -1152,6 +1208,109 @@ def generate_tranche_pdf(
         )
 
     # ═══════════════════════════════════════════════════════════
+    #  PROGRESS SINCE LAST REPORT (needs a prior snapshot)
+    # ═══════════════════════════════════════════════════════════
+    if prev_snapshot and current_snapshot:
+        try:
+            _good_c = (103, 120, 72)   # sage green
+            _bad_c = (207, 90, 63)     # rust orange
+            _ps_date = str(prev_snapshot_ts)[:10] if prev_snapshot_ts else "previous run"
+            _delta_specs = [
+                ("current_monthly_rev", "Current pet revenue", "${:,.0f}/mo", True),
+                ("monthly_lift", "Monthly lift", "${:,.0f}/mo", True),
+                ("missing_tenants", "Tenants missing pet rent", "{:,.0f}", False),
+                ("missing_monthly", "Uncollected revenue", "${:,.0f}/mo", False),
+                ("suspected_tenants", "Suspected undisclosed", "{:,.0f}", False),
+                ("avg_adoption", "Avg adoption", "{:.1f}%", True),
+            ]
+            _delta_rows = []
+            for _dk, _dl, _dfmt, _up_good in _delta_specs:
+                _nv, _ov = current_snapshot.get(_dk), prev_snapshot.get(_dk)
+                if _nv is None or _ov is None:
+                    continue
+                try:
+                    _nv, _ov = float(_nv), float(_ov)
+                except (TypeError, ValueError):
+                    continue
+                _delta_rows.append((_dl, _dfmt.format(_ov), _dfmt.format(_nv),
+                                    _nv - _ov, _dfmt, _up_good))
+            if _delta_rows:
+                section_heading('Progress Since Last Report', dark_blue)
+                narrative(f"Movement in the headline numbers since the report generated on {_ps_date}. "
+                          f"Green marks improvement.")
+                _pw = [58, 38, 38, 46]
+                pdf.set_fill_color(249, 244, 230)
+                pdf.set_draw_color(*card_border)
+                pdf.set_font('Helvetica', 'B', 8)
+                pdf.set_text_color(*dark_blue)
+                for _w, _h in zip(_pw, ("METRIC", "LAST REPORT", "NOW", "CHANGE")):
+                    pdf.cell(_w, 6, f" {_h}", border=1, fill=True)
+                pdf.ln()
+                pdf.set_font('Helvetica', '', 8)
+                for _i, (_dl, _olds, _news, _d, _dfmt, _up_good) in enumerate(_delta_rows):
+                    pdf.set_fill_color(255, 255, 255) if _i % 2 == 0 else pdf.set_fill_color(250, 250, 248)
+                    pdf.set_text_color(*body_gray)
+                    pdf.cell(_pw[0], 6, _pdf_safe(f" {_dl}"), border='LR', fill=True)
+                    pdf.cell(_pw[1], 6, f" {_olds}", border='LR', fill=True)
+                    pdf.set_text_color(*dark_blue)
+                    pdf.cell(_pw[2], 6, f" {_news}", border='LR', fill=True)
+                    _improved = (_d > 0) == _up_good and _d != 0
+                    pdf.set_text_color(*(_good_c if (_improved or _d == 0) else _bad_c))
+                    _chg = ("+" if _d >= 0 else "-") + _dfmt.format(abs(_d))
+                    if _d == 0:
+                        _chg = "no change"
+                    pdf.cell(_pw[3], 6, f" {_chg}", border='LR', fill=True)
+                    pdf.ln()
+                pdf.cell(sum(_pw), 0, '', border='T', ln=True)
+                pdf.ln(4)
+        except Exception as _prog_err:  # noqa: BLE001 — never break the report
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Progress section error: {str(_prog_err)[:80]}', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
+    #  PET RENT PRICING — what this portfolio charges (own data)
+    # ═══════════════════════════════════════════════════════════
+    if benchmarks and benchmarks.get("pricing"):
+        try:
+            section_heading('Pet Rent Pricing', dark_blue)
+            _bmp = benchmarks["pricing"]
+            _n_bp = _bmp["n_props"]
+            if _n_bp > 1:
+                draw_card_row([
+                    {"value": f"${_bmp['median']:,.0f}/mo", "label": "TYPICAL PET RENT",
+                     "sub": f"median across {_n_bp:,} properties"},
+                    {"value": f"${_bmp['min']:,.0f}-${_bmp['max']:,.0f}",
+                     "label": "FULL RANGE", "sub": "lowest to highest property"},
+                    {"value": f"${_bmp['p25']:,.0f}-${_bmp['p75']:,.0f}",
+                     "label": "MIDDLE 50%", "sub": "25th-75th percentile"},
+                ])
+                narrative(
+                    f"Across the {_n_bp:,} properties with recurring pet rent in this report, "
+                    f"monthly fees range from ${_bmp['min']:,.0f} to ${_bmp['max']:,.0f} "
+                    f"(median ${_bmp['median']:,.0f}/mo; the middle half charge "
+                    f"${_bmp['p25']:,.0f}-${_bmp['p75']:,.0f}/mo). A wide spread can be a "
+                    f"pricing opportunity: properties at the low end may support rates closer "
+                    f"to the portfolio median."
+                )
+            else:
+                draw_card_row([
+                    {"value": f"${_bmp['median']:,.0f}/mo", "label": "TYPICAL PET RENT",
+                     "sub": "recurring pet rent at this property"},
+                ])
+            pdf.set_font('Helvetica', 'I', 6.5)
+            pdf.set_text_color(*light_gray)
+            pdf.multi_cell(USABLE_W, 3, _pdf_safe(
+                "Basis: recurring pet-rent charges pulled live from your property management "
+                "system for this report (per-property typical fee, per-tenant medians)."
+            ))
+            pdf.ln(3)
+        except Exception as _bm_err:  # noqa: BLE001
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Pricing section error: {str(_bm_err)[:80]}', ln=True)
+
+    # ═══════════════════════════════════════════════════════════
     #  KEY METRICS TABLE (always starts on page 2)
     # ═══════════════════════════════════════════════════════════
     pdf.add_page()
@@ -1174,7 +1333,13 @@ def generate_tranche_pdf(
     # Revenue metric label/value based on toggle
     _km_rev = _comp_post_avg if (use_avg_lift and _comp_post_avg > 0) else current_monthly_rev
     _km_rev_label = "Post-PS Avg Pet Revenue (comparable)" if use_avg_lift else "Current Monthly Pet-Related Revenue (total portfolio)"
-    metrics.append(("Pre-PS Baseline", f"${pre_baseline:,.0f}/mo", None))
+    # "--" instead of "$0/mo" when there is no pre-launch data — a zero
+    # implies an observed baseline that does not exist (e.g. RealPage).
+    metrics.append((
+        "Pre-PS Baseline",
+        f"${pre_baseline:,.0f}/mo" if comparable_count > 0 else "--",
+        None,
+    ))
     metrics.append((_km_rev_label, f"${_km_rev:,.0f}/mo", None))
     if comparable_count > 0 and (_monthly_lift != 0 or t1_mo != 0):
         # Only show the methodology being used — less noise, fewer questions
@@ -1616,6 +1781,209 @@ def generate_tranche_pdf(
             pdf.set_text_color(*body_gray)
 
     # ═══════════════════════════════════════════════════════════
+    #  PORTFOLIO BEFORE/AFTER CHART (parent-company PDFs)
+    #  Aggregated pet fee revenue across the comparable properties —
+    #  the same set behind the lift KPIs — with the PS rollout window
+    #  and the combined pre-PS baseline. Blue = before first launch,
+    #  sage = during rollout, green = all comparable properties live.
+    # ═══════════════════════════════════════════════════════════
+    elif monthly_by_prop and len(monthly_by_prop) > 1 and latest_month:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+            from matplotlib.patches import Patch
+            from matplotlib.lines import Line2D
+
+            _comp_names = [p for p in (comparable_data or {}) if p in monthly_by_prop]
+            _scope_names = _comp_names if _comp_names else list(monthly_by_prop.keys())
+            _port_monthly = {}
+            for _pn in _scope_names:
+                for _m, _v in monthly_by_prop[_pn].items():
+                    _port_monthly[_m] = _port_monthly.get(_m, 0) + _v
+            _chart_months = sorted(_port_monthly.keys())
+            _chart_values = [_port_monthly[m] for m in _chart_months]
+
+            if len(_chart_months) >= 2:
+                _launches = sorted(
+                    comparable_data[_pn]["launch_month"] for _pn in _comp_names
+                    if comparable_data[_pn].get("launch_month")
+                )
+                _rollout_start = _launches[0] if _launches else None
+                _rollout_end = _launches[-1] if _launches else None
+                _pre_avg_total = sum(
+                    comparable_data[_pn].get("pre_avg", 0) for _pn in _comp_names
+                ) if _comp_names else 0
+
+                _bar_colors = []
+                for _m in _chart_months:
+                    if _rollout_start and _m < _rollout_start:
+                        _bar_colors.append('#7D9BC1')   # before any PS launch
+                    elif _rollout_end and _m < _rollout_end:
+                        _bar_colors.append('#A9B79A')   # rollout in progress
+                    else:
+                        _bar_colors.append('#677848')   # all comparable live
+
+                fig, ax1 = plt.subplots(figsize=(7, 3.5), dpi=150)
+                ax1.bar(_chart_months, _chart_values, color=_bar_colors, width=20,
+                        edgecolor='white', linewidth=0.3, zorder=2)
+                if _pre_avg_total > 0:
+                    ax1.axhline(y=_pre_avg_total, color='#E2AB58', linestyle=':',
+                                linewidth=1.5, zorder=3)
+                if _rollout_start:
+                    ax1.axvline(x=_rollout_start - timedelta(days=15), color='#CF5A3F',
+                                linestyle='--', linewidth=2, zorder=4)
+
+                ax1.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                ax1.spines['top'].set_visible(False)
+                ax1.spines['right'].set_visible(False)
+                ax1.spines['left'].set_color('#CCCCCC')
+                ax1.spines['bottom'].set_color('#CCCCCC')
+                ax1.tick_params(axis='both', colors='#4F5155', labelsize=8)
+                ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                ax1.set_ylabel('Monthly Pet Fee Revenue', fontsize=9, color='#4F5155')
+                _scope_label = (
+                    f'Comparable Properties ({len(_scope_names)})' if _comp_names
+                    else f'All Properties ({len(_scope_names)})'
+                )
+                ax1.set_title(f'Before & After PetScreening — {_scope_label}',
+                              fontsize=10, color='#1F2257', pad=10)
+                plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+                _legend_handles = [Patch(facecolor='#677848', edgecolor='white')]
+                _legend_labels = ['Post-rollout']
+                if any(c == '#A9B79A' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#A9B79A', edgecolor='white'))
+                    _legend_labels.append('PS rollout in progress')
+                if any(c == '#7D9BC1' for c in _bar_colors):
+                    _legend_handles.append(Patch(facecolor='#7D9BC1', edgecolor='white'))
+                    _legend_labels.append('Pre-PetScreening')
+                if _rollout_start:
+                    _legend_handles.append(Line2D([0], [0], color='#CF5A3F', linestyle='--', linewidth=2))
+                    _legend_labels.append('First PS Launch')
+                if _pre_avg_total > 0:
+                    _legend_handles.append(Line2D([0], [0], color='#E2AB58', linestyle=':', linewidth=1.5))
+                    _legend_labels.append(f'Pre-PS Baseline (${_pre_avg_total:,.0f}/mo)')
+                ax1.legend(_legend_handles, _legend_labels, loc='upper left', fontsize=7,
+                           framealpha=0.9, facecolor='white')
+
+                plt.tight_layout()
+                _chart_buf = io.BytesIO()
+                fig.savefig(_chart_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _chart_buf.seek(0)
+                plt.close(fig)
+
+                if pdf.get_y() + 75 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                else:
+                    pdf.ln(10)
+                pdf.image(_chart_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(65)
+        except Exception as _chart_err:
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Portfolio chart error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
+
+    # ═══════════════════════════════════════════════════════════
+    #  INDIVIDUAL PROPERTY CHARTS APPENDIX (optional)
+    #  The same before/after charts shown in the Fee Collection tab,
+    #  one per comparable property, sorted by monthly lift.
+    # ═══════════════════════════════════════════════════════════
+    if (include_property_charts and not _is_single_property
+            and monthly_by_prop and comparable_data):
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.ticker import FuncFormatter
+
+            _MAX_PROP_CHARTS = 40
+            _appendix_props = sorted(
+                (p for p in comparable_data if p in monthly_by_prop),
+                key=lambda p: -comparable_data[p].get("diff_monthly", 0),
+            )[:_MAX_PROP_CHARTS]
+
+            if _appendix_props:
+                pdf.add_page()
+                pdf.set_font('Helvetica', 'B', 13)
+                pdf.set_text_color(*dark_blue)
+                pdf.cell(0, 8, _pdf_safe('Appendix: Property Fee Collection Trends'), ln=True)
+                pdf.set_font('Helvetica', '', 8)
+                pdf.set_text_color(*body_gray)
+                _cap_note = (
+                    f'Before/after pet fee revenue for the {len(_appendix_props)} '
+                    f'comparable properties, sorted by monthly lift.'
+                )
+                if len(comparable_data) > _MAX_PROP_CHARTS:
+                    _cap_note += f' (Top {_MAX_PROP_CHARTS} of {len(comparable_data)} shown.)'
+                pdf.cell(0, 5, _pdf_safe(_cap_note), ln=True)
+                pdf.ln(2)
+
+            for _ap_name in _appendix_props:
+                _ap = comparable_data[_ap_name]
+                _ap_data = monthly_by_prop.get(_ap_name, {})
+                _ap_months = sorted(_ap_data.keys())
+                if len(_ap_months) < 2:
+                    continue
+                _ap_values = [_ap_data.get(m, 0) for m in _ap_months]
+                _ap_launch = _ap.get("launch_month")
+                _ap_pre = _ap.get("pre_avg", 0)
+                _ap_lift = _ap.get("diff_monthly", 0)
+
+                _colors = [
+                    '#7D9BC1' if (_ap_launch and m < _ap_launch) else '#677848'
+                    for m in _ap_months
+                ]
+                fig, ax = plt.subplots(figsize=(7, 2.1), dpi=140)
+                ax.bar(_ap_months, _ap_values, color=_colors, width=20,
+                       edgecolor='white', linewidth=0.3, zorder=2)
+                if _ap_pre > 0:
+                    ax.axhline(y=_ap_pre, color='#E2AB58', linestyle=':', linewidth=1.2, zorder=3)
+                if _ap_launch:
+                    ax.axvline(x=_ap_launch - timedelta(days=15), color='#CF5A3F',
+                               linestyle='--', linewidth=1.5, zorder=4)
+                ax.set_facecolor('#FAFAF8')
+                fig.patch.set_facecolor('#FAFAF8')
+                for side in ('top', 'right'):
+                    ax.spines[side].set_visible(False)
+                for side in ('left', 'bottom'):
+                    ax.spines[side].set_color('#CCCCCC')
+                ax.tick_params(axis='both', colors='#4F5155', labelsize=7)
+                ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %y'))
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=max(1, len(_ap_months) // 8)))
+                _sign = '+' if _ap_lift >= 0 else ''
+                ax.set_title(
+                    f'{_ap_name[:60]}  ({_sign}${_ap_lift:,.0f}/mo lift, '
+                    f'baseline ${_ap_pre:,.0f}/mo)',
+                    fontsize=8.5, color='#1F2257', loc='left', pad=6,
+                )
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                plt.tight_layout()
+
+                _buf = io.BytesIO()
+                fig.savefig(_buf, format='png', bbox_inches='tight', facecolor='#FAFAF8')
+                _buf.seek(0)
+                plt.close(fig)
+
+                if pdf.get_y() + 52 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+                pdf.image(_buf, x=15, y=pdf.get_y(), w=180)
+                pdf.ln(50)
+        except Exception as _chart_err:
+            pdf.set_font('Helvetica', 'I', 7)
+            pdf.set_text_color(200, 100, 100)
+            pdf.cell(0, 4, f'Property charts appendix error: {str(_chart_err)[:80]}', ln=True)
+            pdf.set_text_color(*body_gray)
+
+    # ═══════════════════════════════════════════════════════════
     #  MISSING RENT APPENDIX — TENANT LIST
     # ═══════════════════════════════════════════════════════════
     _has_tenant_detail = False
@@ -1781,5 +2149,3 @@ def generate_tranche_pdf(
     buf = io.BytesIO()
     pdf.output(buf)
     return buf.getvalue()
-
-

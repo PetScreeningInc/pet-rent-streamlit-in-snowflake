@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +151,24 @@ def load_properties(
 ) -> list[dict[str, Any]]:
     pd = __import__("pandas")
 
+    if pmc_system == "all":
+        # Combined mode: load from every system and tag each property with
+        # its source so the fetcher can route it correctly.
+        out: list[dict[str, Any]] = []
+        for _sys in ("yardi", "entrata", "real_page", "appfolio"):
+            try:
+                rows = load_properties(
+                    id_val=id_val, id_type=id_type, pmc_system=_sys,
+                    label=label, app_imports=app_imports,
+                )
+            except Exception:
+                rows = []
+            for r in rows:
+                tagged = dict(r)
+                tagged["_PMC_SYSTEM"] = _sys
+                out.append(tagged)
+        return out
+
     if pmc_system == "entrata":
         loader = app_imports["load_entrata_properties_for_selection"]
         if id_type == "parent":
@@ -218,6 +236,24 @@ def save_report_csv(
     return str(path.relative_to(output_dir))
 
 
+def existing_reports_for_id(output_dir: Path, id_val: str, report: str,
+                            resume_days: float) -> list[str]:
+    """Recent CSVs already produced for this ID (all requested types), or []."""
+    cutoff = datetime.now() - timedelta(days=resume_days)
+    needed = ["missing", "suspected"] if report == "both" else [report]
+    found: list[str] = []
+    id_part = sanitize_filename(id_val, 24)
+    for rt in needed:
+        hits = [
+            p for p in output_dir.glob(f"*/{rt}_*_{id_part}_*.csv")
+            if datetime.fromtimestamp(p.stat().st_mtime) >= cutoff
+        ]
+        if not hits:
+            return []
+        found.append(sorted(hits)[-1].name)
+    return found
+
+
 def process_single_id(
     *,
     id_val: str,
@@ -256,12 +292,21 @@ def process_single_id(
             label = args.label
         if pmc_system is None:
             raise ValueError("ID not found in PROD.COMMON.D_PROPERTIES")
-        if pmc_system not in ("yardi", "entrata", "real_page", "appfolio"):
+        if pmc_system not in ("yardi", "entrata", "real_page", "appfolio", "all"):
             raise ValueError(f"Unsupported PMC: {pmc_system}")
 
         label_text = str(label or id_val)
         row.update({"pmc": pmc_system, "label": label_text, "properties_found": prop_count or 0})
         st.session_state["pmc_system"] = pmc_system
+
+        # Yardi API is only served weekdays 9:00-18:00 local — defer instead
+        # of failing property by property.
+        from batch_pdf import yardi_window_open, id_needs_yardi
+        if id_needs_yardi(pmc_system) and not getattr(args, "ignore_yardi_window", False) \
+                and not yardi_window_open():
+            row["status"] = "deferred"
+            row["error"] = "outside Yardi API window (weekdays 9:00-18:00 local)"
+            return row
 
         print(f"  Found: {label_text} ({pmc_system.upper()}, {prop_count} properties)")
         properties = load_properties(
@@ -273,6 +318,12 @@ def process_single_id(
         )
         if not properties:
             raise ValueError("No properties found in selection")
+
+        # pid → source system map for combined-mode report builders
+        st.session_state["property_system_by_pid"] = {
+            str(p.get("PROPERTY_ID")): p.get("_PMC_SYSTEM", pmc_system)
+            for p in properties
+        }
 
         property_ids = property_ids_from(properties)
         row["properties_found"] = len(property_ids)
@@ -286,6 +337,8 @@ def process_single_id(
             app_imports,
             verbose=args.verbose,
             workers=args.workers or 1,
+            use_cache=not getattr(args, "no_cache", False),
+            cache_ttl_days=getattr(args, "cache_days", 7.0),
         )
         del fetch_log  # retained only for parity with batch_pdf fetch helper
 
@@ -339,6 +392,25 @@ def process_single_id(
                     timestamp=timestamp,
                 )
 
+        # ── Auto-append the person rows to RAW.MISC.PET_VALUE_USERS_SNAPSHOT ──
+        # Same pattern as the fetch cache: batch exports land in Snowflake on
+        # their own, so no more backfill runs for future pulls.
+        try:
+            import snapshot_tables as _snap_tbl
+            _is_parent = str(getattr(args, "type", "")) == "parent"
+            _n_snap = _snap_tbl.append_users_snapshot(
+                missing_df=locals().get("missing_df"),
+                suspected_df=locals().get("suspected_df"),
+                pmc_system=pmc_system,
+                run_label=f"{label_text} {id_val} {timestamp}",
+                parent_id=id_val if _is_parent else "",
+                parent_name=label_text if _is_parent else "",
+            )
+            if _n_snap:
+                print(f"    Users snapshot: +{_n_snap} rows appended to Snowflake")
+        except Exception as _snap_exc:  # noqa: BLE001 — never fail the export
+            print(f"    Users snapshot not appended: {str(_snap_exc)[:120]}")
+
         row["status"] = "success"
         if not row["missing_csv"] and not row["suspected_csv"]:
             row["status"] = "success_empty"
@@ -386,7 +458,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pmc",
-        choices=["yardi", "entrata", "real_page", "appfolio"],
+        choices=["yardi", "entrata", "real_page", "appfolio", "all"],
         default=None,
         help="Force PMC system; overrides auto-detection",
     )
@@ -396,6 +468,21 @@ def main() -> None:
         help="Override label for output filenames when grouping arbitrary IDs",
     )
     parser.add_argument("--verbose", action="store_true", help="Show detailed traces and fetch output")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Ignore the per-property fetch cache and re-hit the APIs")
+    parser.add_argument("--cache-days", type=float, default=7.0,
+                        help="Max age in days for cached per-property fetches (default 7)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip IDs whose requested CSV(s) already exist in the output "
+                             "folder from the last N days (see --resume-days)")
+    parser.add_argument("--resume-days", type=float, default=4.0,
+                        help="Look-back window for --resume (default 4 days)")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Retries per ID on transient errors (timeouts, 5xx, SOAP faults; default 2)")
+    parser.add_argument("--retry-wait", type=float, default=30.0,
+                        help="Base seconds between retries, doubled each attempt (default 30)")
+    parser.add_argument("--ignore-yardi-window", action="store_true",
+                        help="Attempt Yardi fetches even outside weekdays 9:00-18:00")
 
     args = parser.parse_args()
     ids = parse_ids(args)
@@ -439,21 +526,50 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-        success = failed = empty = 0
+        from batch_pdf import is_transient_error
+
+        success = failed = empty = skipped = deferred = 0
         for idx, id_val in enumerate(ids, 1):
             print(f"\n[{idx}/{len(ids)}] Processing {args.type} ID: {id_val}")
-            result = process_single_id(
-                id_val=id_val,
-                args=args,
-                output_dir=output_dir,
-                app_imports=app_imports,
-                conn=conn,
-                timestamp=timestamp,
-            )
+
+            if args.resume:
+                existing = existing_reports_for_id(output_dir, id_val, args.report, args.resume_days)
+                if existing:
+                    print(f"  ⟩ SKIPPED (resume: {', '.join(existing)})")
+                    writer.writerow({
+                        "id": id_val, "type": args.type, "status": "skipped",
+                        "error": "", "missing_csv": "", "suspected_csv": "",
+                        "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    f.flush()
+                    skipped += 1
+                    continue
+
+            _max_attempts = 1 + max(0, getattr(args, "retries", 2))
+            for _attempt in range(1, _max_attempts + 1):
+                result = process_single_id(
+                    id_val=id_val,
+                    args=args,
+                    output_dir=output_dir,
+                    app_imports=app_imports,
+                    conn=conn,
+                    timestamp=timestamp,
+                )
+                if result["status"] != "failed" or not is_transient_error(result.get("error")):
+                    break
+                if _attempt < _max_attempts:
+                    _backoff = getattr(args, "retry_wait", 30.0) * (2 ** (_attempt - 1))
+                    print(f"  ↻ Transient error (attempt {_attempt}/{_max_attempts}): "
+                          f"{str(result['error'])[:120]} — retrying in {_backoff:.0f}s")
+                    import time as _time
+                    _time.sleep(_backoff)
             writer.writerow(result)
             f.flush()
 
-            if result["status"] == "failed":
+            if result["status"] == "deferred":
+                deferred += 1
+                print(f"  ⏸ DEFERRED — {result['error']} (re-run with --resume during the window)")
+            elif result["status"] == "failed":
                 failed += 1
                 print(f"  ✗ {result['error']}")
             elif result["status"] == "success_empty":
@@ -469,7 +585,12 @@ def main() -> None:
                 )
 
     print("\n" + "=" * 60)
-    print(f"Complete: {success} succeeded, {empty} empty, {failed} failed")
+    summary = f"Complete: {success} succeeded, {empty} empty, {failed} failed"
+    if skipped:
+        summary += f", {skipped} skipped (resume)"
+    if deferred:
+        summary += f", {deferred} deferred (Yardi window — re-run weekdays 9:00-18:00)"
+    print(summary)
     print(f"CSVs saved under: {output_dir.absolute()}")
     print(f"Log saved to: {log_path.absolute()}")
 

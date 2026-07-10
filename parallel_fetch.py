@@ -167,47 +167,66 @@ def _fetch_one_yardi_property(prop: Dict, app_imports: Dict, license_token: str,
     prop_name = prop["PROPERTY_NAME"]
     prop_code = prop["PROPERTY_CODE"]
 
-    try:
-        payload = build_soap_payload(prop, license_token, move_date, charge_from, charge_to)
-        resp = requests.post(prop["RESIDENT_DATA_URL"], data=payload,
-                             headers=soap_headers, timeout=120)
-        if resp.status_code != 200:
+    import time as _time
+
+    # 1 try + 2 retries with linear backoff on transient failures
+    # (timeouts, HTTP 5xx, connection resets). Non-transient errors and
+    # empty responses return immediately.
+    max_attempts = 3
+    for _attempt in range(1, max_attempts + 1):
+        try:
+            payload = build_soap_payload(prop, license_token, move_date, charge_from, charge_to)
+            resp = requests.post(prop["RESIDENT_DATA_URL"], data=payload,
+                                 headers=soap_headers, timeout=120)
+            if resp.status_code != 200:
+                if resp.status_code >= 500 and _attempt < max_attempts:
+                    _time.sleep(3 * _attempt)
+                    continue
+                return {
+                    "charges": [],
+                    "log_entry": {"property": prop_name, "code": prop_code,
+                                  "status": f"Error: HTTP {resp.status_code}", "charges": 0},
+                }
+            parsed = xml_to_dict(resp.text)
+            extracted = extract_property(parsed)
+            if not extracted:
+                error_msg = "No data"
+                for m in ET.fromstring(resp.text).iter():
+                    if "Message" in m.tag and m.text:
+                        error_msg = m.text.strip()[:60]
+                        break
+                return {
+                    "charges": [],
+                    "log_entry": {"property": prop_name, "code": prop_code,
+                                  "status": f"Warning: {error_msg}", "charges": 0},
+                }
+            charges = extract_charges_from_prop(extracted, prop)
+            return {
+                "charges": charges,
+                "log_entry": {"property": prop_name, "code": prop_code,
+                              "status": "Success", "charges": len(charges)},
+            }
+        except requests.exceptions.Timeout:
+            if _attempt < max_attempts:
+                _time.sleep(3 * _attempt)
+                continue
             return {
                 "charges": [],
                 "log_entry": {"property": prop_name, "code": prop_code,
-                              "status": f"Error: HTTP {resp.status_code}", "charges": 0},
+                              "status": "Error: Timeout (after retries)", "charges": 0},
             }
-        parsed = xml_to_dict(resp.text)
-        extracted = extract_property(parsed)
-        if not extracted:
-            error_msg = "No data"
-            for m in ET.fromstring(resp.text).iter():
-                if "Message" in m.tag and m.text:
-                    error_msg = m.text.strip()[:60]
-                    break
+        except Exception as exc:
+            _msg = str(exc).lower()
+            if _attempt < max_attempts and any(
+                t in _msg for t in ("connection", "reset", "temporarily", "unavailable")
+            ):
+                _time.sleep(3 * _attempt)
+                continue
             return {
                 "charges": [],
                 "log_entry": {"property": prop_name, "code": prop_code,
-                              "status": f"Warning: {error_msg}", "charges": 0},
+                              "status": f"Error: {str(exc)[:50]}", "charges": 0},
             }
-        charges = extract_charges_from_prop(extracted, prop)
-        return {
-            "charges": charges,
-            "log_entry": {"property": prop_name, "code": prop_code,
-                          "status": "Success", "charges": len(charges)},
-        }
-    except requests.exceptions.Timeout:
-        return {
-            "charges": [],
-            "log_entry": {"property": prop_name, "code": prop_code,
-                          "status": "Error: Timeout", "charges": 0},
-        }
-    except Exception as exc:
-        return {
-            "charges": [],
-            "log_entry": {"property": prop_name, "code": prop_code,
-                          "status": f"Error: {str(exc)[:50]}", "charges": 0},
-        }
 
 
 def fetch_yardi_parallel(

@@ -1,15 +1,17 @@
-"""Suspected undisclosed pets — revenue estimation and downloadable report."""
+"""Suspected Undisclosed Pets: unresolved profile signals, no pet charges."""
 
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import snowflake.connector
 import streamlit as st
-from datetime import datetime
-
-from analytics.launch_analysis import parse_date, _resolve_launch_dt
-from analytics.missing_pet_rent import _build_paying_sets, _apply_paying_flag
+from analytics.launch_analysis import parse_date
+from analytics.missing_pet_rent import _apply_paying_flag, _build_paying_sets, _classify_pet_charge_codes, _dedup_missing_rows, _estimate_property_fees, _filter_realpage_profiles_to_live_residents, _recent_paying_charges, _unit_sources_sql
+from components.charts import _resolve_launch_dt
 from config import JUNK_EMAILS
-from services.snowflake_io import run_query
+from services.snowflake_io import get_snowflake_connection
 
+# ─── Suspected Undisclosed Pets ──────────────────────────────────────
 
 def fetch_suspected_undisclosed_by_property(
     all_charges_df, selected_codes, property_ids, launch_dates, months,
@@ -38,6 +40,8 @@ def fetch_suspected_undisclosed_by_property(
     }}
     """
     pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
 
     # ── Scope to properties that actually have PET-RELATED charge data ──
     _pet_charges_filter = all_charges_df[all_charges_df['charge_code'].isin(selected_codes)]
@@ -54,58 +58,24 @@ def fetch_suspected_undisclosed_by_property(
     pet_charges['_from'] = pet_charges['charge_from_date'].apply(parse_date)
     pet_charges['_to'] = pet_charges['charge_to_date'].apply(parse_date)
 
-    paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
+    # Current-state report → match against recently-active charges only
+    # (see _recent_paying_charges).
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
 
-    _has_frequency = 'frequency' in pet_charges.columns
-    code_class = {}
-    for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
-        if pmc_system in ("real_page", "appfolio"):
-            # RealPage / AppFolio scheduled charges are monthly snapshots, so the normalized
-            # one-month span should not make pet rent look like a one-time fee.
-            code_class[(pname, code)] = "recurring"
-        elif _has_frequency:
-            freqs = grp['frequency'].dropna().str.strip().str.lower()
-            onetime_count = (freqs == 'one-time').sum()
-            monthly_count = (freqs.isin(['monthly', 'recurring'])).sum()
-            code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
-        else:
-            spans = []
-            for _, row in grp.iterrows():
-                f, t = row['_from'], row['_to']
-                if f and t and not pd.isna(f) and not pd.isna(t):
-                    spans.append((t - f).days)
-            # No valid date spans → assume recurring (missing dates ≠ one-time)
-            median_span = float(np.median(spans)) if spans else None
-            if median_span is None:
-                code_class[(pname, code)] = "recurring"
-            else:
-                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
-
-    # Apply user overrides (from the charge type classification UI)
     try:
         _user_overrides = st.session_state.get("charge_type_overrides", {})
-        if _user_overrides:
-            for (pname, code) in list(code_class.keys()):
-                if code in _user_overrides:
-                    code_class[(pname, code)] = _user_overrides[code]
     except Exception:
-        pass
+        _user_overrides = {}
+    code_class = _classify_pet_charge_codes(
+        pet_charges, pmc_system, _user_overrides,
+        system_by_pid=st.session_state.get("property_system_by_pid"),
+    )
 
-    avg_recurring_by_prop = {}
-    avg_onetime_by_prop = {}
-    for pname, pgrp in pet_charges.groupby('property_name'):
-        rec_amts, ot_amts = [], []
-        for tc, tgrp in pgrp.groupby('tenant_code'):
-            for _, row in tgrp.iterrows():
-                cls = code_class.get((pname, row['charge_code']), 'recurring')
-                if cls == 'recurring':
-                    rec_amts.append(row['_amt'])
-                else:
-                    ot_amts.append(row['_amt'])
-        if rec_amts:
-            avg_recurring_by_prop[pname] = float(np.mean(rec_amts))
-        if ot_amts:
-            avg_onetime_by_prop[pname] = float(np.mean(ot_amts))
+    avg_recurring_by_prop, avg_onetime_by_prop = _estimate_property_fees(
+        pet_charges, code_class
+    )
 
     # Tenant info for lease dates
     tenant_info = {}
@@ -121,33 +91,33 @@ def fetch_suspected_undisclosed_by_property(
             'status': str(row.get('tenant_status', '')).strip().lower(),
         }
 
-    # Portfolio-wide fallback averages
+    # Portfolio-wide fallback (median across properties)
     _all_recurring = [v for v in avg_recurring_by_prop.values() if v > 0]
     _all_onetime = [v for v in avg_onetime_by_prop.values() if v > 0]
-    portfolio_avg_rec = float(np.mean(_all_recurring)) if _all_recurring else 0
-    portfolio_avg_ot = float(np.mean(_all_onetime)) if _all_onetime else 0
+    portfolio_avg_rec = float(np.median(_all_recurring)) if _all_recurring else 0
+    portfolio_avg_ot = float(np.median(_all_onetime)) if _all_onetime else 0
 
     realpage_current_resident_clause = ""
-    if pmc_system == 'real_page':
+    if pmc_system in ('real_page', 'all'):
         # RealPage current resident list is the freshness anchor for suspected
         # undisclosed pets too; otherwise old f_leases rows can surface prior
         # residents/leases as current opportunities.
         realpage_current_resident_clause = """
-      AND EXISTS (
+      AND (du.unit_source <> 'real_page' OR EXISTS (
           SELECT 1
           FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
-          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):"pmcid"::STRING
-            AND r.site_id = PARSE_JSON(p.property_source_id):"siteid"::STRING
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
             AND (
                 r.lease_id = COALESCE(
-                    l.lease_source_external_id:"lease_id"::STRING,
+                    l.lease_source_external_id:\"lease_id\"::STRING,
                     l.lease_external_id::STRING
                 )
                 OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
             )
             AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
             AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
-      )
+      ))
         """
 
     # ── Step 2: Query Snowflake for suspected undisclosed pets ──
@@ -190,7 +160,7 @@ def fetch_suspected_undisclosed_by_property(
         ON up.user_key = ue.user_key
     LEFT JOIN PROD.common.d_pet_profiles pp
         ON pp.pet_key = up.pet_key
-    WHERE du.unit_source = '{pmc_system}'
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
       AND du.property_id IN ({props_str})
       AND ue.compliance_status IN ('compliant', 'non_compliant')
       /* Exclude recommended AND expired assistance profiles — both at pet_profile and user_enriched level */
@@ -225,7 +195,9 @@ def fetch_suspected_undisclosed_by_property(
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
       {realpage_current_resident_clause}
     """
-    profiles_df = pd.DataFrame(run_query(sql_suspected))
+    cur.execute(sql_suspected)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
 
     if profiles_df.empty:
         return {}
@@ -233,9 +205,12 @@ def fetch_suspected_undisclosed_by_property(
     # ── Step 3: Exclude anyone already paying selected charges ──
     # Uses case-insensitive tc + email fallback; propagates across multi-lease users
     profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
 
     # ── Step 3b: Entrata freshness filter ──
-    if pmc_system == 'entrata' and 'email' in all_charges_df.columns:
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
         api_emails_by_prop = (
             all_charges_df
             .assign(
@@ -249,6 +224,8 @@ def fetch_suspected_undisclosed_by_property(
         )
         def _in_api_susp(row):
             pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
             em = str(row.get('USER_EMAIL', '')).strip().lower()
             return em in api_emails_by_prop.get(pid, set())
         profiles_df['_in_api'] = profiles_df.apply(_in_api_susp, axis=1)
@@ -286,7 +263,10 @@ def fetch_suspected_undisclosed_by_property(
         monthly_missing = {m: 0.0 for m in months}
         missing_tenants = []
 
-        for _, row in grp.iterrows():
+        # One row per person for the dollar estimation (duplicate lease rows
+        # would double-count the estimated fee).
+        _grp_dedup = _dedup_missing_rows(grp, pname, tenant_info)
+        for _, row in _grp_dedup.iterrows():
             tc = str(row['TENANT_CODE'])
             tinfo = tenant_info.get((pname, tc))
 
@@ -323,7 +303,7 @@ def fetch_suspected_undisclosed_by_property(
                         first_month_done = True
 
             # Build unit label: prefer unit_address_1, fall back to full_unit_address
-            _unit_label_s = str(row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
+            _unit_label_s = str(row.get('UNIT_ADDRESS_2', '') or row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
 
             missing_tenants.append({
                 "name": f"{row.get('USER_FIRST_NAME', '')} {row.get('USER_LAST_NAME', '')}".strip(),
@@ -364,29 +344,34 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
     undisclosed query criteria and adds suspected_reason column.
     """
     pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
-    # Step 1: From live API data, build paying tenant set (normalized)
-    paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
+    # Step 1: From live API data, build paying tenant set (normalized).
+    # Current-state report → only recently-active charges count as "paying".
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
 
     realpage_current_resident_clause = ""
-    if pmc_system == 'real_page':
+    if pmc_system in ('real_page', 'all'):
         realpage_current_resident_clause = """
-      AND EXISTS (
+      AND (du.unit_source <> 'real_page' OR EXISTS (
           SELECT 1
           FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
-          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):"pmcid"::STRING
-            AND r.site_id = PARSE_JSON(p.property_source_id):"siteid"::STRING
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
             AND (
                 r.lease_id = COALESCE(
-                    l.lease_source_external_id:"lease_id"::STRING,
+                    l.lease_source_external_id:\"lease_id\"::STRING,
                     l.lease_external_id::STRING
                 )
                 OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
             )
             AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
             AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
-      )
+      ))
         """
 
     # Step 2: Query Snowflake for suspected undisclosed profiles
@@ -434,7 +419,7 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
         ON up.user_key = ue.user_key
     LEFT JOIN PROD.common.d_pet_profiles pp
         ON pp.pet_key = up.pet_key
-    WHERE du.unit_source = '{pmc_system}'
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
       AND du.property_id IN ({props_str})
       AND ue.compliance_status IN ('compliant', 'non_compliant')
       /* Exclude recommended AND expired assistance profiles — both at pet_profile and user_enriched level */
@@ -469,7 +454,9 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
       {realpage_current_resident_clause}
     """
-    profiles_df = pd.DataFrame(run_query(sql))
+    cur.execute(sql)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
 
     if profiles_df.empty:
         return pd.DataFrame()
@@ -477,9 +464,12 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
     # Step 3: Exclude anyone already paying (case-insensitive tc + email fallback)
     # Propagates across multi-lease users — if any lease row is paying, all are
     profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
 
     # Step 3b: Entrata freshness filter
-    if pmc_system == 'entrata' and 'email' in all_charges_df.columns:
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
         api_emails_by_prop = (
             all_charges_df
             .assign(
@@ -493,6 +483,8 @@ def generate_suspected_undisclosed_report(all_charges_df, selected_codes, proper
         )
         def _in_api_susp_rpt(row):
             pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
             em = str(row.get('USER_EMAIL', '')).strip().lower()
             return em in api_emails_by_prop.get(pid, set())
         profiles_df['_in_api'] = profiles_df.apply(_in_api_susp_rpt, axis=1)

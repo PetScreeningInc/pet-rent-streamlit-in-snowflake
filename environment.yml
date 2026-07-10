@@ -13,4 +13,5 @@ dependencies:
   - python-dotenv=1.1.0
   - requests=2.31.0
   - snowflake-connector-python=3.18.0
+  - snowflake-snowpark-python=1.26.0
   - streamlit=1.42.0

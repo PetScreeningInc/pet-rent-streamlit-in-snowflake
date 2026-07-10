@@ -1,21 +1,25 @@
-"""Entrata API helpers, Snowflake queries, and fetch functions."""
+"""Entrata: Snowflake property/parent queries + live getLeases REST fetch."""
 
+from services.snowflake_io import get_app_secret as _get_app_secret
 import json
-
 import requests
+import snowflake.connector
 import streamlit as st
+from services.snowflake_io import get_snowflake_connection
 
-from services.snowflake_io import run_query, get_secret
-
+ENTRATA_API_KEY = _get_app_secret("ENTRATA_API_KEY", "")
 ENTRATA_BASE_URL = "https://apis.entrata.com/ext/orgs"
-
-
-# ─── Snowflake queries ────────────────────────────────────────────────
-
+# ─── Entrata Snowflake queries ────────────────────────────────────────
 @st.cache_data(ttl=300)
 def load_entrata_parent_companies():
-    """Count ALL properties per parent company that have Entrata integrations."""
-    return run_query("""
+    """Count ALL properties per parent company that have Entrata integrations.
+
+    total_props = every property under the parent company in d_properties
+    api_props   = only those with active Entrata API integrations
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT
             p.parent_company_name,
             MAX(p.parent_company_ancestry_id)    AS ancestry_id,
@@ -37,11 +41,14 @@ def load_entrata_parent_companies():
         HAVING api_props > 0
         ORDER BY 1
     """)
+    return cur.fetchall()
 
 
 @st.cache_data(ttl=300)
 def load_entrata_all_properties():
-    return run_query("""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT DISTINCT
             p.property_id,
             p.property_name,
@@ -51,9 +58,13 @@ def load_entrata_all_properties():
         WHERE p.property_source_name = 'entrata'
         ORDER BY p.property_name
     """)
+    return cur.fetchall()
 
 
 def load_entrata_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
     where_clause = """
         WHERE i.system = 'entrata'
           AND p.property_source_name = 'entrata'
@@ -70,7 +81,7 @@ def load_entrata_properties_for_selection(parent_company_name=None, property_id=
     if ancestry_id:
         where_clause += f" AND p.parent_company_ancestry_id = '{ancestry_id}'"
 
-    return run_query(f"""
+    cur.execute(f"""
         SELECT DISTINCT
             i.integration_id,
             PARSE_JSON(i.settings):"corp_id"::STRING AS corp_id,
@@ -88,14 +99,45 @@ def load_entrata_properties_for_selection(parent_company_name=None, property_id=
         {where_clause}
         ORDER BY p.property_name
     """)
+    return cur.fetchall()
 
 
-# ─── Entrata API fetch helpers ────────────────────────────────────────
-
+# ─── Entrata API fetch ────────────────────────────────────────────────
 def _extract_charges_from_entrata_lease(lease_obj, property_row):
-    """Flatten an Entrata lease JSON into rows matching the Yardi all_charges_df shape."""
+    """Flatten an Entrata lease JSON into rows matching the Yardi all_charges_df shape.
+
+    Key Entrata-specific handling vs Yardi:
+
+    1. **Interval filtering** — Entrata leases can contain multiple intervals
+       (original, renewals, cancelled attempts). We only include charges from
+       intervals with status Current / Past / Notice.  Cancelled / Applicant /
+       Future intervals are dropped so we don't count revenue from leases that
+       never went live.
+
+    2. **Charge→interval linkage** — Each scheduledCharge carries a
+       leaseIntervalId that ties it to a specific interval.  We use this to
+       skip charges attached to cancelled renewal attempts.
+
+    3. **Deduplication key** — Charges belong to the *lease*, not an individual
+       customer.  Every customer row for the same lease has identical charges.
+       We still emit one row per customer×charge (so all customers appear in
+       the paying-set for missing-pet-rent matching), but stamp each row with
+       ``_entrata_charge_dedup_key`` so downstream revenue aggregation can
+       ``drop_duplicates`` before summing.
+
+    4. **Frequency-based end-date logic** — Entrata provides a ``frequency``
+       field on each charge.  One-Time charges get charge_to = charge_from
+       (same day) so they don't get spread across months.  Monthly charges
+       with no endDate fall back to the interval's lease_to.
+
+    5. **Status field choice** — We filter on ``leaseIntervalStatus`` (did the
+       lease go live?) NOT ``leaseCustomerStatus`` (is this person still on
+       the lease?).  A guarantor with customerStatus="Cancelled" on a
+       "Notice" lease should not cause us to drop the lease's charges.
+    """
     rows = []
 
+    # ── Parse customers ────────────────────────────────────────────────
     customers_data = lease_obj.get("customers", {})
     customers = customers_data.get("customer", [])
     if isinstance(customers, dict):
@@ -103,6 +145,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
     if not customers:
         return rows
 
+    # ── Parse lease intervals — find valid ones ────────────────────────
     VALID_INTERVAL_STATUSES = {"current", "past", "notice"}
     INVALID_INTERVAL_STATUSES = {"cancelled", "applicant", "denied", "future"}
 
@@ -112,7 +155,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
         intervals = [intervals]
 
     valid_interval_ids = set()
-    interval_info = {}
+    interval_info = {}  # interval_id → {status, startDate, endDate}
     for iv in intervals:
         iv_id = str(iv.get("id", ""))
         iv_status = str(iv.get("status", "")).strip().lower()
@@ -124,6 +167,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
                 "end": iv.get("endDate", ""),
             }
 
+    # Fallback: if no detailed intervals, check top-level lease fields
     top_level_status = str(lease_obj.get("leaseIntervalStatus", "")).strip().lower()
     top_level_interval_id = str(lease_obj.get("leaseIntervalId", ""))
     if not valid_interval_ids and top_level_status not in INVALID_INTERVAL_STATUSES:
@@ -137,6 +181,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
     if not valid_interval_ids:
         return rows
 
+    # ── Parse lease activities for date fallbacks ──────────────────────
     activities_data = lease_obj.get("leaseActivities", {})
     activities = activities_data.get("leasesActivity", [])
     if isinstance(activities, dict):
@@ -155,6 +200,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
     unit_number = lease_obj.get("unitNumberSpace", "")
     unit_id = lease_obj.get("unitId", "")
 
+    # ── Parse scheduled charges — keep only valid-interval charges ─────
     charges_data = lease_obj.get("scheduledCharges", {})
     charges = charges_data.get("scheduledCharge", [])
     if isinstance(charges, dict):
@@ -164,6 +210,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
     for ch in charges:
         ch_interval_id = str(ch.get("leaseIntervalId", ""))
 
+        # If the charge has an interval ID, skip unless that interval is valid
         if ch_interval_id and ch_interval_id not in valid_interval_ids:
             continue
 
@@ -175,10 +222,13 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
         charge_from = ch.get("startDate", "")
         charge_to = ch.get("endDate", "")
 
+        # ── Frequency-based end-date logic ──
         freq_lower = (frequency or "").strip().lower()
         if freq_lower == "one-time":
+            # One-time charges: same day, do NOT spread across months
             charge_to = charge_from
         elif not charge_to or str(charge_to).strip() == "":
+            # Monthly charges missing endDate → fall back to interval lease_to
             charge_to = iv_lease_to
 
         valid_charges.append({
@@ -193,6 +243,13 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
             "iv_lease_to": iv_lease_to,
         })
 
+    # ── Emit rows: every customer × every valid charge ─────────────────
+    #
+    # WHY emit for all customers (not just primary)?
+    # Charges belong to the lease, but downstream _build_paying_sets needs
+    # every customer's email/tenant_code in the paying set so roommates
+    # aren't flagged as "missing pet rent".  Revenue dedup happens later
+    # via _entrata_charge_dedup_key.
     for cust in customers:
         first_name = cust.get("firstName", "")
         last_name = cust.get("lastName", "")
@@ -202,6 +259,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
         move_in = cust.get("moveInDate", "") or act_dates.get("Actual Move In", "")
         move_out = cust.get("moveOutDate", "") or act_dates.get("Actual Move Out", "")
 
+        # Email: try direct field, then addresses.address
         email = cust.get("email", "")
         if not email:
             addrs = cust.get("addresses", {})
@@ -230,6 +288,7 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
         }
 
         if not valid_charges:
+            # Tenant-only row (for reports, even when no charges)
             rows.append({
                 **base_row,
                 "lease_from": lease_from_fallback,
@@ -268,7 +327,12 @@ def _extract_charges_from_entrata_lease(lease_obj, property_row):
 
 
 def _extract_ar_charges_from_entrata_lease(lease_obj, property_row):
-    """Extract AR (actual posted) transactions from an Entrata lease."""
+    """Extract AR (actual posted) transactions from an Entrata lease.
+
+    Returns a list of dicts with actual posted charges including amount paid.
+    Only pet-related charge codes are kept (matched case-insensitively against
+    common pet charge code names).
+    """
     PET_KEYWORDS = {
         'pet rent', 'pet fee', 'pet deposit', 'pet damage',
         'animal rent', 'animal fee', 'animal deposit',
@@ -292,6 +356,7 @@ def _extract_ar_charges_from_entrata_lease(lease_obj, property_row):
         if not code_name:
             continue
         code_lower = code_name.lower()
+        # Match exact keywords OR any partial substring match
         if code_lower not in PET_KEYWORDS and not any(kw in code_lower for kw in PARTIAL_KEYWORDS):
             continue
         rows.append({
@@ -344,8 +409,8 @@ def _fetch_entrata_leases_for_property(prop, api_key):
                     "propertyId": entrata_pid,
                     "includeArTransactions": 1,
                     "includeLeaseHistory": 1,
-                    "includeScheduledCharges": 1,
-                    "leaseStatusTypeIds": "1,2,3,4,5,6",
+                    "includeScheduledCharges": 1,  # Explicitly request scheduled charges
+                    "leaseStatusTypeIds": "1,2,3,4,5,6",  # All statuses for full history
                 },
             },
         }
@@ -392,7 +457,9 @@ def _fetch_entrata_leases_for_property(prop, api_key):
 def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months=24):
     """Call Entrata getLeases API for each property, return normalized charge rows.
 
-    Returns (all_charges, results_log, all_ar_charges, all_raw_lease_arrays).
+    Returns (all_charges, results_log, all_ar_charges) tuple.  The first two
+    match the Yardi equivalent so downstream code works unchanged.
+    all_ar_charges contains actual posted AR transactions for comparison.
     """
     all_charges = []
     all_ar_charges = []
@@ -406,7 +473,7 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
         progress_bar.progress(progress)
         status_text.text(f"[{i+1}/{len(properties)}] Fetching {prop_name} (Entrata {prop_code})...")
 
-        leases, error_msg = _fetch_entrata_leases_for_property(prop, get_secret("ENTRATA_API_KEY"))
+        leases, error_msg = _fetch_entrata_leases_for_property(prop, ENTRATA_API_KEY)
         status_text.text(f"[{i+1}/{len(properties)}] {prop_name}: {len(leases)} leases, extracting charges...")
 
         if error_msg and not leases:
@@ -422,8 +489,10 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
             charges.extend(_extract_charges_from_entrata_lease(lease, prop))
             ar_charges_prop.extend(_extract_ar_charges_from_entrata_lease(lease, prop))
 
+            # Capture raw arrays for export
             lease_id = str(lease.get("id", ""))
             unit = lease.get("unitNumberSpace", "")
+            # Get primary customer name
             _custs = lease.get("customers", {}).get("customer", [])
             if isinstance(_custs, dict):
                 _custs = [_custs]
@@ -431,9 +500,11 @@ def fetch_entrata_for_properties(properties, progress_bar, status_text, lookback
             _tenant_name = f"{_primary.get('firstName', '')} {_primary.get('lastName', '')}".strip()
             _tenant_status = _primary.get("leaseCustomerStatus", "")
 
+            # Raw scheduled charges array
             _sched_raw = lease.get("scheduledCharges", {}).get("scheduledCharge", [])
             if isinstance(_sched_raw, dict):
                 _sched_raw = [_sched_raw]
+            # Raw AR transactions array
             _ar_raw = lease.get("arTransactions", {}).get("arTransaction", [])
             if isinstance(_ar_raw, dict):
                 _ar_raw = [_ar_raw]

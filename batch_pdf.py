@@ -45,6 +45,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from collections import defaultdict
 
 
+# ─── Reliability helpers (Yardi window, transient-error retry) ────────
+
+def yardi_window_open(now=None):
+    """Yardi's GetRentroll endpoint is only served weekdays 9:00-18:00
+    (local time). Entrata/RealPage/AppFolio have no such restriction."""
+    now = now or datetime.now()
+    return now.weekday() < 5 and 9 <= now.hour < 18
+
+
+def seconds_until_yardi_window(now=None):
+    """Seconds until the Yardi API window next opens (0 if open now)."""
+    now = now or datetime.now()
+    if yardi_window_open(now):
+        return 0
+    candidate = now
+    for _ in range(8):
+        start = candidate.replace(hour=9, minute=0, second=0, microsecond=0)
+        if candidate.weekday() < 5 and now < start:
+            return (start - now).total_seconds()
+        candidate = (candidate + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        if candidate.weekday() < 5:
+            return (candidate - now).total_seconds()
+    return 0
+
+
+def id_needs_yardi(pmc_system):
+    """Whether processing this ID may hit the Yardi API ('all' can)."""
+    return pmc_system in ("yardi", "all")
+
+
+TRANSIENT_ERROR_PATTERNS = (
+    "timeout", "timed out", "connection", "soap fault", "temporarily",
+    "rate limit", "too many requests", "503", "502", "500", "reset by peer",
+    "unavailable",
+)
+
+
+def is_transient_error(err):
+    e = str(err or "").lower()
+    return any(p in e for p in TRANSIENT_ERROR_PATTERNS)
+
+
 class FakeProgressBar:
     """Dummy progress bar for batch mode."""
     def progress(self, val):
@@ -105,13 +147,71 @@ def detect_pmc_for_id(conn, id_val, id_type="property"):
         return None, 0, None
 
 
-def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=True, workers=1):
+def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=True,
+                                 workers=1, use_cache=True, cache_ttl_days=7.0):
     """
-    Fetch charges via API for a list of properties.
+    Fetch charges via API for a list of properties, reusing the shared
+    per-property cache (fetch_cache.py) so quarterly batch runs don't
+    re-hit the APIs for properties pulled recently.
+
     workers > 1 → use parallel fetcher (much faster for large parents).
     workers = 1 → use sequential fetcher (legacy / matches Streamlit app).
     Returns: (all_charges_list, results_log)
     """
+    from fetch_cache import fetch_with_cache
+
+    if pmc_system == "all":
+        # Combined mode: group tagged properties by source system and fetch
+        # each group through its own path (each with its own cache bucket).
+        groups = {}
+        for p in properties:
+            groups.setdefault(p.get("_PMC_SYSTEM", "yardi"), []).append(p)
+        all_charges, results_log = [], []
+        for sys_name, group in sorted(groups.items()):
+            if verbose:
+                print(f"    [{sys_name}] {len(group)} properties")
+            c, l = fetch_charges_for_properties(
+                group, sys_name, app_imports, verbose=verbose, workers=workers,
+                use_cache=use_cache, cache_ttl_days=cache_ttl_days,
+            )
+            all_charges.extend(c)
+            results_log.extend(l)
+        return all_charges, results_log
+
+    mode = "live" if pmc_system == "real_page" else ""
+
+    def _do_fetch(props):
+        result = _fetch_charges_uncached(props, pmc_system, app_imports,
+                                         verbose=verbose, workers=workers)
+        if pmc_system == "real_page":
+            # Persist the live resident roster with the cached payload so
+            # cache-hit runs filter reports identically to fresh runs.
+            import realpage_live_api as _rp_api
+            extras = {pid: {"residents": res}
+                      for pid, res in _rp_api.LAST_RESIDENTS.items()}
+            return result[0], result[1], [], [], extras
+        return result
+
+    charges, log, _ar, _raw, cache_info = fetch_with_cache(
+        pmc_system,
+        properties,
+        _do_fetch,
+        ttl_days=cache_ttl_days,
+        force_refresh=not use_cache,
+        mode=mode,
+    )
+    if pmc_system == "real_page":
+        import realpage_live_api as _rp_api2
+        for _pid, _ex in (cache_info.get("extras_by_pid") or {}).items():
+            if _ex and _ex.get("residents") is not None:
+                _rp_api2.LAST_RESIDENTS[str(_pid)] = _ex["residents"]
+    if verbose and cache_info["hits"]:
+        print(f"    ♻️  Cache: reused {cache_info['hits']} of {len(properties)} "
+              f"properties, fetched {cache_info['misses']} fresh")
+    return charges, log
+
+
+def _fetch_charges_uncached(properties, pmc_system, app_imports, verbose=True, workers=1):
     if workers and workers > 1:
         from parallel_fetch import fetch_entrata_parallel, fetch_yardi_parallel
         if pmc_system == "entrata":
@@ -121,11 +221,16 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
                 workers=workers, verbose=verbose,
             )
         elif pmc_system in ("real_page", "appfolio"):
-            # RealPage/AppFolio read from Snowflake — single-query, parallelism
-            # at the per-property level adds no benefit. Fall through.
+            # RealPage hybrid runs its own SOAP thread pool; AppFolio reads
+            # from Snowflake — per-property parallelism adds no benefit here.
             progress_bar = FakeProgressBar()
             status_text = FakeStatusText(verbose=verbose)
-            fetch_fn = app_imports["fetch_realpage_for_properties"] if pmc_system == "real_page" else app_imports["fetch_appfolio_for_properties"]
+            if pmc_system == "real_page":
+                # Live current-state only — no hybrid/staging history
+                # (docs/realpage-accuracy-audit.md)
+                from realpage_live_api import fetch_realpage_live as fetch_fn
+            else:
+                fetch_fn = app_imports["fetch_appfolio_for_properties"]
             all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
         else:
             license_token = app_imports["YARDI_LICENSE_TOKEN"]
@@ -147,8 +252,9 @@ def fetch_charges_for_properties(properties, pmc_system, app_imports, verbose=Tr
         all_charges = result[0]
         results_log = result[1]
     elif pmc_system == "real_page":
-        fetch_fn = app_imports["fetch_realpage_for_properties"]
-        all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
+        # Live current-state only (docs/realpage-accuracy-audit.md)
+        from realpage_live_api import fetch_realpage_live
+        all_charges, results_log = fetch_realpage_live(properties, progress_bar, status_text)
     elif pmc_system == "appfolio":
         fetch_fn = app_imports["fetch_appfolio_for_properties"]
         all_charges, results_log = fetch_fn(properties, progress_bar, status_text)
@@ -175,6 +281,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
     load_appfolio_properties_for_selection = app_imports["load_appfolio_properties_for_selection"]
     compute_launch_analysis = app_imports["compute_launch_analysis"]
     launch_analysis_is_comparable = app_imports["_launch_analysis_is_comparable"]
+    latest_observed_revenue_month = app_imports["_latest_observed_revenue_month"]
     fetch_compliance_data = app_imports["fetch_compliance_data"]
     fetch_missing_pet_rent_by_property = app_imports["fetch_missing_pet_rent_by_property"]
     fetch_suspected_undisclosed_by_property = app_imports["fetch_suspected_undisclosed_by_property"]
@@ -199,7 +306,35 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
     
     try:
         # Load properties
-        if pmc_system == "entrata":
+        _loaders_by_system = {
+            "yardi": load_properties_for_selection,
+            "entrata": load_entrata_properties_for_selection,
+            "real_page": load_realpage_properties_for_selection,
+            "appfolio": load_appfolio_properties_for_selection,
+        }
+        if pmc_system == "all":
+            # Combined mode: load from every system and tag each property.
+            props_df = []
+            for _sys, _loader in _loaders_by_system.items():
+                try:
+                    if id_type == "parent":
+                        if _sys == "yardi":
+                            _rows = _loader(parent_company_name=label)
+                        else:
+                            _rows = _loader(ancestry_id=str(id_val))
+                            if not _rows or (hasattr(_rows, '__len__') and len(_rows) == 0):
+                                _rows = _loader(parent_company_name=label)
+                    else:
+                        _rows = _loader(property_id=id_val)
+                except Exception:
+                    _rows = []
+                if _rows is not None and hasattr(_rows, "to_dict"):
+                    _rows = _rows.to_dict("records")
+                for _r in _rows or []:
+                    _tagged = dict(_r)
+                    _tagged["_PMC_SYSTEM"] = _sys
+                    props_df.append(_tagged)
+        elif pmc_system == "entrata":
             if id_type == "parent":
                 # Pass ancestry_id for entrata parent lookups (the ID is the ancestry_id)
                 props_df = load_entrata_properties_for_selection(ancestry_id=str(id_val))
@@ -252,13 +387,21 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             return result
         property_ids = [p.get("PROPERTY_ID") or p.get("property_id") for p in properties]
         result["properties_found"] = len(property_ids)
+
+        # pid → source system map for combined-mode report builders
+        st.session_state["property_system_by_pid"] = {
+            str(p.get("PROPERTY_ID") or p.get("property_id")): p.get("_PMC_SYSTEM", pmc_system)
+            for p in properties
+        }
         
         print(f"    Fetching charges via {pmc_system.upper()} API...")
         
         # Fetch charges via API
         workers = getattr(args, "workers", 1) or 1
         all_charges, fetch_log = fetch_charges_for_properties(
-            properties, pmc_system, app_imports, verbose=True, workers=workers
+            properties, pmc_system, app_imports, verbose=True, workers=workers,
+            use_cache=not getattr(args, "no_cache", False),
+            cache_ttl_days=getattr(args, "cache_days", 7.0),
         )
         
         if not all_charges:
@@ -492,12 +635,13 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         t1_total = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
         t1_months = max((a["n_post"] for a in comparable.values()), default=0)
         
-        latest_month = months[-1]
+        latest_month = latest_observed_revenue_month(monthly_by_prop, months) or months[-1]
+        comparable_latest_month = latest_observed_revenue_month(monthly_by_prop, months, comparable.keys()) if comparable else latest_month
         current_monthly_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in monthly_by_prop)
         
         # Simple lift (current - pre) - uses ONLY comparable properties to match PDF
         # The PDF uses comparable_current_rev for headline, not full portfolio current_monthly_rev
-        comparable_current_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0
+        comparable_current_rev = sum(monthly_by_prop[p].get(comparable_latest_month, 0) for p in comparable.keys()) if comparable and comparable_latest_month else 0
         t1_mo_simple = comparable_current_rev - pre_baseline if pre_baseline > 0 else 0
         
         # Auto-select methodology: use simple lift unless negative, then try avg lift, then use least negative
@@ -572,7 +716,7 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         t2_tenants = sum(v["missing_count"] for v in missing_rent_data.values()) if missing_rent_data else 0
         t2_mo = sum(v["monthly_missing"].get(latest_month, 0) for v in missing_rent_data.values()) if missing_rent_data else 0
         t2_props = sum(1 for v in missing_rent_data.values() if v["missing_count"] > 0) if missing_rent_data else 0
-        
+
         result["uncollected_tenants"] = t2_tenants
         
         # Fetch suspected undisclosed
@@ -665,6 +809,50 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             _unit_df = _unit_df[_unit_df["unit_code"].notna() & (_unit_df["unit_code"] != "")]
             total_units = _unit_df.drop_duplicates(subset=["property_name", "unit_code"]).shape[0]
         
+        # ── Snapshots (PDF "Progress Since Last Report") + benchmarks ──
+        _snap_label = f"{pmc_system}::{label}"
+        _prev_snap, _prev_ts = (None, None)
+        _now_snap = None
+        _benchmarks = None
+        try:
+            from fetch_cache import load_last_report_snapshot
+            _prev_snap, _prev_ts = load_last_report_snapshot(_snap_label)
+        except Exception:
+            pass
+        try:
+            _now_snap = {
+                "current_monthly_rev": float(current_monthly_rev or 0),
+                "monthly_lift": float(t1_mo or 0),
+                "missing_tenants": int(t2_tenants or 0),
+                "missing_monthly": float(t2_mo or 0),
+                "suspected_tenants": int(su_total_profiles or 0),
+                "avg_adoption": float(avg_adoption) if avg_adoption is not None else None,
+                "comparable_count": int(len(comparable) if comparable else 0),
+            }
+        except Exception:
+            _now_snap = None
+        try:
+            from app import (_classify_pet_charge_codes, _estimate_property_fees,
+                             _recent_paying_charges)
+            from benchmarks import build_pet_rent_pricing
+            _bm_pet = df[df['charge_code'].isin(selected_codes)].copy()
+            if not _bm_pet.empty:
+                _bm_pet['_amt'] = pd.to_numeric(_bm_pet['charge_amount'], errors='coerce').fillna(0)
+                _bm_pet['_from'] = _bm_pet['charge_from_date'].apply(app_imports["parse_date"])
+                _bm_pet['_to'] = _bm_pet['charge_to_date'].apply(app_imports["parse_date"])
+                _bm_class = _classify_pet_charge_codes(_bm_pet, pmc_system, None,
+                                                       system_by_pid=None)
+                _bm_rec_by_prop, _ = _estimate_property_fees(_bm_pet, _bm_class)
+                _bm_recent = _recent_paying_charges(_bm_pet)
+                _bm_rec_codes = {c for (_pn, c), cls in _bm_class.items() if cls == 'recurring'}
+                _bm_paying = _bm_recent[_bm_recent['charge_code'].isin(_bm_rec_codes)]
+                _bm_n_paying = (_bm_paying.groupby(['property_id', 'tenant_code']).ngroups
+                                if not _bm_paying.empty else 0)
+                _bm_pricing = build_pet_rent_pricing(_bm_rec_by_prop, _bm_n_paying)
+                _benchmarks = {"pricing": _bm_pricing} if _bm_pricing else None
+        except Exception as _bm_exc:
+            print(f"    Pricing summary skipped: {str(_bm_exc)[:120]}")
+
         # Generate PDF
         print("    Generating PDF...")
         today_str = datetime.now().strftime("%B %d, %Y")
@@ -673,6 +861,14 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             label=label,
             today_str=today_str,
             pre_baseline=pre_baseline,
+            realpage_prop_count=sum(
+                1 for p in properties
+                if p.get("_PMC_SYSTEM", pmc_system) == "real_page"
+            ),
+            benchmarks=_benchmarks,
+            prev_snapshot=_prev_snap,
+            prev_snapshot_ts=_prev_ts,
+            current_snapshot=_now_snap,
             comparable_count=len(comparable),
             t1_mo=t1_mo,
             t1_total=t1_total,
@@ -700,10 +896,13 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             missing_rent_data=missing_rent_data,
             total_units=total_units,
             comparable_data=comparable,
-            total_portfolio_units=total_units,
+            # "How This Scales" is opt-in: only project across the portfolio
+            # when --portfolio-units was passed explicitly (matches the app's
+            # optional Total Portfolio Units input).
+            total_portfolio_units=int(getattr(args, "portfolio_units", 0) or 0),
             property_doors=property_doors_by_name,
             monthly_revenue_series=None,
-            comparable_current_rev=sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0,
+            comparable_current_rev=comparable_current_rev,
             pmc_system=pmc_system,
             use_avg_lift=use_avg_lift,
             asset_class="conventional",
@@ -711,6 +910,48 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
             latest_month=latest_month,
             selected_charge_codes=selected_codes,
         )
+
+        try:
+            from fetch_cache import save_report_snapshot
+            if _now_snap:
+                save_report_snapshot(_snap_label, _now_snap)
+        except Exception:
+            pass
+
+        # Flag cohort for the reclaim-rate OKR (see fetch_cache.save_flagged_tenants)
+        try:
+            from fetch_cache import save_flagged_tenants
+            _pid_by_name = {}
+            for _r in all_charges:
+                _pn = str(_r.get("property_name") or "")
+                if _pn and _pn not in _pid_by_name:
+                    _pid_by_name[_pn] = _r.get("property_id")
+            _flag_rows = []
+            for _fpn, _fv in (missing_rent_data or {}).items():
+                for _ft in _fv.get("missing_tenants", []):
+                    _flag_rows.append({
+                        "property_id": _pid_by_name.get(_fpn),
+                        "property_name": _fpn,
+                        "email": str(_ft.get("email") or "").lower().strip(),
+                        "name": _ft.get("name", ""),
+                        "reason": "missing_pet_rent",
+                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                    })
+            for _fpn, _fv in (suspected_data or {}).items():
+                for _ft in _fv.get("missing_tenants", []):
+                    _flag_rows.append({
+                        "property_id": _pid_by_name.get(_fpn),
+                        "property_name": _fpn,
+                        "email": str(_ft.get("email") or "").lower().strip(),
+                        "name": _ft.get("name", ""),
+                        "reason": _ft.get("suspected_reason", "Other suspected"),
+                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                    })
+            if _flag_rows:
+                save_flagged_tenants(_snap_label, pmc_system, property_ids, _flag_rows)
+                print(f"    Reclaim tracking: saved cohort of {len(_flag_rows)} flagged tenants")
+        except Exception as _flag_exc:
+            print(f"    Flag cohort not saved: {str(_flag_exc)[:120]}")
         
         # Save PDF with detailed naming and PMC folder structure
         # Get parent company info
@@ -743,11 +984,55 @@ def process_single_id(id_val, id_type, pmc_system, label, args, output_path, app
         
         with open(filepath, "wb") as f:
             f.write(pdf_bytes)
-        
+
         result["status"] = "success"
         result["pdf_filename"] = f"{pmc_system}/{filename}"
         result["parent_company_name"] = parent_name
         result["parent_company_id"] = parent_id
+
+        # ── Auto-append to the analytics snapshot tables (RAW.MISC) ──
+        # Same pattern as the fetch cache: every run lands in Snowflake so
+        # the backfilled tables keep growing without manual uploads.
+        try:
+            import snapshot_tables as _snap_tbl
+            _pid_by_name_snap = {}
+            for _r in all_charges:
+                _pn = str(_r.get("property_name") or "")
+                if _pn and _pn not in _pid_by_name_snap:
+                    _pid_by_name_snap[_pn] = _r.get("property_id")
+            _prop_rows = _snap_tbl.build_property_rows_from_report(
+                pmc_system, missing_rent_data, suspected_data,
+                monthly_by_prop, latest_month, _pid_by_name_snap,
+                doors_by_name=property_doors_by_name,
+                parent_id=parent_id, parent_name=parent_name,
+            )
+            for _pr in _prop_rows:
+                _pr["PDF_FILENAME"] = f"{pmc_system}/{filename}"
+            _snap_tbl.append_property_snapshot(_prop_rows)
+            if id_type == "parent":
+                _snap_tbl.append_parent_snapshot({
+                    "PMC": pmc_system,
+                    "PARENT_ID": parent_id or id_val,
+                    "PARENT_NAME": parent_name or label,
+                    "PROPERTY_COUNT": len(property_ids),
+                    "UNIT_COUNT": total_units or None,
+                    "PDF_FILENAME": f"{pmc_system}/{filename}",
+                    "COMPARABLE_COUNT": len(comparable) if comparable else None,
+                    "PRE_REVENUE": pre_baseline,
+                    "CURRENT_REVENUE": current_monthly_rev,
+                    "MONTHLY_LIFT": t1_mo,
+                    "UNCOLLECTED_TENANTS": t2_tenants,
+                    "MISSING_MONTHLY_RENT": t2_mo,
+                    "SUSPECTED_UNDISCLOSED": su_total_profiles,
+                    "SUSPECTED_MONTHLY": su_current_mo,
+                    "AVG_UNIT_ADOPTION_PCT": avg_adoption,
+                    "PROPERTIES_WITH_LAUNCH": len(launch_dates),
+                    "PROPERTIES_WITH_DATA": len(monthly_by_prop),
+                    "TOTAL_PROPERTIES": len(property_ids),
+                    "ANNUALIZED_LIFT": (t1_mo * 12) if t1_mo else None,
+                })
+        except Exception as _snap_tbl_exc:
+            print(f"    Snapshot tables not appended: {str(_snap_tbl_exc)[:120]}")
         
     except Exception as e:
         import traceback
@@ -771,8 +1056,10 @@ def main():
     parser.add_argument("--avg-lift", action="store_true", help="Use average monthly lift methodology")
     parser.add_argument("--include-pm", action="store_true", help="Include property manager appendix")
     parser.add_argument("--verbose", action="store_true", help="Show detailed error traces")
-    parser.add_argument("--pmc", type=str, choices=["yardi", "entrata", "real_page", "appfolio"], default=None,
-                        help="Force PMC system (yardi, entrata, real_page, or appfolio). Overrides auto-detection.")
+    parser.add_argument("--pmc", type=str, choices=["yardi", "entrata", "real_page", "appfolio", "all"], default=None,
+                        help="Force PMC system (yardi, entrata, real_page, appfolio, or all "
+                             "to combine every system the parent uses into one report). "
+                             "Overrides auto-detection.")
     parser.add_argument("--resume", action="store_true",
                         help="Skip IDs that already have a PDF in output folder from the last N days (default 4)")
     parser.add_argument("--resume-days", type=int, default=4,
@@ -782,10 +1069,27 @@ def main():
     parser.add_argument("--workers", type=int, default=1,
                         help="Concurrent property fetches per parent (default 1 = sequential). "
                              "Try 8 for 5-8x speedup on large parents (Greystar, Trinity, etc).")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Ignore the per-property fetch cache and re-hit the APIs "
+                             "(fresh results still update the cache)")
+    parser.add_argument("--cache-days", type=float, default=7.0,
+                        help="Max age in days for cached per-property fetches (default 7)")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Retries per ID on transient errors (timeouts, 5xx, SOAP faults; default 2)")
+    parser.add_argument("--retry-wait", type=float, default=30.0,
+                        help="Base seconds between retries, doubled each attempt (default 30)")
+    parser.add_argument("--ignore-yardi-window", action="store_true",
+                        help="Attempt Yardi fetches even outside weekdays 9:00-18:00")
+    parser.add_argument("--wait-for-yardi", action="store_true",
+                        help="Sleep until the Yardi window opens instead of deferring Yardi IDs")
     parser.add_argument("--label", type=str, default=None,
                         help="Override report label (PDF title + filename prefix). "
                              "Use when grouping arbitrary property IDs under a custom name, "
                              "e.g. --label 'TruAmerica' for an asset-owner report.")
+    parser.add_argument("--portfolio-units", type=int, default=0,
+                        help="Total units across the FULL portfolio. When set, the PDF "
+                             "includes the 'How This Scales' extrapolation section; "
+                             "omitted (default) the projection is left out entirely.")
 
     args = parser.parse_args()
     
@@ -829,6 +1133,7 @@ def main():
         load_appfolio_properties_for_selection,
         compute_launch_analysis,
         _launch_analysis_is_comparable,
+        _latest_observed_revenue_month,
         fetch_compliance_data,
         fetch_missing_pet_rent_by_property,
         fetch_suspected_undisclosed_by_property,
@@ -837,6 +1142,7 @@ def main():
         fetch_rentroll_for_properties,
         fetch_entrata_for_properties,
         fetch_realpage_for_properties,
+        fetch_realpage_hybrid,
         fetch_appfolio_for_properties,
         parse_date,
         # Per-property internals (used by parallel_fetch.py)
@@ -860,6 +1166,7 @@ def main():
         "load_appfolio_properties_for_selection": load_appfolio_properties_for_selection,
         "compute_launch_analysis": compute_launch_analysis,
         "_launch_analysis_is_comparable": _launch_analysis_is_comparable,
+        "_latest_observed_revenue_month": _latest_observed_revenue_month,
         "fetch_compliance_data": fetch_compliance_data,
         "fetch_missing_pet_rent_by_property": fetch_missing_pet_rent_by_property,
         "fetch_suspected_undisclosed_by_property": fetch_suspected_undisclosed_by_property,
@@ -868,6 +1175,7 @@ def main():
         "fetch_rentroll_for_properties": fetch_rentroll_for_properties,
         "fetch_entrata_for_properties": fetch_entrata_for_properties,
         "fetch_realpage_for_properties": fetch_realpage_for_properties,
+        "fetch_realpage_hybrid": fetch_realpage_hybrid,
         "fetch_appfolio_for_properties": fetch_appfolio_for_properties,
         "parse_date": parse_date,
         # Internals + constants used by parallel_fetch.py
@@ -890,6 +1198,7 @@ def main():
     success_count = 0
     error_count = 0
     skipped_count = 0
+    deferred_count = 0
     
     # Set up CSV log file upfront so we can write incrementally
     # This way if the script dies, you still have a log of what was processed
@@ -1057,11 +1366,53 @@ def main():
             error_count += 1
             continue
         
-        # Process the ID
-        result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports, conn)
+        # Yardi API is only served weekdays 9:00-18:00. Defer (or wait for)
+        # IDs that would hit it outside the window instead of failing.
+        if id_needs_yardi(pmc_system) and not getattr(args, "ignore_yardi_window", False) \
+                and not yardi_window_open():
+            if getattr(args, "wait_for_yardi", False):
+                _wait_s = seconds_until_yardi_window()
+                _resume_at = datetime.now() + timedelta(seconds=_wait_s)
+                print(f"  ⏸ Yardi window closed — waiting {_wait_s / 3600:.1f}h "
+                      f"until {_resume_at.strftime('%a %H:%M')}...")
+                import time as _time
+                while _wait_s > 0:
+                    _chunk = min(_wait_s, 300)
+                    _time.sleep(_chunk)
+                    _wait_s = seconds_until_yardi_window()
+            else:
+                print("  ⏸ DEFERRED — outside Yardi API window (weekdays 9:00-18:00). "
+                      "Re-run with --resume during the window, or use --wait-for-yardi.")
+                defer_row = {
+                    "id": id_val, "type": args.type, "pmc": pmc_system,
+                    "label": label, "parent_company_name": "", "parent_company_id": "",
+                    "status": "deferred", "methodology": "",
+                    "properties_found": prop_count, "properties_with_data": 0,
+                    "comparable_count": 0, "monthly_lift": 0,
+                    "uncollected_tenants": 0, "suspected_undisclosed": 0,
+                    "pdf_filename": "",
+                    "error": "outside Yardi API window (weekdays 9:00-18:00 local)",
+                }
+                results.append(defer_row)
+                _append_to_log(defer_row)
+                deferred_count += 1
+                continue
+
+        # Process the ID, retrying transient failures with backoff.
+        _max_attempts = 1 + max(0, getattr(args, "retries", 2))
+        for _attempt in range(1, _max_attempts + 1):
+            result = process_single_id(id_val, args.type, pmc_system, label, args, output_path, app_imports, conn)
+            if result["status"] == "success" or not is_transient_error(result.get("error")):
+                break
+            if _attempt < _max_attempts:
+                _backoff = getattr(args, "retry_wait", 30) * (2 ** (_attempt - 1))
+                print(f"  ↻ Transient error (attempt {_attempt}/{_max_attempts}): "
+                      f"{result['error'][:120]} — retrying in {_backoff:.0f}s")
+                import time as _time
+                _time.sleep(_backoff)
         results.append(result)
         _append_to_log(result)  # Persist result immediately
-        
+
         if result["status"] == "success":
             print(f"  ✓ Saved: {result['pdf_filename']}")
             print(f"    {result['comparable_count']} comparable, ${result['monthly_lift']:,.0f}/mo lift, "
@@ -1077,6 +1428,8 @@ def main():
     summary = f"Complete: {success_count} succeeded, {error_count} failed"
     if skipped_count > 0:
         summary += f", {skipped_count} skipped (resume mode)"
+    if deferred_count > 0:
+        summary += f", {deferred_count} deferred (Yardi window — re-run with --resume weekdays 9:00-18:00)"
     print(summary)
     print(f"PDFs saved to: {output_path.absolute()}")
     print(f"Log saved to: {csv_path.absolute()}")

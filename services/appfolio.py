@@ -1,13 +1,16 @@
-"""AppFolio Snowflake queries and fetch functions."""
+"""AppFolio: Snowflake staging-backed queries and charge fetch."""
 
 import pandas as pd
+import snowflake.connector
 import streamlit as st
-
-from services.snowflake_io import run_query
 from config import JUNK_EMAILS
+from services.snowflake_io import get_snowflake_connection
 
-
-# ─── Helpers ─────────────────────────────────────────────────────────
+# ─── AppFolio (Snowflake-backed) ─────────────────────────────────────
+# Read from staging tables populated by the AppFolio ingestion job. Live
+# Developer Space/API access is intentionally deferred behind a disabled
+# sidebar toggle until MFA + direct endpoint probing are available.
+# pmc_system value: 'appfolio'
 
 def _format_appfolio_date(value):
     """Return YYYY-MM-DD for Snowflake date/datetime values, else blank."""
@@ -27,7 +30,13 @@ def _format_appfolio_date(value):
 
 
 def _normalize_appfolio_snowflake_charge_row(row):
-    """Normalize one AppFolio Snowflake recurring-charge row to app schema."""
+    """Normalize one AppFolio Snowflake recurring-charge row to app schema.
+
+    AppFolio's staged `getrecurringcharges` data often has NULL FREQUENCY even
+    though the endpoint itself is recurring-charge data. Treat blank frequency
+    as recurring by endpoint semantics so monthly pet rent does not get
+    misclassified as one-time just because the field is empty.
+    """
     def _get(key, default=""):
         value = row.get(key, default)
         return default if value is None else value
@@ -70,12 +79,12 @@ def _normalize_appfolio_snowflake_charge_row(row):
     }
 
 
-# ─── Snowflake queries ────────────────────────────────────────────────
-
 @st.cache_data(ttl=300)
 def load_appfolio_parent_companies():
     """Count AppFolio properties per parent company with staged Snowflake data."""
-    return run_query("""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT
             p.parent_company_name,
             MAX(p.parent_company_ancestry_id)    AS ancestry_id,
@@ -94,11 +103,14 @@ def load_appfolio_parent_companies():
         HAVING api_props > 0
         ORDER BY 1
     """)
+    return cur.fetchall()
 
 
 @st.cache_data(ttl=300)
 def load_appfolio_all_properties():
-    return run_query("""
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+    cur.execute("""
         SELECT DISTINCT
             p.property_id,
             p.property_name,
@@ -108,10 +120,19 @@ def load_appfolio_all_properties():
         WHERE p.property_source_name = 'appfolio'
         ORDER BY p.property_name
     """)
+    return cur.fetchall()
 
 
 def load_appfolio_properties_for_selection(parent_company_name=None, property_id=None, ancestry_id=None):
-    """Load AppFolio properties matching the selection criteria."""
+    """Load AppFolio properties matching the selection criteria.
+
+    AppFolio uses the staged property_source_id:property_id as the provider
+    property key. We also require active/enabled metadata so the user sees the
+    same integration-ready portfolio semantics as RealPage.
+    """
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
     where_clause = """
         WHERE p.property_source_name = 'appfolio'
           AND p.property_status = 'active'
@@ -127,7 +148,7 @@ def load_appfolio_properties_for_selection(parent_company_name=None, property_id
         _safe = str(ancestry_id).replace("'", "''")
         where_clause += f" AND p.parent_company_ancestry_id = '{_safe}'"
 
-    return run_query(f"""
+    cur.execute(f"""
         SELECT DISTINCT
             PARSE_JSON(p.property_source_id):"property_id"::STRING AS appfolio_property_id,
             p.property_id,
@@ -141,20 +162,24 @@ def load_appfolio_properties_for_selection(parent_company_name=None, property_id
         {where_clause}
         ORDER BY p.property_name
     """)
+    return cur.fetchall()
 
-
-# ─── AppFolio charge fetch (Snowflake-backed) ─────────────────────────
 
 def fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months=24):
     """Read AppFolio recurring charges from Snowflake and emit unified rows.
 
-    Returns (all_charges, results_log).
+    Returns (all_charges, results_log), matching Yardi/RealPage downstream shape.
+    `lookback_months` is kept for interface parity; staged recurring charges
+    carry their own effective START_DATE/END_DATE and the UI clips display later.
     """
     if not properties:
         return [], []
 
     progress_bar.progress(0.05)
     status_text.text(f"Reading AppFolio recurring-charge data from Snowflake for {len(properties)} properties...")
+
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
 
     def _esc(s):
         return str(s if s is not None else "").replace("'", "''")
@@ -318,7 +343,8 @@ def fetch_appfolio_for_properties(properties, progress_bar, status_text, lookbac
 
     progress_bar.progress(0.30)
     status_text.text("Querying AppFolio Snowflake staging tables...")
-    rows = run_query(sql)
+    cur.execute(sql)
+    rows = cur.fetchall()
     progress_bar.progress(0.85)
 
     by_prop = {}
@@ -364,6 +390,7 @@ def fetch_appfolio_for_properties(properties, progress_bar, status_text, lookbac
                 "charges": info["charges"],
             })
 
+    cur.close()
     progress_bar.progress(1.0)
     status_text.text(f"Done — {len(all_charges):,} AppFolio recurring-charge rows.")
     return all_charges, results_log

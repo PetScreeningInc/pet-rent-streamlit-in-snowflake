@@ -1,16 +1,306 @@
-"""Missing pet rent analysis — identifies tenants with pets not paying selected charge codes."""
+"""Missing Pet Rent: household profiles active but not paying pet rent."""
 
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import snowflake.connector
 import streamlit as st
-from datetime import datetime, timezone, timedelta
-
-from analytics.launch_analysis import parse_date, _resolve_launch_dt
+from datetime import timedelta
+from analytics.launch_analysis import parse_date
+from components.charts import _resolve_launch_dt
 from config import JUNK_EMAILS
-from services.snowflake_io import run_query
+from services.snowflake_io import get_snowflake_connection
+
+
+def fetch_property_manager_emails(property_ids, ancestry_id=None, parent_company_name=None):
+    """
+    Fetch property manager emails from Snowflake.
+
+    Uses parent_company_ancestry_id or parent_company_name on user_enriched
+    (more reliable than pm.entity_id which may not match d_properties.property_id).
+    Falls back to pm.entity_id IN (property_ids) if neither is available.
+
+    Returns a list of dicts: [{PM_EMAIL, PROPERTY_ID, PROPERTY_NAME}]
+    """
+    if not property_ids and not ancestry_id and not parent_company_name:
+        return []
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
+
+    # Resolve ancestry_id if not provided — much more reliable than pm.entity_id
+    if not ancestry_id and not parent_company_name and property_ids:
+        try:
+            _cur = conn.cursor()
+            _cur.execute(f"""
+                SELECT DISTINCT parent_company_ancestry_id
+                FROM PROD.common.d_properties
+                WHERE property_id IN ({", ".join(str(int(pid)) for pid in property_ids)})
+                  AND parent_company_ancestry_id IS NOT NULL
+            """)
+            _aids = [str(r[0]) for r in _cur.fetchall() if r[0]]
+            _cur.close()
+            if len(_aids) == 1:
+                ancestry_id = _aids[0]
+        except Exception:
+            pass
+
+    # Build the WHERE filter — prefer ancestry_id on user_enriched
+    if ancestry_id:
+        scope_filter = f"u.parent_company_ancestry_id = '{ancestry_id}'"
+    elif parent_company_name:
+        safe_name = parent_company_name.replace("'", "''")
+        scope_filter = f"u.parent_company_name ILIKE '%{safe_name}%'"
+    else:
+        props_str = ", ".join(str(int(pid)) for pid in property_ids)
+        scope_filter = f"pm.entity_id IN ({props_str})"
+
+    sql = f"""
+    SELECT DISTINCT
+        CASE
+            WHEN u.user_email = 'parkatvenetopm@stylresidential.com'
+            THEN 'parkatvenetoteam@stylresidential.com'
+            WHEN u.user_email = 'admin@endeavourhsv.com'
+            THEN 'contracts@endeavourhsv.com'
+            ELSE u.user_email
+        END AS PM_EMAIL,
+        pm.entity_id AS PROPERTY_ID,
+        p.property_name AS PROPERTY_NAME
+    FROM PROD.staging.stg_petscreening__property_manager_permissions_only pm
+    LEFT JOIN PROD.petscreening.petscreening__user_enriched u
+        ON u.user_id = pm.user_id
+    LEFT JOIN PROD.common.d_properties p
+        ON pm.entity_id = p.property_id
+    WHERE u.user_status = 'active'
+      AND pm.name IN (
+          'manager_admin_permission',
+          'manager_view_hipaa_permission',
+          'manager_reviewer_permission',
+          'manager_view_only_permission'
+      )
+      AND u.compliance_status != 'n/a|manual|individual_level'
+      AND u.user_role = 'property_manager'
+      AND {scope_filter}
+      AND u.user_email IS NOT NULL
+      AND TRIM(u.user_email) <> ''
+    ORDER BY PROPERTY_NAME, PM_EMAIL
+    """
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    except Exception as e:
+        cur.close()
+        st.error(f"Error fetching PM emails: {e}")
+        return []
 
 
 # ─── Robust tenant matching helpers ──────────────────────────────────
+def _unit_sources_sql(pmc_system):
+    """SQL literal list for du.unit_source / property_source_name scoping.
+
+    "all" (combined mode) expands to every supported source system so one
+    query covers a parent company that spans Yardi + Entrata + RealPage.
+    """
+    systems = ("yardi", "entrata", "real_page", "appfolio") if pmc_system == "all" else (pmc_system,)
+    return ", ".join(f"'{sys_}'" for sys_ in systems)
+
+
+def _recent_paying_charges(charges_df, days=90):
+    """Restrict charge rows to those still active recently.
+
+    The missing/suspected reports answer "who is not paying *now*", but the
+    fetched data can carry up to 24 months of history. Without this filter, a
+    unit whose PREVIOUS tenant paid pet rent marks the CURRENT tenant as
+    covered (via unit/lease-level expansion in _build_paying_sets), hiding a
+    real opportunity. Rows with no parseable end date are treated as ongoing
+    and kept — unless the tenant is explicitly Past/Former.
+
+    Only use this for current-state matching; revenue charts must keep the
+    full history.
+    """
+    if charges_df is None or charges_df.empty or 'charge_to_date' not in charges_df.columns:
+        return charges_df
+    cutoff = datetime.now() - timedelta(days=days)
+    to_dt = pd.to_datetime(charges_df['charge_to_date'], errors='coerce')
+    status = charges_df.get('tenant_status')
+    if status is not None:
+        is_past = status.astype(str).str.strip().str.lower().isin(
+            ('past', 'former', 'former applicant')
+        )
+    else:
+        is_past = pd.Series(False, index=charges_df.index)
+    keep = (to_dt >= cutoff) | (to_dt.isna() & ~is_past)
+    return charges_df[keep]
+
+
+def _classify_pet_charge_codes(pet_charges, pmc_system, user_overrides=None,
+                               system_by_pid=None):
+    """Classify each (property_name, charge_code) as "recurring" or "onetime".
+
+    RealPage/AppFolio: always recurring (rows are monthly scheduled-charge
+    snapshots — the one-month normalized span must not look one-time).
+    Entrata: use the explicit `frequency` field.
+    Yardi: infer from the median charge date span (> 60 days → recurring;
+    missing dates → recurring, since missing ≠ one-time).
+
+    In combined mode (pmc_system == "all"), pass ``system_by_pid`` so each
+    property is classified by its own source system's rules.
+    """
+    _has_frequency = 'frequency' in pet_charges.columns
+    code_class = {}
+    for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
+        _grp_system = pmc_system
+        if pmc_system == "all" and system_by_pid and 'property_id' in grp.columns:
+            _grp_system = system_by_pid.get(str(grp['property_id'].iloc[0]), "yardi")
+        if _grp_system in ("real_page", "appfolio"):
+            # RealPage rows are monthly scheduled-charge snapshots keyed by
+            # post_month. AppFolio getrecurringcharges rows are recurring by endpoint semantics.
+            # Neither should look one-time just because the normalized span
+            # is a single month.
+            code_class[(pname, code)] = "recurring"
+        elif _has_frequency:
+            freqs = grp['frequency'].dropna().str.strip().str.lower()
+            onetime_count = (freqs == 'one-time').sum()
+            monthly_count = (freqs.isin(['monthly', 'recurring'])).sum()
+            code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
+        else:
+            spans = []
+            for _, row in grp.iterrows():
+                f, t = row['_from'], row['_to']
+                if f and t and not pd.isna(f) and not pd.isna(t):
+                    spans.append((t - f).days)
+            median_span = float(np.median(spans)) if spans else None
+            if median_span is None:
+                code_class[(pname, code)] = "recurring"
+            else:
+                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
+
+    if user_overrides:
+        for (pname, code) in list(code_class.keys()):
+            if code in user_overrides:
+                code_class[(pname, code)] = user_overrides[code]
+    return code_class
+
+
+def _estimate_property_fees(pet_charges, code_class):
+    """Estimate the typical pet fee per property from tenants actually paying.
+
+    Methodology: per tenant, take the median amount per charge code (their
+    typical rate for that code), sum the tenant's recurring codes into one
+    monthly pet bill, then take the MEDIAN across tenants. Medians resist
+    skew from outlier amounts and duplicate rows; per-tenant aggregation
+    stops tenants with more charge rows (e.g. RealPage one-row-per-month
+    snapshots) from dominating the estimate. One-time fees: median occurrence
+    per code, summed across codes (pet fee + pet deposit), median across
+    tenants.
+
+    Returns (recurring_by_prop, onetime_by_prop): {property_name: float}.
+    Requires a numeric `_amt` column on pet_charges.
+    """
+    recurring_by_prop = {}
+    onetime_by_prop = {}
+    for pname, pgrp in pet_charges.groupby('property_name'):
+        rec_by_tenant = []
+        ot_by_tenant = []
+        for _tc, tgrp in pgrp.groupby('tenant_code'):
+            rec_code_rates = []
+            ot_total = 0.0
+            for code, cgrp in tgrp.groupby('charge_code'):
+                amts = [a for a in cgrp['_amt'].tolist() if a > 0]
+                if not amts:
+                    continue
+                if code_class.get((pname, code), 'recurring') == 'recurring':
+                    rec_code_rates.append(float(np.median(amts)))
+                else:
+                    ot_total += float(np.median(amts))
+            if rec_code_rates:
+                rec_by_tenant.append(sum(rec_code_rates))
+            if ot_total > 0:
+                ot_by_tenant.append(ot_total)
+        if rec_by_tenant:
+            recurring_by_prop[pname] = float(np.median(rec_by_tenant))
+        if ot_by_tenant:
+            onetime_by_prop[pname] = float(np.median(ot_by_tenant))
+    return recurring_by_prop, onetime_by_prop
+
+
+def _dedup_missing_rows(missing_df, pname, tenant_info):
+    """One row per USER_EMAIL for the per-month dollar estimation.
+
+    A user can have several f_leases rows (renewals, roommate re-signs) that
+    all survive SELECT DISTINCT because tenant_code differs. Counting each row
+    would add the estimated fee multiple times per month for the same person.
+    Prefer the row whose tenant_code has live lease-date info so the active
+    window stays accurate.
+    """
+    if missing_df.empty or 'USER_EMAIL' not in missing_df.columns:
+        return missing_df
+    df = missing_df.copy()
+    df['_has_info'] = df['TENANT_CODE'].astype(str).map(
+        lambda tc: 0 if (pname, tc) in tenant_info else 1
+    )
+    df = df.sort_values('_has_info').drop_duplicates(subset=['USER_EMAIL'], keep='first')
+    return df.drop(columns=['_has_info'])
+
+
+def _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system):
+    """Filter PetScreening profiles for RealPage properties against the LIVE
+    resident roster from the most recent fetch (realpage_live_api.LAST_RESIDENTS).
+
+    The SQL EXISTS clause checks the staging resident table, which can lag
+    weeks; the live roster is today's truth. This makes the missing/suspected
+    CSVs reflect who actually lives there right now. Applies only to
+    properties present in the roster — cached fetches leave LAST_RESIDENTS
+    empty, in which case the SQL filter stands alone. Profiles already
+    flagged as paying are kept (a live scheduled charge implies current).
+    """
+    if pmc_system not in ('real_page', 'all') or profiles_df.empty:
+        return profiles_df
+    try:
+        from realpage_live_api import LAST_RESIDENTS
+    except Exception:
+        return profiles_df
+    if not LAST_RESIDENTS:
+        return profiles_df
+
+    _sys_by_pid = st.session_state.get("property_system_by_pid", {}) or {}
+    _drop_status = {'former', 'former applicant'}
+    _today_s = datetime.now().strftime("%Y-%m-%d")
+
+    live_ok = {}
+    for _pid, _residents in LAST_RESIDENTS.items():
+        _emails, _leases = set(), set()
+        for r in _residents:
+            if str(r.get("lease_status") or "").strip().lower() in _drop_status:
+                continue
+            _mo = str(r.get("move_out_date") or "")[:10]
+            if _mo and _mo < _today_s:
+                continue
+            _em = str(r.get("email") or "").strip().lower()
+            if _em:
+                _emails.add(_em)
+            _lid = str(r.get("lease_id") or "").strip()
+            if _lid:
+                _leases.add(_lid)
+        live_ok[str(_pid)] = (_emails, _leases)
+
+    def _keep(row):
+        if row.get('pet_rent_paid') == 1:
+            return True
+        pid = str(row.get('PROPERTY_ID', '')).strip()
+        if pmc_system == 'all' and _sys_by_pid.get(pid, '') != 'real_page':
+            return True
+        entry = live_ok.get(pid)
+        if entry is None:
+            return True  # no live roster for this property (cache hit)
+        _emails, _leases = entry
+        em = str(row.get('USER_EMAIL', '')).strip().lower()
+        tc = str(row.get('TENANT_CODE', '')).strip()
+        return bool((em and em in _emails) or (tc and tc in _leases))
+
+    return profiles_df[profiles_df.apply(_keep, axis=1)]
+
 
 def _build_paying_sets(charges_df, selected_codes):
     """Build normalized paying-tenant sets for robust matching.
@@ -194,85 +484,6 @@ def _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set):
     return profiles_df
 
 
-# ─── Snowflake query helpers ──────────────────────────────────────────
-
-def fetch_property_manager_emails(property_ids, ancestry_id=None, parent_company_name=None):
-    """
-    Fetch property manager emails from Snowflake.
-
-    Uses parent_company_ancestry_id or parent_company_name on user_enriched
-    (more reliable than pm.entity_id which may not match d_properties.property_id).
-    Falls back to pm.entity_id IN (property_ids) if neither is available.
-
-    Returns a list of dicts: [{PM_EMAIL, PROPERTY_ID, PROPERTY_NAME}]
-    """
-    if not property_ids and not ancestry_id and not parent_company_name:
-        return []
-
-    # Resolve ancestry_id if not provided — much more reliable than pm.entity_id
-    if not ancestry_id and not parent_company_name and property_ids:
-        try:
-            _rows = run_query(f"""
-                SELECT DISTINCT parent_company_ancestry_id
-                FROM PROD.common.d_properties
-                WHERE property_id IN ({", ".join(str(int(pid)) for pid in property_ids)})
-                  AND parent_company_ancestry_id IS NOT NULL
-            """)
-            _aids = [str(r["PARENT_COMPANY_ANCESTRY_ID"]) for r in _rows if r.get("PARENT_COMPANY_ANCESTRY_ID")]
-            if len(_aids) == 1:
-                ancestry_id = _aids[0]
-        except Exception:
-            pass
-
-    # Build the WHERE filter — prefer ancestry_id on user_enriched
-    if ancestry_id:
-        scope_filter = f"u.parent_company_ancestry_id = '{ancestry_id}'"
-    elif parent_company_name:
-        safe_name = parent_company_name.replace("'", "''")
-        scope_filter = f"u.parent_company_name ILIKE '%{safe_name}%'"
-    else:
-        props_str = ", ".join(str(int(pid)) for pid in property_ids)
-        scope_filter = f"pm.entity_id IN ({props_str})"
-
-    sql = f"""
-    SELECT DISTINCT
-        CASE
-            WHEN u.user_email = 'parkatvenetopm@stylresidential.com'
-            THEN 'parkatvenetoteam@stylresidential.com'
-            WHEN u.user_email = 'admin@endeavourhsv.com'
-            THEN 'contracts@endeavourhsv.com'
-            ELSE u.user_email
-        END AS PM_EMAIL,
-        pm.entity_id AS PROPERTY_ID,
-        p.property_name AS PROPERTY_NAME
-    FROM PROD.staging.stg_petscreening__property_manager_permissions_only pm
-    LEFT JOIN PROD.petscreening.petscreening__user_enriched u
-        ON u.user_id = pm.user_id
-    LEFT JOIN PROD.common.d_properties p
-        ON pm.entity_id = p.property_id
-    WHERE u.user_status = 'active'
-      AND pm.name IN (
-          'manager_admin_permission',
-          'manager_view_hipaa_permission',
-          'manager_reviewer_permission',
-          'manager_view_only_permission'
-      )
-      AND u.compliance_status != 'n/a|manual|individual_level'
-      AND u.user_role = 'property_manager'
-      AND {scope_filter}
-      AND u.user_email IS NOT NULL
-      AND TRIM(u.user_email) <> ''
-    ORDER BY PROPERTY_NAME, PM_EMAIL
-    """
-    try:
-        return run_query(sql)
-    except Exception as e:
-        st.error(f"Error fetching PM emails: {e}")
-        return []
-
-
-# ─── Main analysis functions ──────────────────────────────────────────
-
 def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_ids):
     """
     Generate the 'Missing Pet Rent' report using LIVE API rent roll data.
@@ -289,6 +500,8 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
       5. Python join → final report (per-pet granularity for download)
     """
     pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
 
     # ── Scope to properties that actually have PET-RELATED charge data ──
     # Only include properties with at least 1 charge matching selected codes.
@@ -304,30 +517,33 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     props_str = ", ".join(str(int(pid)) for pid in property_ids)
 
     # ── Step 1: From LIVE API data, build set of tenants paying selected charges ──
-    paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
+    # Current-state report → only recently-active charges count as "paying".
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
 
     realpage_current_resident_clause = ""
-    if pmc_system == 'real_page':
+    if pmc_system in ('real_page', 'all'):
         # RealPage resident/charge data is a current snapshot. Require the
         # PetScreening profile's lease/email to still exist in the latest
         # RealPage resident list; otherwise old f_leases rows make past tenants
         # look like current missing pet-rent opportunities.
         realpage_current_resident_clause = """
-      AND EXISTS (
+      AND (du.unit_source <> 'real_page' OR EXISTS (
           SELECT 1
           FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
-          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):"pmcid"::STRING
-            AND r.site_id = PARSE_JSON(p.property_source_id):"siteid"::STRING
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
             AND (
                 r.lease_id = COALESCE(
-                    l.lease_source_external_id:"lease_id"::STRING,
+                    l.lease_source_external_id:\"lease_id\"::STRING,
                     l.lease_external_id::STRING
                 )
                 OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
             )
             AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
             AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
-      )
+      ))
         """
 
     # ── Step 2: Query Snowflake for PetScreening household profiles ──
@@ -359,7 +575,7 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
         ON ue.unit_id = du.unit_id
     JOIN PROD.common.f_leases l
         ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
-    WHERE du.unit_source = '{pmc_system}'
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
       AND du.property_id IN ({props_str})
       AND ue.compliance_status = 'compliant'
       AND ue.user_pet_type = 'household'
@@ -369,16 +585,20 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
       {realpage_current_resident_clause}
     """
-    profiles_df = pd.DataFrame(run_query(sql_profiles))
+    cur.execute(sql_profiles)
+    profiles_df = pd.DataFrame(cur.fetchall())
 
     if profiles_df.empty:
         return pd.DataFrame()
 
     # ── Step 3: Match live charges to profiles ──
     profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
 
     # ── Step 3b: Entrata freshness filter — exclude profiles not in API data ──
-    if pmc_system == 'entrata' and 'email' in all_charges_df.columns:
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
         api_emails_by_prop = (
             all_charges_df
             .assign(
@@ -392,6 +612,8 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
         )
         def _in_api(row):
             pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
             em = str(row.get('USER_EMAIL', '')).strip().lower()
             return em in api_emails_by_prop.get(pid, set())
         profiles_df['_in_api'] = profiles_df.apply(_in_api, axis=1)
@@ -448,9 +670,10 @@ def generate_missing_pet_rent_report(all_charges_df, selected_codes, property_id
     WHERE m.property_id IN ({props_str})
       AND m.pet_profile_type = 'household'
       AND m.pet_profile_status = 'active'
-      AND m.property_source_name = '{pmc_system}'
+      AND m.property_source_name IN ({_unit_sources_sql(pmc_system)})
     """
-    exec_df = pd.DataFrame(run_query(sql_exec))
+    cur.execute(sql_exec)
+    exec_df = pd.DataFrame(cur.fetchall())
 
     if exec_df.empty:
         return pd.DataFrame()
@@ -509,6 +732,8 @@ def fetch_missing_pet_rent_by_property(
     }}
     """
     pmc_system = st.session_state.get("pmc_system", "yardi")
+    conn = get_snowflake_connection()
+    cur = conn.cursor(snowflake.connector.DictCursor)
 
     # ── Scope to properties that actually have PET-RELATED charge data ──
     # Only include properties with at least 1 charge matching selected codes.
@@ -528,70 +753,27 @@ def fetch_missing_pet_rent_by_property(
     pet_charges['_from'] = pet_charges['charge_from_date'].apply(parse_date)
     pet_charges['_to'] = pet_charges['charge_to_date'].apply(parse_date)
 
-    paying_tc_set, paying_email_set = _build_paying_sets(all_charges_df, selected_codes)
+    # Paying sets from charges still active recently — this is a current-state
+    # report, so a previous tenant's old pet charge must not mark the unit's
+    # current tenant as covered.
+    paying_tc_set, paying_email_set = _build_paying_sets(
+        _recent_paying_charges(all_charges_df), selected_codes
+    )
     properties_with_payers = set(pet_charges['property_id'].astype(str).unique())
 
-    # Classify each charge code at each property as recurring or one-time.
-    # Entrata: use the explicit `frequency` field when available.
-    # Yardi: infer from median date span (> 60 days → recurring).
-    _has_frequency = 'frequency' in pet_charges.columns
-    code_class = {}   # {(property_name, charge_code): "recurring" | "onetime"}
-    for (pname, code), grp in pet_charges.groupby(['property_name', 'charge_code']):
-        if pmc_system in ("real_page", "appfolio"):
-            # RealPage rows are monthly scheduled-charge snapshots keyed by
-            # post_month. AppFolio getrecurringcharges rows are recurring by endpoint semantics.
-            # but pet rent is still recurring for missing-rent estimation.
-            code_class[(pname, code)] = "recurring"
-        elif _has_frequency:
-            # Entrata: use the frequency field directly
-            freqs = grp['frequency'].dropna().str.strip().str.lower()
-            onetime_count = (freqs == 'one-time').sum()
-            monthly_count = (freqs.isin(['monthly', 'recurring'])).sum()
-            if onetime_count > monthly_count:
-                code_class[(pname, code)] = "onetime"
-            else:
-                code_class[(pname, code)] = "recurring"
-        else:
-            # Yardi: infer from median date span
-            spans = []
-            for _, row in grp.iterrows():
-                f, t = row['_from'], row['_to']
-                if f and t and not pd.isna(f) and not pd.isna(t):
-                    spans.append((t - f).days)
-            # No valid date spans → assume recurring (missing dates ≠ one-time)
-            median_span = float(np.median(spans)) if spans else None
-            if median_span is None:
-                code_class[(pname, code)] = "recurring"
-            else:
-                code_class[(pname, code)] = "recurring" if median_span > 60 else "onetime"
-
-    # Apply user overrides (from the charge type classification UI)
     try:
         _user_overrides = st.session_state.get("charge_type_overrides", {})
-        if _user_overrides:
-            for (pname, code) in list(code_class.keys()):
-                if code in _user_overrides:
-                    code_class[(pname, code)] = _user_overrides[code]
     except Exception:
-        pass
+        _user_overrides = {}
+    code_class = _classify_pet_charge_codes(
+        pet_charges, pmc_system, _user_overrides,
+        system_by_pid=st.session_state.get("property_system_by_pid"),
+    )
 
-    # Avg fee per property, split by recurring vs one-time
-    avg_recurring_by_prop = {}   # avg monthly recurring fee per tenant
-    avg_onetime_by_prop = {}     # avg one-time deposit per tenant
-    for pname, pgrp in pet_charges.groupby('property_name'):
-        rec_amts, ot_amts = [], []
-        for tc, tgrp in pgrp.groupby('tenant_code'):
-            for _, row in tgrp.iterrows():
-                cls = code_class.get((pname, row['charge_code']), 'recurring')
-                if cls == 'recurring':
-                    rec_amts.append(row['_amt'])
-                else:
-                    ot_amts.append(row['_amt'])
-        # De-dup per tenant (avg per tenant, then avg across tenants)
-        if rec_amts:
-            avg_recurring_by_prop[pname] = float(np.mean(rec_amts))
-        if ot_amts:
-            avg_onetime_by_prop[pname] = float(np.mean(ot_amts))
+    # Typical fee per property (per-tenant medians — see _estimate_property_fees)
+    avg_recurring_by_prop, avg_onetime_by_prop = _estimate_property_fees(
+        pet_charges, code_class
+    )
 
     # Build tenant_info lookup from ALL API data (every tenant, all charge codes)
     # so we can get lease dates for any tenant, even those without pet charges.
@@ -609,25 +791,25 @@ def fetch_missing_pet_rent_by_property(
         }
 
     realpage_current_resident_clause = ""
-    if pmc_system == 'real_page':
+    if pmc_system in ('real_page', 'all'):
         # RealPage is current-snapshot data. Do not let stale f_leases rows from
         # previous residents inflate current missing pet-rent estimates.
         realpage_current_resident_clause = """
-      AND EXISTS (
+      AND (du.unit_source <> 'real_page' OR EXISTS (
           SELECT 1
           FROM PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST r
-          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):"pmcid"::STRING
-            AND r.site_id = PARSE_JSON(p.property_source_id):"siteid"::STRING
+          WHERE r.pmc_id = PARSE_JSON(p.property_source_id):\"pmcid\"::STRING
+            AND r.site_id = PARSE_JSON(p.property_source_id):\"siteid\"::STRING
             AND (
                 r.lease_id = COALESCE(
-                    l.lease_source_external_id:"lease_id"::STRING,
+                    l.lease_source_external_id:\"lease_id\"::STRING,
                     l.lease_external_id::STRING
                 )
                 OR LOWER(TRIM(r.email)) = LOWER(TRIM(ue.user_email))
             )
             AND COALESCE(r.lease_status, '') NOT IN ('Former', 'Former Applicant')
             AND (r.move_out_date IS NULL OR r.move_out_date >= CURRENT_DATE)
-      )
+      ))
         """
 
     # ── Step 2: Snowflake → PetScreening household profiles with tenant_code ──
@@ -655,7 +837,7 @@ def fetch_missing_pet_rent_by_property(
         ON ue.unit_id = du.unit_id
     JOIN PROD.common.f_leases l
         ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
-    WHERE du.unit_source = '{pmc_system}'
+    WHERE du.unit_source IN ({_unit_sources_sql(pmc_system)})
       AND du.property_id IN ({props_str})
       AND ue.compliance_status = 'compliant'
       AND ue.user_pet_type = 'household'
@@ -665,7 +847,9 @@ def fetch_missing_pet_rent_by_property(
       AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
       {realpage_current_resident_clause}
     """
-    profiles_df = pd.DataFrame(run_query(sql_profiles))
+    cur.execute(sql_profiles)
+    profiles_df = pd.DataFrame(cur.fetchall())
+    cur.close()
 
     if profiles_df.empty:
         return {}
@@ -673,9 +857,12 @@ def fetch_missing_pet_rent_by_property(
     # ── Step 3: Match to paying set (case-insensitive tc + email fallback) ──
     # If a user has multiple leases, paying on ANY lease counts for all rows.
     profiles_df = _apply_paying_flag(profiles_df, paying_tc_set, paying_email_set)
+    # RealPage: keep only profiles matching the LIVE resident roster
+    profiles_df = _filter_realpage_profiles_to_live_residents(profiles_df, pmc_system)
 
     # ── Step 3b: Entrata freshness filter ──
-    if pmc_system == 'entrata' and 'email' in all_charges_df.columns:
+    if pmc_system in ('entrata', 'all') and 'email' in all_charges_df.columns:
+        _pid_systems = st.session_state.get("property_system_by_pid", {}) or {}
         api_emails_by_prop = (
             all_charges_df
             .assign(
@@ -689,17 +876,20 @@ def fetch_missing_pet_rent_by_property(
         )
         def _in_api_check(row):
             pid = str(row.get('PROPERTY_ID', '')).strip()
+            if pmc_system == 'all' and _pid_systems.get(pid, 'entrata') != 'entrata':
+                return True  # Entrata freshness applies only to Entrata properties
             em = str(row.get('USER_EMAIL', '')).strip().lower()
             return em in api_emails_by_prop.get(pid, set())
         profiles_df['_in_api'] = profiles_df.apply(_in_api_check, axis=1)
         profiles_df = profiles_df[profiles_df['_in_api'] | (profiles_df['pet_rent_paid'] == 1)]
         profiles_df = profiles_df.drop(columns=['_in_api'], errors='ignore')
 
-    # Compute a portfolio-wide average fee as fallback for properties with no payers
+    # Portfolio-wide typical fee as fallback for properties with no payers
+    # (median across properties — same skew-resistance as per-property fees)
     _all_recurring = [v for v in avg_recurring_by_prop.values() if v > 0]
     _all_onetime = [v for v in avg_onetime_by_prop.values() if v > 0]
-    portfolio_avg_rec = float(np.mean(_all_recurring)) if _all_recurring else 0
-    portfolio_avg_ot = float(np.mean(_all_onetime)) if _all_onetime else 0
+    portfolio_avg_rec = float(np.median(_all_recurring)) if _all_recurring else 0
+    portfolio_avg_ot = float(np.median(_all_onetime)) if _all_onetime else 0
 
     # ── Step 4: Per-property, per-month missing revenue ──
     m0, mN = months[0], months[-1]
@@ -708,6 +898,9 @@ def fetch_missing_pet_rent_by_property(
         missing = grp[grp['pet_rent_paid'] == 0]
         if missing.empty:
             continue
+        # One row per person for the dollar estimation — multiple f_leases
+        # rows for the same user would add the fee several times per month.
+        missing = _dedup_missing_rows(missing, pname, tenant_info)
 
         # Property launch date — only count missing rent on or after launch
         launch_dt = _resolve_launch_dt(launch_dates.get(pname))
@@ -779,7 +972,7 @@ def fetch_missing_pet_rent_by_property(
                         first_month_done = True
 
             # Build unit label: prefer unit_address_1, fall back to full_unit_address
-            _unit_label = str(row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
+            _unit_label = str(row.get('UNIT_ADDRESS_2', '') or row.get('UNIT_ADDRESS_1', '') or row.get('FULL_UNIT_ADDRESS', '') or '').strip()
 
             missing_tenants.append({
                 "name": f"{row.get('USER_FIRST_NAME', '')} {row.get('USER_LAST_NAME', '')}".strip(),

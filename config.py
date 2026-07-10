@@ -1,4 +1,4 @@
-"""App-wide constants."""
+"""Shared constants for the Pet Value Report app."""
 
 JUNK_EMAILS = (
     "'none@none.com','noemail@noemail.com','none@nowhere.com','none@gmail.com',"

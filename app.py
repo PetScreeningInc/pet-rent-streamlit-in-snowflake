@@ -1,82 +1,71 @@
-"""Pet Rent Analysis -- Streamlit Application (refactored)"""
+"""
+Pet Rent Analysis — Streamlit Application
+Connects to Snowflake, fetches Yardi GetRentroll data, and visualizes
+pet/fee collection over time per property and parent company.
+"""
 
 import os
 import io
 import json
+import xml.etree.ElementTree as ET
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import numpy as np
+import requests
+import snowflake.connector
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_dotenv()
 
-# Snowflake (Snowpark)
-from services.snowflake_io import run_query
-
-# PMC services
-from services.yardi import (
-    load_parent_companies, load_all_properties,
-    load_properties_for_selection, fetch_rentroll_for_properties,
-)
-from services.entrata import (
-    load_entrata_parent_companies, load_entrata_all_properties,
-    load_entrata_properties_for_selection, fetch_entrata_for_properties,
-)
-from services.realpage import (
-    load_realpage_parent_companies, load_realpage_all_properties,
-    load_realpage_properties_for_selection, fetch_realpage_for_properties,
-)
-from services.appfolio import (
-    load_appfolio_parent_companies, load_appfolio_all_properties,
-    load_appfolio_properties_for_selection, fetch_appfolio_for_properties,
-)
-
-# Analytics
-from analytics.launch_analysis import (
-    parse_date, compute_launch_analysis, _launch_analysis_is_comparable,
-    fetch_compliance_data, _build_property_id_lookup,
-)
-from analytics.missing_pet_rent import (
-    _build_paying_sets, _apply_paying_flag,
-    fetch_property_manager_emails,
-    generate_missing_pet_rent_report,
-    fetch_missing_pet_rent_by_property,
-)
-from analytics.suspected_undisclosed import (
-    fetch_suspected_undisclosed_by_property,
-    generate_suspected_undisclosed_report,
-)
-
-# Components
-from components.ui_helpers import (
-    inject_brand_css, _render_table, _render_property_funnel,
-    _PS_LOGO_WHITE_URI, _PS_LOGO_DARK_URI,
-)
-from components.charts import (
-    build_portfolio_chart, build_stacked_area_chart,
-    build_current_snapshot_chart, build_individual_property_charts,
-)
-
-# Reports
-from reports.html_report import generate_html_report, generate_exec_summary_html
-from reports.pdf_report import generate_tranche_pdf
-
-# Config
-from config import JUNK_EMAILS
-
-# Page config
+# ─── Page config ─────────────────────────────────────────────────────
 st.set_page_config(
     page_title="PetScreening Value Report",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+
+from analytics.launch_analysis import _build_property_id_lookup, _launch_analysis_is_comparable, _run_data_health_checks, compute_launch_analysis, fetch_compliance_data, parse_date
+from analytics.missing_pet_rent import _apply_paying_flag, _build_paying_sets, _classify_pet_charge_codes, _estimate_property_fees, _recent_paying_charges, fetch_missing_pet_rent_by_property, fetch_property_manager_emails, generate_missing_pet_rent_report
+from analytics.suspected_undisclosed import fetch_suspected_undisclosed_by_property, generate_suspected_undisclosed_report
+from components.charts import _latest_observed_revenue_month, build_current_snapshot_chart, build_individual_property_charts
+from components.ui_helpers import _PS_LOGO_DARK_URI, _PS_LOGO_WHITE_URI, _auto_export_dir, _render_property_funnel, _render_table, inject_brand_css, require_app_password
+from config import JUNK_EMAILS
+from reports.html_report import generate_exec_summary_html, generate_html_report
+from reports.pdf_report import _n_props, generate_tranche_pdf
+from services.appfolio import fetch_appfolio_for_properties, load_appfolio_all_properties, load_appfolio_parent_companies, load_appfolio_properties_for_selection
+from services.entrata import fetch_entrata_for_properties, load_entrata_all_properties, load_entrata_parent_companies, load_entrata_properties_for_selection
+from services.realpage import load_realpage_all_properties, load_realpage_parent_companies, load_realpage_properties_for_selection
+from services.snowflake_io import get_snowflake_connection
+from services.yardi import fetch_rentroll_for_properties, load_all_properties, load_parent_companies, load_properties_for_selection
+
+# Re-exports for the batch scripts and export tools, which import these via
+# `from app import ...` (kept so those scripts stay identical to the
+# actively developed pet-rent repo). Not used by the app UI directly.
+from services.yardi import (  # noqa: F401
+    SOAP_HEADERS, YARDI_LICENSE_TOKEN, build_soap_payload,
+    extract_charges_from_property, extract_property, xml_to_dict,
+)
+from services.entrata import (  # noqa: F401
+    ENTRATA_API_KEY, ENTRATA_BASE_URL,
+    _extract_ar_charges_from_entrata_lease,
+    _extract_charges_from_entrata_lease,
+    _fetch_entrata_leases_for_property,
+)
+from services.realpage import (  # noqa: F401
+    fetch_realpage_for_properties, fetch_realpage_hybrid,
+)
+
+require_app_password()
 inject_brand_css()
 
 # ═════════════════════════════════════════════════════════════════════
@@ -85,7 +74,37 @@ inject_brand_css()
 
 
 # ─── PMC system routing (for the 3-way Yardi/Entrata/RealPage switch) ──
+# AppFolio intentionally excluded while API access (MFA) is unresolved —
+# provider code kept as placeholder.
+ALL_PMC_SYSTEMS = ("yardi", "entrata", "real_page")
+
+
+def _scoped_systems(pmc_system=None):
+    """The concrete source systems a pmc_system value stands for."""
+    if pmc_system is None:
+        pmc_system = st.session_state.get("pmc_system", "yardi")
+    return list(ALL_PMC_SYSTEMS) if pmc_system == "all" else [pmc_system]
+
+
 def _load_parent_companies_for(pmc_system):
+    if pmc_system == "all":
+        # Union across systems: a big parent (e.g. Greystar) can run Yardi,
+        # Entrata AND RealPage properties. Merge by parent name, sum counts.
+        merged = {}
+        for _sys in ALL_PMC_SYSTEMS:
+            for r in _load_parent_companies_for(_sys):
+                name = r["PARENT_COMPANY_NAME"]
+                m = merged.get(name)
+                if m is None:
+                    merged[name] = dict(r)
+                    merged[name]["_SYSTEMS"] = [_sys]
+                else:
+                    m["TOTAL_PROPS"] = (m.get("TOTAL_PROPS") or 0) + (r.get("TOTAL_PROPS") or 0)
+                    m["API_PROPS"] = (m.get("API_PROPS") or 0) + (r.get("API_PROPS") or 0)
+                    if not m.get("ANCESTRY_ID") and r.get("ANCESTRY_ID"):
+                        m["ANCESTRY_ID"] = r.get("ANCESTRY_ID")
+                    m["_SYSTEMS"].append(_sys)
+        return sorted(merged.values(), key=lambda r: r["PARENT_COMPANY_NAME"])
     if pmc_system == "entrata":
         return load_entrata_parent_companies()
     if pmc_system == "real_page":
@@ -95,6 +114,14 @@ def _load_parent_companies_for(pmc_system):
     return load_parent_companies()
 
 def _load_all_properties_for(pmc_system):
+    if pmc_system == "all":
+        out = []
+        for _sys in ALL_PMC_SYSTEMS:
+            for r in _load_all_properties_for(_sys):
+                row = dict(r)
+                row["_PMC_SYSTEM"] = _sys
+                out.append(row)
+        return out
     if pmc_system == "entrata":
         return load_entrata_all_properties()
     if pmc_system == "real_page":
@@ -104,6 +131,18 @@ def _load_all_properties_for(pmc_system):
     return load_all_properties()
 
 def _load_properties_for_selection_for(pmc_system, **kwargs):
+    if pmc_system == "all":
+        out = []
+        for _sys in ALL_PMC_SYSTEMS:
+            try:
+                rows = _load_properties_for_selection_for(_sys, **kwargs)
+            except Exception:
+                rows = []
+            for r in rows or []:
+                row = dict(r)
+                row["_PMC_SYSTEM"] = _sys
+                out.append(row)
+        return out
     if pmc_system == "entrata":
         return load_entrata_properties_for_selection(**kwargs)
     if pmc_system == "real_page":
@@ -135,8 +174,8 @@ else:
 _sel_label = st.session_state.get("selection_label", "")
 _sel_system = st.session_state.get("pmc_system", "yardi")
 if _sel_label:
-    _sys_badge = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}.get(_sel_system, "Yardi")
-    _badge_color = {"yardi": "#7D9BC1", "entrata": "#677848", "real_page": "#8F6A3E", "appfolio": "#5B7C99"}.get(_sel_system, "#7D9BC1")
+    _sys_badge = {"all": "All Systems", "yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}.get(_sel_system, "Yardi")
+    _badge_color = {"all": "#1F2257", "yardi": "#7D9BC1", "entrata": "#677848", "real_page": "#8F6A3E", "appfolio": "#5B7C99"}.get(_sel_system, "#7D9BC1")
     st.markdown(
         f'<div style="background:#F9F4E6;border-left:4px solid {_badge_color};padding:8px 16px;'
         f'border-radius:0 6px 6px 0;margin:0 0 12px 0;display:flex;align-items:center;gap:10px">'
@@ -172,14 +211,23 @@ with st.sidebar:
     #   Entrata  -> 'entrata'
     #   RealPage -> 'real_page'   <-- with underscore, matches D_PROPERTIES
     #   AppFolio -> 'appfolio'
-    _pmc_labels  = ["Yardi", "Entrata", "RealPage", "AppFolio"]
-    _pmc_values  = ["yardi", "entrata", "real_page", "appfolio"]
+    # AppFolio is hidden for now: live API access is blocked by MFA on the
+    # account and the Snowflake-staged data is not trusted. The provider
+    # code (fetch_appfolio_for_properties etc.) stays as a placeholder —
+    # re-add "AppFolio"/"appfolio" here once API access is sorted.
+    _pmc_labels  = ["All Systems", "Yardi", "Entrata", "RealPage"]
+    _pmc_values  = ["all", "yardi", "entrata", "real_page"]
     _curr_idx = _pmc_values.index(st.session_state.pmc_system) if st.session_state.pmc_system in _pmc_values else 0
     _pmc_choice = st.radio(
         "Data Source:",
         _pmc_labels,
         index=_curr_idx,
-        help="Select the property management system to fetch charge data from.",
+        help=(
+            "Select the property management system to fetch charge data from. "
+            "All Systems combines every source a parent company uses (e.g. a "
+            "large parent running Yardi, Entrata AND RealPage properties) "
+            "into one dataset, one report, and one set of CSVs."
+        ),
         horizontal=True,
     )
     _pmc_system = _pmc_values[_pmc_labels.index(_pmc_choice)]
@@ -194,13 +242,13 @@ with st.sidebar:
         st.session_state.selection_label = ""
         st.session_state.property_ids = []
         for _sk in list(st.session_state.keys()):
-            if (_sk.startswith("missing_rent_") and isinstance(st.session_state[_sk], dict)) or _sk in ("export_html", "exec_html"):
+            if (_sk.startswith("missing_rent_") and isinstance(st.session_state[_sk], dict)) or _sk in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv"):
                 del st.session_state[_sk]
 
     _is_entrata  = _pmc_system == "entrata"
-    _is_realpage = _pmc_system == "real_page"
+    _is_realpage = _pmc_system in ("real_page", "all")
     _is_appfolio = _pmc_system == "appfolio"
-    _system_label = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}[_pmc_system]
+    _system_label = {"all": "All Systems", "yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}[_pmc_system]
 
     st.divider()
     st.header("Select Properties")
@@ -305,7 +353,7 @@ with st.sidebar:
     st.divider()
 
     # ── Check for saved exports ──
-    _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+    _auto_dir = _auto_export_dir()
     _saved_files = []
     if os.path.isdir(_auto_dir):
         _saved_files = sorted(
@@ -313,19 +361,76 @@ with st.sidebar:
             reverse=True,
         )
 
-    # RealPage-only: optionally bypass Snowflake staging and call the OneSite
-    # SOAP API directly. Slower, but gives real-time data instead of whatever
-    # the nightly Airbyte sync last landed.
-    if _is_realpage:
+    # ── View mode: clean client-facing view vs developer view ───────
+    st.toggle(
+        "Developer view",
+        key="dev_view",
+        value=False,
+        help=(
+            "Show validation and debug widgets: raw data exports, "
+            "scheduled-vs-actual AR reconciliation, detailed breakdown "
+            "tables, and the property data explorer. Leave off for a "
+            "clean view when presenting or for non-technical users."
+        ),
+    )
+
+    # ── Fetch cache controls (all systems) ──────────────────────────
+    with st.expander("Data reuse (cache)"):
         st.toggle(
-            "\U0001F534 Use Live RealPage API (slower, bypasses Snowflake)",
-            key="realpage_use_live_api",
+            "Reuse recent fetches",
+            key="use_fetch_cache",
+            value=True,
             help=(
-                "Calls the OneSite SOAP API directly instead of reading from "
-                "Snowflake staging tables. Much slower for many properties "
-                "(2-4 SOAP calls per property) but gives real-time data. "
-                "Only the current-month snapshot is returned \u2014 no historical backfill."
+                "Reuses per-property charge data fetched within the max age "
+                "below instead of re-hitting the Yardi/Entrata/RealPage APIs. "
+                "Charge data changes on a monthly cadence, so a re-pull within "
+                "a few days rarely adds anything — and skipping it avoids "
+                "burning shared API rate limits. Turn off (or lower the max "
+                "age) when you need to see changes made in the PMS today; "
+                "fresh pulls always update the cache either way."
             ),
+        )
+        st.selectbox(
+            "Max age (days)",
+            options=[1, 3, 7, 14, 30],
+            index=2,
+            key="fetch_cache_ttl_days",
+        )
+        try:
+            from fetch_cache import cache_stats, clear_cache
+            _fc_stats = cache_stats()
+            _fc_backend = _fc_stats.get("backend", "local")
+            if _fc_backend == "snowflake":
+                st.caption(
+                    f"Backend: Snowflake `{_fc_stats.get('location', '')}` — "
+                    f"{_fc_stats.get('total_entries', 0):,} properties, "
+                    f"{_fc_stats.get('total_records', 0):,} rows (append-only; "
+                    f"doubles as our own fetch-history record). Toggle off "
+                    f"'Reuse recent fetches' to bypass."
+                )
+            elif _fc_stats.get("total_entries"):
+                st.caption(
+                    f"Local cache: {_fc_stats['total_entries']:,} properties "
+                    f"({_fc_stats.get('total_bytes', 0) / 1e6:.1f} MB)"
+                )
+                if st.button("Clear local cache", use_container_width=True):
+                    _n = clear_cache()
+                    st.success(f"Removed {_n} cached properties.")
+        except Exception:
+            pass
+
+    # RealPage: live API, current-state only. No mode toggle by design \u2014
+    # the 2026-07 accuracy audit (docs/realpage-accuracy-audit.md) showed
+    # the API cannot return history (`postmonth` ignored, Former residents
+    # unreachable) and Snowflake staging has its own gaps, so RealPage data
+    # is presented as what it truly is: today's snapshot. Missing/suspected
+    # reports and current revenue are accurate; before/after lift is not
+    # attributed until RealPage authorizes the `getresidentledger` endpoint.
+    if _is_realpage:
+        st.caption(
+            "RealPage is a live current-state snapshot: current revenue "
+            "and missing/suspected reports only \u2014 no before/after lift "
+            "(resident-ledger access pending with RealPage)."
         )
 
     # AppFolio starts Snowflake-backed; keep the live API path visible but
@@ -513,36 +618,107 @@ if fetch_btn:
             # Clear cached missing rent, suspected, and charge type data
             for _stale_key in list(st.session_state.keys()):
                 if (_stale_key.startswith("missing_rent_") or _stale_key.startswith("suspected_") or
-                    _stale_key in ("export_html", "exec_html", "charge_type_overrides")):
+                    _stale_key in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv", "charge_type_overrides")):
                     del st.session_state[_stale_key]
             st.markdown(f"Fetching {_system_label} data (full history — display window: **{lookback_months} months**)...")
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            # Route to correct API fetch
-            if _pmc_system == "entrata":
-                all_charges, fetch_log, ar_charges, raw_lease_arrays = fetch_entrata_for_properties(properties, progress_bar, status_text, lookback_months)
-            elif _pmc_system == "real_page":
-                if st.session_state.get("realpage_use_live_api"):
-                    from realpage_live_api import fetch_realpage_live
-                    all_charges, fetch_log = fetch_realpage_live(
-                        properties, progress_bar, status_text, lookback_months,
-                        junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
-                    )
-                else:
-                    all_charges, fetch_log = fetch_realpage_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
-            elif _pmc_system == "appfolio":
-                if st.session_state.get("appfolio_use_live_api"):
-                    st.warning("AppFolio live API is not enabled yet — using Snowflake data for now.")
-                all_charges, fetch_log = fetch_appfolio_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
+            # Route to correct API fetch — wrapped in the per-property cache
+            # so repeat pulls within the TTL skip the APIs entirely. In
+            # "All Systems" mode, properties are grouped by source system and
+            # each group goes through its own fetcher; results are combined
+            # into one dataset.
+            from fetch_cache import fetch_with_cache
+
+            def _fetch_fn_for(_sys):
+                """(fetch_fn, cache_mode) for one concrete source system."""
+                if _sys == "entrata":
+                    return (lambda props: fetch_entrata_for_properties(props, progress_bar, status_text, lookback_months)), ""
+                if _sys == "real_page":
+                    # Live current-state only (see sidebar note / audit doc).
+                    # Returns the 5-tuple form so the live resident roster is
+                    # persisted in the cache — cache-hit runs then filter the
+                    # missing/suspected reports identically to fresh runs.
+                    import realpage_live_api as _rp_api
+
+                    def _rp_fetch(props):
+                        _c, _l = _rp_api.fetch_realpage_live(
+                            props, progress_bar, status_text, lookback_months,
+                            junk_emails={e.strip().strip("'").lower() for e in JUNK_EMAILS.split(",")},
+                        )
+                        _extras = {
+                            _pid: {"residents": _res}
+                            for _pid, _res in _rp_api.LAST_RESIDENTS.items()
+                        }
+                        return _c, _l, [], [], _extras
+
+                    return _rp_fetch, "live"
+                if _sys == "appfolio":
+                    if st.session_state.get("appfolio_use_live_api"):
+                        st.warning("AppFolio live API is not enabled yet — using Snowflake data for now.")
+                    return (lambda props: fetch_appfolio_for_properties(props, progress_bar, status_text, lookback_months)), ""
+                return (lambda props: fetch_rentroll_for_properties(props, progress_bar, status_text, lookback_months)), ""
+
+            if _pmc_system == "all":
+                _sys_groups = {}
+                for _p in properties:
+                    _sys_groups.setdefault(_p.get("_PMC_SYSTEM", "yardi"), []).append(_p)
             else:
-                all_charges, fetch_log = fetch_rentroll_for_properties(properties, progress_bar, status_text, lookback_months)
-                ar_charges = []
-                raw_lease_arrays = []
+                _sys_groups = {_pmc_system: properties}
+
+            # pid → source system, used by the report builders (missing /
+            # suspected SQL scoping) when systems are combined.
+            st.session_state["property_system_by_pid"] = {
+                str(_p.get("PROPERTY_ID")): _p.get("_PMC_SYSTEM", _pmc_system)
+                for _p in properties
+            }
+
+            all_charges, fetch_log, ar_charges, raw_lease_arrays = [], [], [], []
+            _cache_hits = _cache_misses = 0
+            _cache_oldest = None
+            for _sys, _sys_props in _sys_groups.items():
+                if _pmc_system == "all":
+                    status_text.text(f"Fetching {_sys} ({len(_sys_props)} properties)...")
+                _fn, _mode = _fetch_fn_for(_sys)
+                _c, _l, _a, _r, _ci = fetch_with_cache(
+                    _sys,
+                    _sys_props,
+                    _fn,
+                    ttl_days=float(st.session_state.get("fetch_cache_ttl_days", 7)),
+                    force_refresh=not st.session_state.get("use_fetch_cache", True),
+                    mode=_mode,
+                )
+                all_charges.extend(_c)
+                _sys_label_map = {"yardi": "Yardi", "entrata": "Entrata", "real_page": "RealPage", "appfolio": "AppFolio"}
+                for _lr in _l:
+                    _lr["system"] = _sys_label_map.get(_sys, _sys)
+                fetch_log.extend(_l)
+                ar_charges.extend(_a)
+                raw_lease_arrays.extend(_r)
+                if _sys == "real_page":
+                    # Restore live resident rosters from cached payloads so
+                    # report filtering behaves the same on cache hits.
+                    import realpage_live_api as _rp_api2
+                    for _pid, _ex in (_ci.get("extras_by_pid") or {}).items():
+                        if _ex and _ex.get("residents") is not None:
+                            _rp_api2.LAST_RESIDENTS[str(_pid)] = _ex["residents"]
+                _cache_hits += _ci["hits"]
+                _cache_misses += _ci["misses"]
+                if _ci["oldest"] is not None and (_cache_oldest is None or _ci["oldest"] < _cache_oldest):
+                    _cache_oldest = _ci["oldest"]
+
+            if len(_sys_groups) > 1:
+                _grp_summary = ", ".join(f"{s}: {len(p)}" for s, p in sorted(_sys_groups.items()))
+                st.caption(f"Combined {len(_sys_groups)} source systems — {_grp_summary}")
+            if _cache_hits:
+                _oldest_txt = f" (oldest from {_cache_oldest.strftime('%b %d %H:%M')})" if _cache_oldest else ""
+                st.caption(
+                    f"Reused cached data for {_cache_hits} of "
+                    f"{len(properties)} properties{_oldest_txt}; fetched "
+                    f"{_cache_misses} fresh. Disable in the sidebar "
+                    f"cache panel to force a full re-pull."
+                )
 
             success_count = sum(1 for l in fetch_log if l['status'].startswith('Success'))
             error_count = sum(1 for l in fetch_log if l['status'].startswith('Error'))
@@ -561,18 +737,24 @@ if fetch_btn:
                     st.session_state.raw_lease_arrays_df = None
 
                 # ── Auto-export to disk (survives crashes / memory kills) ──
-                _auto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
-                os.makedirs(_auto_dir, exist_ok=True)
-                _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                _label_safe = st.session_state.get("selection_label", "export").replace(" ", "_")[:60]
-                _auto_path = os.path.join(_auto_dir, f"charges_{_label_safe}_{_ts}.csv")
-                st.session_state.all_charges_df.to_csv(_auto_path, index=False)
-                _auto_msg = f"Auto-saved {len(all_charges):,} charges → `{os.path.basename(_auto_path)}`"
-                if ar_charges and st.session_state.ar_charges_df is not None:
-                    _ar_path = os.path.join(_auto_dir, f"ar_charges_{_label_safe}_{_ts}.csv")
-                    st.session_state.ar_charges_df.to_csv(_ar_path, index=False)
-                    _auto_msg += f" + AR transactions"
-                st.info(f"💾 {_auto_msg} (in `auto_exports/` folder)")
+                # In Streamlit-in-Snowflake the app stage is read-only, so
+                # this falls back to the temp dir (and the Snowflake fetch
+                # cache is the real persistence there anyway).
+                try:
+                    _auto_dir = _auto_export_dir()
+                    os.makedirs(_auto_dir, exist_ok=True)
+                    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _label_safe = st.session_state.get("selection_label", "export").replace(" ", "_")[:60]
+                    _auto_path = os.path.join(_auto_dir, f"charges_{_label_safe}_{_ts}.csv")
+                    st.session_state.all_charges_df.to_csv(_auto_path, index=False)
+                    _auto_msg = f"Auto-saved {len(all_charges):,} charges → `{os.path.basename(_auto_path)}`"
+                    if ar_charges and st.session_state.ar_charges_df is not None:
+                        _ar_path = os.path.join(_auto_dir, f"ar_charges_{_label_safe}_{_ts}.csv")
+                        st.session_state.ar_charges_df.to_csv(_ar_path, index=False)
+                        _auto_msg += f" + AR transactions"
+                    st.info(f"💾 {_auto_msg} (in `{os.path.basename(_auto_dir)}/` folder)")
+                except Exception as _auto_err:  # noqa: BLE001 — never break a fetch over a local save
+                    st.caption(f"Auto-export skipped: {str(_auto_err)[:100]}")
 
                 # Build summary message
                 summary_parts = [f"Fetched **{len(all_charges):,}** charges across **{success_count}** properties"]
@@ -591,7 +773,11 @@ if fetch_btn:
 # ─── Show fetch results ──────────────────────────────────────────────
 if st.session_state.fetch_log is not None:
     with st.expander("Fetch Results (click to expand)", expanded=False):
-        _render_table(st.session_state.fetch_log, height=300)
+        _fl_df = st.session_state.fetch_log
+        if _fl_df is not None and "system" in getattr(_fl_df, "columns", []):
+            _fl_cols = ["system"] + [c for c in _fl_df.columns if c != "system"]
+            _fl_df = _fl_df[_fl_cols]
+        _render_table(_fl_df, height=300)
 
 # ─── Charge code selection ───────────────────────────────────────────
 if st.session_state.all_charges_df is not None:
@@ -655,7 +841,7 @@ if st.session_state.all_charges_df is not None:
         st.info("Select at least one charge code above to continue.")
     else:
         # ─── Charge Type Classification (Recurring vs One-Time) ──────
-        with st.expander("⚙️ Charge type classification — recurring vs one-time", expanded=False):
+        with st.expander("Charge type classification — recurring vs one-time", expanded=False):
             st.markdown(
                 "Each charge code is auto-classified as **recurring** (monthly pet rent) or "
                 "**one-time** (pet deposit/fee). One-time charges only count in their start month "
@@ -743,260 +929,265 @@ if st.session_state.all_charges_df is not None:
 
             if st.session_state.get(_override_key):
                 _n_overrides = len(st.session_state[_override_key])
-                st.info(f"📌 {_n_overrides} manual override{'s' if _n_overrides > 1 else ''} active. "
+                st.info(f"{_n_overrides} manual override{'s' if _n_overrides > 1 else ''} active. "
                         f"These override the auto-detection for revenue charts and lift calculations.")
 
         st.divider()
 
         # ─── Raw Data Exports (for Snowflake validation) ─────────────
-        with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
-            st.markdown(
-                "Download the raw data that the app uses so you can upload it to "
-                "Snowflake and independently recreate/validate the numbers with SQL.  \n"
-                "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
-            )
+        # Developer-view only — hidden in the default client-facing view
+        if st.session_state.get("dev_view", False):
+            with st.expander("Raw Data Exports — Download API data for Snowflake validation", expanded=False):
+                st.markdown(
+                    "Download the raw data that the app uses so you can upload it to "
+                    "Snowflake and independently recreate/validate the numbers with SQL.  \n"
+                    "**Date columns are auto-fixed** (century correction applied) — upload directly, no manual cleanup needed."
+                )
 
-            pmc_sys = st.session_state.get("pmc_system", "yardi")
-            props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
+                pmc_sys = st.session_state.get("pmc_system", "yardi")
+                props_str_export = ", ".join(str(int(pid)) for pid in st.session_state.get("property_ids", []))
 
-            # ── Fix dates before export ──────────────────────────────
-            # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
-            # Fix all date columns so the CSV can be uploaded to Snowflake directly.
-            _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
-                          'charge_from_date', 'charge_to_date']
+                # ── Fix dates before export ──────────────────────────────
+                # Yardi API returns dates like "07/01/0025" instead of "07/01/2025".
+                # Fix all date columns so the CSV can be uploaded to Snowflake directly.
+                _date_cols = ['launch_date', 'lease_from', 'lease_to', 'move_in', 'move_out',
+                              'charge_from_date', 'charge_to_date']
 
-            def _fix_dates_for_export(export_df):
-                """Fix century-shifted dates (0025 → 2025) in all date columns."""
-                fixed = export_df.copy()
-                for col in _date_cols:
-                    if col not in fixed.columns:
-                        continue
-                    def _fix_date_val(val):
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            return val
-                        s = str(val).strip()
-                        if not s or s.lower() in ('nan', 'nat', 'none', ''):
-                            return None
-                        # Try parsing and fix year if < 1000
-                        for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                def _fix_dates_for_export(export_df):
+                    """Fix century-shifted dates (0025 → 2025) in all date columns."""
+                    fixed = export_df.copy()
+                    for col in _date_cols:
+                        if col not in fixed.columns:
+                            continue
+                        def _fix_date_val(val):
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                return val
+                            s = str(val).strip()
+                            if not s or s.lower() in ('nan', 'nat', 'none', ''):
+                                return None
+                            # Try parsing and fix year if < 1000
+                            for fmt in ["%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d"]:
+                                try:
+                                    dt = datetime.strptime(s[:10], fmt)
+                                    if dt.year < 1000:
+                                        dt = dt.replace(year=dt.year + 2000)
+                                    return dt.strftime("%Y-%m-%d")
+                                except (ValueError, TypeError):
+                                    continue
+                            # If it's already a datetime/Timestamp object
                             try:
-                                dt = datetime.strptime(s[:10], fmt)
-                                if dt.year < 1000:
-                                    dt = dt.replace(year=dt.year + 2000)
-                                return dt.strftime("%Y-%m-%d")
-                            except (ValueError, TypeError):
-                                continue
-                        # If it's already a datetime/Timestamp object
-                        try:
-                            if hasattr(val, 'year') and val.year < 1000:
-                                val = val.replace(year=val.year + 2000)
-                            return str(val)[:10]
-                        except Exception:
-                            return val
-                    fixed[col] = fixed[col].apply(_fix_date_val)
-                return fixed
+                                if hasattr(val, 'year') and val.year < 1000:
+                                    val = val.replace(year=val.year + 2000)
+                                return str(val)[:10]
+                            except Exception:
+                                return val
+                        fixed[col] = fixed[col].apply(_fix_date_val)
+                    return fixed
 
-            exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
+                exp_c1, exp_c2, exp_c3, exp_c4 = st.columns(4)
 
-            with exp_c1:
-                st.markdown("**1. All API Charges**")
-                st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
-                _export_all = _fix_dates_for_export(df)
-                st.download_button(
-                    "Download all_charges.csv",
-                    data=_export_all.to_csv(index=False),
-                    file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_all_charges",
-                )
-
-            with exp_c2:
-                st.markdown("**2. Pet Charges Only**")
-                st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
-                _pet_only = df[df['charge_code'].isin(selected_codes)]
-                _export_pet = _fix_dates_for_export(_pet_only)
-                st.download_button(
-                    "Download pet_charges.csv",
-                    data=_export_pet.to_csv(index=False),
-                    file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_pet_charges",
-                )
-
-            with exp_c3:
-                st.markdown("**3. Paying Tenant Sets**")
-                st.caption("Every (property_id, tenant_code) and (property_id, email) pair identified as paying after unit/lease expansion.")
-                _pay_tc, _pay_em = _build_paying_sets(df, selected_codes)
-                _pay_tc_df = pd.DataFrame(list(_pay_tc), columns=["property_id", "tenant_code"])
-                _pay_em_df = pd.DataFrame(list(_pay_em), columns=["property_id", "email"])
-                _pay_combined = pd.concat([
-                    _pay_tc_df.assign(match_type="tenant_code", match_key=_pay_tc_df["tenant_code"]).drop(columns=["tenant_code"]),
-                    _pay_em_df.assign(match_type="email", match_key=_pay_em_df["email"]).drop(columns=["email"]),
-                ], ignore_index=True)
-                st.download_button(
-                    "Download paying_tenants.csv",
-                    data=_pay_combined.to_csv(index=False),
-                    file_name=f"paying_tenants_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    key="dl_paying_sets",
-                )
-
-            with exp_c4:
-                st.markdown("**4. PS Profiles + Paying Flag**")
-                st.caption("PetScreening profiles from Snowflake with the paying flag applied — the raw join result before final filtering.")
-                if st.button("Generate Profiles Export", key="gen_profiles_export"):
-                    with st.spinner("Querying Snowflake for profiles..."):
-                        _sql = f"""
-                        SELECT DISTINCT
-                            du.property_id,
-                            p.property_name,
-                            COALESCE(
-                                l.lease_source_external_id:tenant_code::STRING,
-                                l.lease_source_external_id:"customerId"::STRING,
-                                l.lease_source_external_id:"customer_id"::STRING,
-                                l.lease_source_external_id:"lease_id"::STRING
-                            ) AS tenant_code,
-                            ue.user_email,
-                            ue.user_first_name,
-                            ue.user_last_name,
-                            ue.compliance_status,
-                            ue.user_pet_type,
-                            ue.user_pet_status,
-                            ue.user_profile_url
-                        FROM PROD.common.d_units du
-                        JOIN PROD.common.d_properties p ON du.property_id = p.property_id
-                        JOIN PROD.petscreening.petscreening__user_enriched ue ON ue.unit_id = du.unit_id
-                        JOIN PROD.common.f_leases l ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
-                        WHERE du.unit_source = '{pmc_sys}'
-                          AND du.property_id IN ({props_str_export})
-                          AND ue.compliance_status = 'compliant'
-                          AND ue.user_pet_type = 'household'
-                          AND ue.user_pet_status = 'active'
-                          AND ue.user_email IS NOT NULL
-                          AND TRIM(ue.user_email) <> ''
-                          AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
-                        """
-                        _profiles = pd.DataFrame(run_query(_sql))
-                        if not _profiles.empty:
-                            _profiles = _apply_paying_flag(_profiles, _pay_tc, _pay_em)
-                            st.session_state["_export_profiles_df"] = _profiles
-                            st.success(f"Loaded {len(_profiles):,} profiles. {(_profiles['pet_rent_paid'] == 1).sum():,} paying, {(_profiles['pet_rent_paid'] == 0).sum():,} not paying.")
-                        else:
-                            st.warning("No profiles found.")
-
-                if "_export_profiles_df" in st.session_state and st.session_state["_export_profiles_df"] is not None:
-                    _prof_df = st.session_state["_export_profiles_df"]
+                with exp_c1:
+                    st.markdown("**1. All API Charges**")
+                    st.caption("Every charge line from the API (all tenants, all codes). Dates are auto-fixed.")
+                    _export_all = _fix_dates_for_export(df)
                     st.download_button(
-                        "Download profiles_with_flag.csv",
-                        data=_prof_df.to_csv(index=False),
-                        file_name=f"profiles_with_paying_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "Download all_charges.csv",
+                        data=_export_all.to_csv(index=False),
+                        file_name=f"all_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                         mime="text/csv",
-                        key="dl_profiles_flag",
+                        key="dl_all_charges",
                     )
 
-            # ── 5. AR Transactions Export (Entrata only) ────────────
-            _ar_export_df = st.session_state.get("ar_charges_df")
-            if pmc_sys == "entrata" and _ar_export_df is not None and not _ar_export_df.empty:
-                st.markdown("---")
-                exp_ar1, exp_ar2, _ = st.columns([1, 1, 2])
-                with exp_ar1:
-                    st.markdown("**5. AR Transactions (Entrata)**")
-                    st.caption(
-                        "Actual posted AR transactions (pet-related only). "
-                        "These are what was *actually billed* vs the scheduled charges above."
-                    )
+                with exp_c2:
+                    st.markdown("**2. Pet Charges Only**")
+                    st.caption("Filtered to your selected pet charge codes only. Dates are auto-fixed.")
+                    _pet_only = df[df['charge_code'].isin(selected_codes)]
+                    _export_pet = _fix_dates_for_export(_pet_only)
                     st.download_button(
-                        "Download ar_transactions.csv",
-                        data=_ar_export_df.to_csv(index=False),
-                        file_name=f"ar_transactions_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                        "Download pet_charges.csv",
+                        data=_export_pet.to_csv(index=False),
+                        file_name=f"pet_charges_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
                         mime="text/csv",
-                        key="dl_ar_transactions",
+                        key="dl_pet_charges",
                     )
-                with exp_ar2:
-                    st.markdown("**6. Scheduled + AR Flag**")
-                    st.caption(
-                        "All pet charges with an `ar_match` column: YES if a matching AR transaction "
-                        "exists for the same lease + charge code, NO otherwise."
+
+                with exp_c3:
+                    st.markdown("**3. Paying Tenant Sets**")
+                    st.caption("Every (property_id, tenant_code) and (property_id, email) pair identified as paying after unit/lease expansion.")
+                    _pay_tc, _pay_em = _build_paying_sets(df, selected_codes)
+                    _pay_tc_df = pd.DataFrame(list(_pay_tc), columns=["property_id", "tenant_code"])
+                    _pay_em_df = pd.DataFrame(list(_pay_em), columns=["property_id", "email"])
+                    _pay_combined = pd.concat([
+                        _pay_tc_df.assign(match_type="tenant_code", match_key=_pay_tc_df["tenant_code"]).drop(columns=["tenant_code"]),
+                        _pay_em_df.assign(match_type="email", match_key=_pay_em_df["email"]).drop(columns=["email"]),
+                    ], ignore_index=True)
+                    st.download_button(
+                        "Download paying_tenants.csv",
+                        data=_pay_combined.to_csv(index=False),
+                        file_name=f"paying_tenants_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        key="dl_paying_sets",
                     )
-                    # Build the flagged export
-                    _pet_sched = df[df['charge_code'].isin(selected_codes)].copy()
-                    _ar_keys = set()
-                    if 'lease_id' in _pet_sched.columns:
-                        for _, _ar_row in _ar_export_df.iterrows():
-                            _ar_keys.add((
-                                str(_ar_row.get('lease_id', '')).strip(),
-                                str(_ar_row.get('charge_code_name', '')).strip().lower(),
-                            ))
-                        _pet_sched['ar_match'] = _pet_sched.apply(
-                            lambda r: 'YES' if (
-                                str(r.get('lease_id', '')).strip(),
-                                str(r.get('charge_code', '')).strip().lower(),
-                            ) in _ar_keys else 'NO',
-                            axis=1,
+
+                with exp_c4:
+                    st.markdown("**4. PS Profiles + Paying Flag**")
+                    st.caption("PetScreening profiles from Snowflake with the paying flag applied — the raw join result before final filtering.")
+                    if st.button("Generate Profiles Export", key="gen_profiles_export"):
+                        with st.spinner("Querying Snowflake for profiles..."):
+                            _conn = get_snowflake_connection()
+                            _cur = _conn.cursor(snowflake.connector.DictCursor)
+                            _sql = f"""
+                            SELECT DISTINCT
+                                du.property_id,
+                                p.property_name,
+                                COALESCE(
+                                    l.lease_source_external_id:tenant_code::STRING,
+                                    l.lease_source_external_id:"customerId"::STRING,
+                                    l.lease_source_external_id:"customer_id"::STRING,
+                                    l.lease_source_external_id:"lease_id"::STRING
+                                ) AS tenant_code,
+                                ue.user_email,
+                                ue.user_first_name,
+                                ue.user_last_name,
+                                ue.compliance_status,
+                                ue.user_pet_type,
+                                ue.user_pet_status,
+                                ue.user_profile_url
+                            FROM PROD.common.d_units du
+                            JOIN PROD.common.d_properties p ON du.property_id = p.property_id
+                            JOIN PROD.petscreening.petscreening__user_enriched ue ON ue.unit_id = du.unit_id
+                            JOIN PROD.common.f_leases l ON du.unit_key = l.unit_key AND l.user_key = ue.user_key
+                            WHERE du.unit_source = '{pmc_sys}'
+                              AND du.property_id IN ({props_str_export})
+                              AND ue.compliance_status = 'compliant'
+                              AND ue.user_pet_type = 'household'
+                              AND ue.user_pet_status = 'active'
+                              AND ue.user_email IS NOT NULL
+                              AND TRIM(ue.user_email) <> ''
+                              AND LOWER(TRIM(ue.user_email)) NOT IN ({JUNK_EMAILS})
+                            """
+                            _cur.execute(_sql)
+                            _profiles = pd.DataFrame(_cur.fetchall())
+                            if not _profiles.empty:
+                                _profiles = _apply_paying_flag(_profiles, _pay_tc, _pay_em)
+                                st.session_state["_export_profiles_df"] = _profiles
+                                st.success(f"Loaded {len(_profiles):,} profiles. {(_profiles['pet_rent_paid'] == 1).sum():,} paying, {(_profiles['pet_rent_paid'] == 0).sum():,} not paying.")
+                            else:
+                                st.warning("No profiles found.")
+
+                    if "_export_profiles_df" in st.session_state and st.session_state["_export_profiles_df"] is not None:
+                        _prof_df = st.session_state["_export_profiles_df"]
+                        st.download_button(
+                            "Download profiles_with_flag.csv",
+                            data=_prof_df.to_csv(index=False),
+                            file_name=f"profiles_with_paying_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_profiles_flag",
                         )
-                    else:
-                        _pet_sched['ar_match'] = 'N/A'
-                    _export_flagged = _fix_dates_for_export(_pet_sched)
-                    st.download_button(
-                        "Download pet_charges_with_ar_flag.csv",
-                        data=_export_flagged.to_csv(index=False),
-                        file_name=f"pet_charges_ar_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        key="dl_pet_ar_flag",
-                    )
 
-            # ── 7. Raw Lease Arrays Export (Entrata only) ────────────
-            _raw_arrays_df = st.session_state.get("raw_lease_arrays_df")
-            if pmc_sys == "entrata" and _raw_arrays_df is not None and not _raw_arrays_df.empty:
-                st.markdown("---")
-                _rac1, _rac2, _ = st.columns([1, 1, 2])
-                with _rac1:
-                    st.markdown("**7. Raw Lease Arrays (Entrata)**")
-                    st.caption(
-                        "One row per lease with the raw `scheduledCharges` and `arTransactions` "
-                        "JSON arrays exactly as returned by the Entrata API. "
-                        "Open the CSV and expand the JSON columns to see every individual "
-                        "charge and transaction."
-                    )
-                    st.download_button(
-                        "Download raw_lease_arrays.csv",
-                        data=_raw_arrays_df.to_csv(index=False),
-                        file_name=f"raw_lease_arrays_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        key="dl_raw_lease_arrays",
-                    )
-                with _rac2:
-                    _n_with_sched = (_raw_arrays_df['n_scheduled_charges'] > 0).sum()
-                    _n_with_ar = (_raw_arrays_df['n_ar_transactions'] > 0).sum()
-                    st.metric("Leases with scheduled charges", f"{_n_with_sched:,}")
-                    st.metric("Leases with AR transactions", f"{_n_with_ar:,}")
+                # ── 5. AR Transactions Export (Entrata only) ────────────
+                _ar_export_df = st.session_state.get("ar_charges_df")
+                if pmc_sys == "entrata" and _ar_export_df is not None and not _ar_export_df.empty:
+                    st.markdown("---")
+                    exp_ar1, exp_ar2, _ = st.columns([1, 1, 2])
+                    with exp_ar1:
+                        st.markdown("**5. AR Transactions (Entrata)**")
+                        st.caption(
+                            "Actual posted AR transactions (pet-related only). "
+                            "These are what was *actually billed* vs the scheduled charges above."
+                        )
+                        st.download_button(
+                            "Download ar_transactions.csv",
+                            data=_ar_export_df.to_csv(index=False),
+                            file_name=f"ar_transactions_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_ar_transactions",
+                        )
+                    with exp_ar2:
+                        st.markdown("**6. Scheduled + AR Flag**")
+                        st.caption(
+                            "All pet charges with an `ar_match` column: YES if a matching AR transaction "
+                            "exists for the same lease + charge code, NO otherwise."
+                        )
+                        # Build the flagged export
+                        _pet_sched = df[df['charge_code'].isin(selected_codes)].copy()
+                        _ar_keys = set()
+                        if 'lease_id' in _pet_sched.columns:
+                            for _, _ar_row in _ar_export_df.iterrows():
+                                _ar_keys.add((
+                                    str(_ar_row.get('lease_id', '')).strip(),
+                                    str(_ar_row.get('charge_code_name', '')).strip().lower(),
+                                ))
+                            _pet_sched['ar_match'] = _pet_sched.apply(
+                                lambda r: 'YES' if (
+                                    str(r.get('lease_id', '')).strip(),
+                                    str(r.get('charge_code', '')).strip().lower(),
+                                ) in _ar_keys else 'NO',
+                                axis=1,
+                            )
+                        else:
+                            _pet_sched['ar_match'] = 'N/A'
+                        _export_flagged = _fix_dates_for_export(_pet_sched)
+                        st.download_button(
+                            "Download pet_charges_with_ar_flag.csv",
+                            data=_export_flagged.to_csv(index=False),
+                            file_name=f"pet_charges_ar_flag_{pmc_sys}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_pet_ar_flag",
+                        )
 
-            st.divider()
-            st.markdown("##### Snowflake Upload Instructions")
-            st.code(
-                "-- 1. Create a stage and file format\n"
-                "CREATE OR REPLACE FILE FORMAT my_csv_format TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '\"' SKIP_HEADER = 1;\n"
-                "CREATE OR REPLACE STAGE my_validation_stage FILE_FORMAT = my_csv_format;\n\n"
-                "-- 2. Upload via SnowSQL or Snowsight UI\n"
-                "PUT file:///path/to/all_charges_*.csv @my_validation_stage;\n\n"
-                "-- 3. Create table and load\n"
-                "CREATE OR REPLACE TABLE sandbox.validation.api_charges AS\n"
-                "SELECT $1 as parent_company, $2 as property_id, $3 as property_name,\n"
-                "       $4 as property_code, $5 as launch_date, $6 as unit_code,\n"
-                "       $7 as unit_type, $8 as market_rent, $9 as tenant_code,\n"
-                "       $10 as first_name, $11 as last_name, $12 as tenant_status,\n"
-                "       $13 as lease_from, $14 as lease_to, $15 as move_in,\n"
-                "       $16 as move_out, $17 as email, $18 as charge_code,\n"
-                "       $19 as charge_type, $20 as charge_amount,\n"
-                "       $21 as charge_from_date, $22 as charge_to_date\n"
-                "FROM @my_validation_stage/all_charges_*.csv;\n\n"
-                "-- 4. Validate: count pet charges\n"
-                "SELECT charge_code, COUNT(*) as cnt, SUM(charge_amount::float) as total\n"
-                "FROM sandbox.validation.api_charges\n"
-                "WHERE charge_code ILIKE '%pet%'\n"
-                "GROUP BY 1 ORDER BY 2 DESC;",
-                language="sql",
-            )
+                # ── 7. Raw Lease Arrays Export (Entrata only) ────────────
+                _raw_arrays_df = st.session_state.get("raw_lease_arrays_df")
+                if pmc_sys == "entrata" and _raw_arrays_df is not None and not _raw_arrays_df.empty:
+                    st.markdown("---")
+                    _rac1, _rac2, _ = st.columns([1, 1, 2])
+                    with _rac1:
+                        st.markdown("**7. Raw Lease Arrays (Entrata)**")
+                        st.caption(
+                            "One row per lease with the raw `scheduledCharges` and `arTransactions` "
+                            "JSON arrays exactly as returned by the Entrata API. "
+                            "Open the CSV and expand the JSON columns to see every individual "
+                            "charge and transaction."
+                        )
+                        st.download_button(
+                            "Download raw_lease_arrays.csv",
+                            data=_raw_arrays_df.to_csv(index=False),
+                            file_name=f"raw_lease_arrays_entrata_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key="dl_raw_lease_arrays",
+                        )
+                    with _rac2:
+                        _n_with_sched = (_raw_arrays_df['n_scheduled_charges'] > 0).sum()
+                        _n_with_ar = (_raw_arrays_df['n_ar_transactions'] > 0).sum()
+                        st.metric("Leases with scheduled charges", f"{_n_with_sched:,}")
+                        st.metric("Leases with AR transactions", f"{_n_with_ar:,}")
+
+                st.divider()
+                st.markdown("##### Snowflake Upload Instructions")
+                st.code(
+                    "-- 1. Create a stage and file format\n"
+                    "CREATE OR REPLACE FILE FORMAT my_csv_format TYPE = 'CSV' FIELD_OPTIONALLY_ENCLOSED_BY = '\"' SKIP_HEADER = 1;\n"
+                    "CREATE OR REPLACE STAGE my_validation_stage FILE_FORMAT = my_csv_format;\n\n"
+                    "-- 2. Upload via SnowSQL or Snowsight UI\n"
+                    "PUT file:///path/to/all_charges_*.csv @my_validation_stage;\n\n"
+                    "-- 3. Create table and load\n"
+                    "CREATE OR REPLACE TABLE sandbox.validation.api_charges AS\n"
+                    "SELECT $1 as parent_company, $2 as property_id, $3 as property_name,\n"
+                    "       $4 as property_code, $5 as launch_date, $6 as unit_code,\n"
+                    "       $7 as unit_type, $8 as market_rent, $9 as tenant_code,\n"
+                    "       $10 as first_name, $11 as last_name, $12 as tenant_status,\n"
+                    "       $13 as lease_from, $14 as lease_to, $15 as move_in,\n"
+                    "       $16 as move_out, $17 as email, $18 as charge_code,\n"
+                    "       $19 as charge_type, $20 as charge_amount,\n"
+                    "       $21 as charge_from_date, $22 as charge_to_date\n"
+                    "FROM @my_validation_stage/all_charges_*.csv;\n\n"
+                    "-- 4. Validate: count pet charges\n"
+                    "SELECT charge_code, COUNT(*) as cnt, SUM(charge_amount::float) as total\n"
+                    "FROM sandbox.validation.api_charges\n"
+                    "WHERE charge_code ILIKE '%pet%'\n"
+                    "GROUP BY 1 ORDER BY 2 DESC;",
+                    language="sql",
+                )
 
         st.divider()
 
@@ -1005,8 +1196,8 @@ if st.session_state.all_charges_df is not None:
         # ═══════════════════════════════════════════════════════════════
         tab_charts, tab_next, tab_report, tab_docs = st.tabs([
             "Fee Collection Charts",
-            "Summary",
-            "Missing Pet Rent Report",
+            "Summary & Reports",
+            "Missing Pet Rent",
             "Documentation & SQL",
         ])
 
@@ -1020,7 +1211,7 @@ if st.session_state.all_charges_df is not None:
             if analyze_btn:
                 # Clear cached data on new analysis
                 for _key in list(st.session_state.keys()):
-                    if _key.startswith("missing_rent_") or _key in ("export_html", "exec_html"):
+                    if _key.startswith("missing_rent_") or _key in ("export_html", "exec_html", "exec_pdf", "exec_missing_csv", "exec_suspected_csv"):
                         del st.session_state[_key]
 
                 label = st.session_state.selection_label
@@ -1134,7 +1325,7 @@ if st.session_state.all_charges_df is not None:
                 charge_cols = [
                     "property_id", "property_name", "from_date", "to_date", "amount",
                     "tenant_code", "first_name", "last_name",
-                    "tenant_status", "charge_code", "charge_type",
+                    "tenant_status", "charge_code", "charge_type", "frequency",
                     "email", "move_in", "move_out", "lease_from", "lease_to",
                     "_raw_to_date", "_move_out_dt", "_lease_to_dt",
                 ]
@@ -1176,7 +1367,6 @@ if st.session_state.all_charges_df is not None:
                 #   Median span > 60 days → recurring (charged monthly)
                 #   Median span ≤ 60 days → one-time (deposit/fee)
                 # One-time charges only count in their from_date month.
-                _has_frequency = any('frequency' in rec for rec in cd["parsed_charges"])
                 _code_class = {}  # {(property_name, charge_code): "recurring" | "onetime"}
 
                 # Group records by (property_name, charge_code)
@@ -1185,16 +1375,24 @@ if st.session_state.all_charges_df is not None:
                     key = (rec["property_name"], rec["charge_code"])
                     _by_prop_code[key].append(rec)
 
+                # Per-property source system (matters in All Systems mode:
+                # each property is classified by its own system's rules).
+                _chart_sys_by_pid = st.session_state.get("property_system_by_pid", {}) or {}
+                _session_sys = st.session_state.get("pmc_system")
+
                 for (pname, code), recs in _by_prop_code.items():
-                    if st.session_state.get("pmc_system") == "real_page":
+                    _grp_sys = _session_sys
+                    if _session_sys == "all":
+                        _grp_sys = _chart_sys_by_pid.get(str(recs[0].get("property_id", "")), "yardi")
+                    _grp_freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency') and not pd.isna(r.get('frequency'))]
+                    if _grp_sys in ("real_page", "appfolio"):
                         # RealPage uses one row per observed post_month. Treat
                         # selected pet-rent codes as recurring even though each
                         # row's normalized date span is one month.
                         _code_class[(pname, code)] = "recurring"
-                    elif _has_frequency:
-                        freqs = [str(r.get('frequency', '')).strip().lower() for r in recs if r.get('frequency')]
-                        onetime_count = sum(1 for f in freqs if f == 'one-time')
-                        monthly_count = sum(1 for f in freqs if f in ('monthly', 'recurring'))
+                    elif _grp_freqs:
+                        onetime_count = sum(1 for f in _grp_freqs if f == 'one-time')
+                        monthly_count = sum(1 for f in _grp_freqs if f in ('monthly', 'recurring'))
                         _code_class[(pname, code)] = "onetime" if onetime_count > monthly_count else "recurring"
                     else:
                         spans = []
@@ -1224,13 +1422,23 @@ if st.session_state.all_charges_df is not None:
                 monthly_portfolio_count = defaultdict(int)
                 monthly_by_prop = defaultdict(lambda: defaultdict(float))
 
+                _neg_rows = 0
+                _neg_total = 0.0
                 for rec in cd["parsed_charges"]:
                     prop = rec["property_name"]
                     amt = rec["amount"]
                     from_dt = rec["from_date"]
                     to_dt = rec["to_date"]
 
-                    if from_dt is None or pd.isna(from_dt) or amt <= 0:
+                    if from_dt is None or pd.isna(from_dt):
+                        continue
+                    if amt <= 0:
+                        # Negative rows are usually concessions/adjustments
+                        # (e.g. CONCPET). They are excluded from revenue, but
+                        # surface the total so nobody thinks they vanished.
+                        if amt < 0:
+                            _neg_rows += 1
+                            _neg_total += amt
                         continue
 
                     charge_start = datetime(int(from_dt.year), int(from_dt.month), 1)
@@ -1255,12 +1463,19 @@ if st.session_state.all_charges_df is not None:
                 monthly_portfolio_count = dict(monthly_portfolio_count)
                 monthly_by_prop = {p: dict(v) for p, v in monthly_by_prop.items()}
 
+                if _neg_rows:
+                    st.caption(
+                        f"{_neg_rows:,} negative charge rows totaling "
+                        f"${_neg_total:,.0f} (concessions/adjustments, e.g. "
+                        f"CONCPET) were excluded from revenue."
+                    )
+
                 # Compute pre/post launch analysis
                 launch_analysis = compute_launch_analysis(monthly_by_prop, months, launch_dates)
 
                 st.header("Fee Collection Analysis")
 
-                latest_month = months[-1]
+                latest_month = _latest_observed_revenue_month(monthly_by_prop, months) or months[-1]
 
                 # ── Property funnel — consistent cascade ──────────────
                 _launch_in_data_funnel = {p: d for p, d in launch_dates.items() if p in monthly_by_prop}
@@ -1393,6 +1608,30 @@ if st.session_state.all_charges_df is not None:
                 # KPI ROW 1: Launch impact metrics (always shown)
                 # ═══════════════════════════════════════════════════════════
 
+                _rp_in_scope = (st.session_state.get("pmc_system") == "real_page") or (
+                    st.session_state.get("pmc_system") == "all"
+                    and any(v == "real_page" for v in (st.session_state.get("property_system_by_pid") or {}).values())
+                )
+                if _rp_in_scope:
+                    st.info(
+                        "**RealPage properties are current-state snapshots**: they "
+                        "contribute current collected revenue and the missing / "
+                        "suspected opportunity numbers, but **no before/after lift** "
+                        "— the RealPage API cannot return payment history "
+                        "(resident-ledger access pending with RealPage)."
+                    )
+
+                # ── Data health panel ──
+                try:
+                    _health = _run_data_health_checks(df, monthly_by_prop, months, launch_dates)
+                    _n_pass = sum(1 for h in _health if h["status"] == "pass")
+                    with st.expander(f"Data health — {_n_pass}/{len(_health)} checks passed"):
+                        for h in _health:
+                            _hi = "Pass" if h["status"] == "pass" else "Warning"
+                            st.markdown(f"- **{_hi}** · {h['label']} — {h['detail']}")
+                except Exception:
+                    pass
+
                 if launch_analysis:
                     comparable = {p: a for p, a in launch_analysis.items()
                                   if _launch_analysis_is_comparable(a)}
@@ -1405,9 +1644,10 @@ if st.session_state.all_charges_df is not None:
                     agg_diff_mo = sum(a["diff_monthly"] for a in comparable.values()) if comparable else 0
                     agg_diff = sum(a["diff_total"] for a in comparable.values()) if comparable else 0
 
-                    # Simple lift (current month - pre baseline)
+                    # Simple lift (latest observed revenue month - pre baseline)
                     _fc_pre_baseline = sum(a["pre_avg"] for a in comparable.values()) if comparable else 0
-                    _fc_current_rev = sum(monthly_by_prop[p].get(latest_month, 0) for p in comparable.keys()) if comparable else 0
+                    _fc_latest = _latest_observed_revenue_month(monthly_by_prop, months, comparable.keys()) if comparable else latest_month
+                    _fc_current_rev = sum(monthly_by_prop[p].get(_fc_latest, 0) for p in comparable.keys()) if comparable and _fc_latest else 0
                     _fc_simple_lift = _fc_current_rev - _fc_pre_baseline if _fc_pre_baseline > 0 else 0
 
                     # Display based on toggle
@@ -2027,398 +2267,404 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 ar_df = st.session_state.get("ar_charges_df")
                 if _is_entrata_view and ar_df is not None and not ar_df.empty:
                     st.divider()
-                    with st.expander("Scheduled vs Actual Revenue (AR Transactions)", expanded=False):
-                        st.caption(
-                            "Compares **scheduled charges** (what the lease says should be billed) "
-                            "with **AR transactions** (what was actually posted to the ledger). "
-                            "AR data comes from Entrata's `includeArTransactions` response."
-                        )
-
-                        ar_df_work = ar_df.copy()
-                        ar_df_work['_amt'] = pd.to_numeric(ar_df_work['amount'], errors='coerce').fillna(0)
-                        ar_df_work['_paid'] = pd.to_numeric(ar_df_work['amount_paid'], errors='coerce').fillna(0)
-
-                        _ar_post_dates = pd.to_datetime(ar_df_work['post_month'], errors='coerce', format='mixed')
-                        ar_df_work['_post_month_dt'] = _ar_post_dates.apply(
-                            lambda d: datetime(d.year, d.month, 1) if pd.notna(d) else None
-                        )
-                        ar_in_window = ar_df_work[
-                            ar_df_work['_post_month_dt'].notna()
-                            & ar_df_work['_post_month_dt'].between(months[0], months[-1])
-                        ]
-
-                        ar_monthly_portfolio = defaultdict(float)
-                        ar_monthly_by_prop = defaultdict(lambda: defaultdict(float))
-                        for _, row in ar_in_window.iterrows():
-                            m = row['_post_month_dt']
-                            ar_monthly_portfolio[m] += row['_amt']
-                            ar_monthly_by_prop[row['property_name']][m] += row['_amt']
-
-                        # Summary metrics
-                        total_ar = ar_in_window['_amt'].sum()
-                        total_ar_paid = ar_in_window['_paid'].sum()
-                        total_scheduled = sum(monthly_portfolio.get(m, 0) for m in months)
-
-                        mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("Scheduled Revenue", f"${total_scheduled:,.0f}",
-                                   help="Total from scheduled charges over the display window")
-                        mc2.metric("Actual Posted (AR)", f"${total_ar:,.0f}",
-                                   help="Total from AR transactions posted over the display window")
-                        mc3.metric("AR Collected", f"${total_ar_paid:,.0f}",
-                                   help="Of the posted amount, how much has been paid")
-                        _diff_pct = ((total_ar / total_scheduled - 1) * 100) if total_scheduled > 0 else 0
-                        mc4.metric("Variance", f"{_diff_pct:+.1f}%",
-                                   help="AR posted vs Scheduled: positive means actual > scheduled")
-
-                        # Monthly comparison table
-                        compare_rows = []
-                        for m in months:
-                            sched = monthly_portfolio.get(m, 0)
-                            actual = ar_monthly_portfolio.get(m, 0)
-                            compare_rows.append({
-                                "Month": m.strftime("%b %Y"),
-                                "Scheduled ($)": f"{sched:,.2f}",
-                                "Actual AR ($)": f"{actual:,.2f}",
-                                "Difference ($)": f"{(actual - sched):,.2f}",
-                                "Variance (%)": f"{((actual / sched - 1) * 100):+.1f}%" if sched > 0 else "N/A",
-                            })
-                        compare_df = pd.DataFrame(compare_rows)
-                        st.markdown("**Monthly Comparison**")
-                        st.table(compare_df)
-
-                        # Per-property breakdown
-                        if ar_monthly_by_prop:
-                            st.subheader("Per-Property: Scheduled vs Actual")
-                            prop_compare = []
-                            for prop in sorted(monthly_by_prop.keys()):
-                                sched_total = sum(monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
-                                ar_total = sum(ar_monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
-                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-                                prop_compare.append({
-                                    "Property": short,
-                                    "Scheduled ($)": f"{sched_total:,.2f}",
-                                    "Actual AR ($)": f"{ar_total:,.2f}",
-                                    "Difference ($)": f"{(ar_total - sched_total):,.2f}",
-                                    "Variance (%)": f"{((ar_total / sched_total - 1) * 100):+.1f}%" if sched_total > 0 else ("N/A" if ar_total == 0 else "New"),
-                                })
-                            prop_compare_df = pd.DataFrame(prop_compare)
-                            st.table(prop_compare_df)
-
-                        st.caption(
-                            f"AR data: **{len(ar_in_window):,}** pet-related transactions in window. "
-                            f"Total AR rows (all time): **{len(ar_df):,}**"
-                        )
-
-                        # ── Raw AR Transactions (individual posted charges) ──
-                        st.markdown("---")
-                        st.subheader("AR Transactions (Individual Posted Charges)")
-                        st.caption(
-                            "Each row = one actual charge posted to the ledger. "
-                            "This is what the property management system actually billed, "
-                            "not what the lease says *should* be billed."
-                        )
-
-                        # Build a clean display table from ar_df
-                        _ar_display = ar_df.copy()
-                        _ar_display['_amt'] = pd.to_numeric(_ar_display['amount'], errors='coerce').fillna(0)
-                        _ar_display['_paid'] = pd.to_numeric(_ar_display['amount_paid'], errors='coerce').fillna(0)
-                        _ar_display['_bal'] = pd.to_numeric(_ar_display['balance_due'], errors='coerce').fillna(0)
-
-                        _ar_table_rows = []
-                        for _, _r in _ar_display.iterrows():
-                            _ar_table_rows.append({
-                                "Unit": _r.get('unit', ''),
-                                "Lease ID": _r.get('lease_id', ''),
-                                "Charge": _r.get('charge_code_name', ''),
-                                "Post Date": str(_r.get('post_date', ''))[:10],
-                                "Post Month": str(_r.get('post_month', ''))[:7],
-                                "Amount": f"${_r['_amt']:,.2f}",
-                                "Paid": f"${_r['_paid']:,.2f}",
-                                "Balance": f"${_r['_bal']:,.2f}",
-                                "Description": str(_r.get('description', ''))[:50],
-                            })
-
-                        if _ar_table_rows:
-                            _ar_table_df = pd.DataFrame(_ar_table_rows)
-
-                            # Month filter
-                            _ar_months = sorted(set(r["Post Month"] for r in _ar_table_rows if r["Post Month"]))
-                            if _ar_months:
-                                _sel_ar_month = st.selectbox(
-                                    "Filter by post month:",
-                                    ["All"] + _ar_months,
-                                    index=0,
-                                    key="ar_month_filter",
-                                )
-                                if _sel_ar_month != "All":
-                                    _ar_table_df = _ar_table_df[_ar_table_df["Post Month"] == _sel_ar_month]
-
-                            st.markdown(f"**{len(_ar_table_df)}** transactions shown")
-                            _render_table(_ar_table_df, height=400)
-
-                            st.download_button(
-                                "Download AR transactions",
-                                data=_ar_display.to_csv(index=False),
-                                file_name=f"ar_transactions_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv",
-                                key="dl_ar_inline",
+                    # Developer-view only — hidden in the default client-facing view
+                    if st.session_state.get("dev_view", False):
+                        with st.expander("Scheduled vs Actual Revenue (AR Transactions)", expanded=False):
+                            st.caption(
+                                "Compares **scheduled charges** (what the lease says should be billed) "
+                                "with **AR transactions** (what was actually posted to the ledger). "
+                                "AR data comes from Entrata's `includeArTransactions` response."
                             )
-                        else:
-                            st.info("No AR transactions found for this property.")
+
+                            ar_df_work = ar_df.copy()
+                            ar_df_work['_amt'] = pd.to_numeric(ar_df_work['amount'], errors='coerce').fillna(0)
+                            ar_df_work['_paid'] = pd.to_numeric(ar_df_work['amount_paid'], errors='coerce').fillna(0)
+
+                            _ar_post_dates = pd.to_datetime(ar_df_work['post_month'], errors='coerce', format='mixed')
+                            ar_df_work['_post_month_dt'] = _ar_post_dates.apply(
+                                lambda d: datetime(d.year, d.month, 1) if pd.notna(d) else None
+                            )
+                            ar_in_window = ar_df_work[
+                                ar_df_work['_post_month_dt'].notna()
+                                & ar_df_work['_post_month_dt'].between(months[0], months[-1])
+                            ]
+
+                            ar_monthly_portfolio = defaultdict(float)
+                            ar_monthly_by_prop = defaultdict(lambda: defaultdict(float))
+                            for _, row in ar_in_window.iterrows():
+                                m = row['_post_month_dt']
+                                ar_monthly_portfolio[m] += row['_amt']
+                                ar_monthly_by_prop[row['property_name']][m] += row['_amt']
+
+                            # Summary metrics
+                            total_ar = ar_in_window['_amt'].sum()
+                            total_ar_paid = ar_in_window['_paid'].sum()
+                            total_scheduled = sum(monthly_portfolio.get(m, 0) for m in months)
+
+                            mc1, mc2, mc3, mc4 = st.columns(4)
+                            mc1.metric("Scheduled Revenue", f"${total_scheduled:,.0f}",
+                                       help="Total from scheduled charges over the display window")
+                            mc2.metric("Actual Posted (AR)", f"${total_ar:,.0f}",
+                                       help="Total from AR transactions posted over the display window")
+                            mc3.metric("AR Collected", f"${total_ar_paid:,.0f}",
+                                       help="Of the posted amount, how much has been paid")
+                            _diff_pct = ((total_ar / total_scheduled - 1) * 100) if total_scheduled > 0 else 0
+                            mc4.metric("Variance", f"{_diff_pct:+.1f}%",
+                                       help="AR posted vs Scheduled: positive means actual > scheduled")
+
+                            # Monthly comparison table
+                            compare_rows = []
+                            for m in months:
+                                sched = monthly_portfolio.get(m, 0)
+                                actual = ar_monthly_portfolio.get(m, 0)
+                                compare_rows.append({
+                                    "Month": m.strftime("%b %Y"),
+                                    "Scheduled ($)": f"{sched:,.2f}",
+                                    "Actual AR ($)": f"{actual:,.2f}",
+                                    "Difference ($)": f"{(actual - sched):,.2f}",
+                                    "Variance (%)": f"{((actual / sched - 1) * 100):+.1f}%" if sched > 0 else "N/A",
+                                })
+                            compare_df = pd.DataFrame(compare_rows)
+                            st.markdown("**Monthly Comparison**")
+                            st.table(compare_df)
+
+                            # Per-property breakdown
+                            if ar_monthly_by_prop:
+                                st.subheader("Per-Property: Scheduled vs Actual")
+                                prop_compare = []
+                                for prop in sorted(monthly_by_prop.keys()):
+                                    sched_total = sum(monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
+                                    ar_total = sum(ar_monthly_by_prop.get(prop, {}).get(m, 0) for m in months)
+                                    short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+                                    prop_compare.append({
+                                        "Property": short,
+                                        "Scheduled ($)": f"{sched_total:,.2f}",
+                                        "Actual AR ($)": f"{ar_total:,.2f}",
+                                        "Difference ($)": f"{(ar_total - sched_total):,.2f}",
+                                        "Variance (%)": f"{((ar_total / sched_total - 1) * 100):+.1f}%" if sched_total > 0 else ("N/A" if ar_total == 0 else "New"),
+                                    })
+                                prop_compare_df = pd.DataFrame(prop_compare)
+                                st.table(prop_compare_df)
+
+                            st.caption(
+                                f"AR data: **{len(ar_in_window):,}** pet-related transactions in window. "
+                                f"Total AR rows (all time): **{len(ar_df):,}**"
+                            )
+
+                            # ── Raw AR Transactions (individual posted charges) ──
+                            st.markdown("---")
+                            st.subheader("AR Transactions (Individual Posted Charges)")
+                            st.caption(
+                                "Each row = one actual charge posted to the ledger. "
+                                "This is what the property management system actually billed, "
+                                "not what the lease says *should* be billed."
+                            )
+
+                            # Build a clean display table from ar_df
+                            _ar_display = ar_df.copy()
+                            _ar_display['_amt'] = pd.to_numeric(_ar_display['amount'], errors='coerce').fillna(0)
+                            _ar_display['_paid'] = pd.to_numeric(_ar_display['amount_paid'], errors='coerce').fillna(0)
+                            _ar_display['_bal'] = pd.to_numeric(_ar_display['balance_due'], errors='coerce').fillna(0)
+
+                            _ar_table_rows = []
+                            for _, _r in _ar_display.iterrows():
+                                _ar_table_rows.append({
+                                    "Unit": _r.get('unit', ''),
+                                    "Lease ID": _r.get('lease_id', ''),
+                                    "Charge": _r.get('charge_code_name', ''),
+                                    "Post Date": str(_r.get('post_date', ''))[:10],
+                                    "Post Month": str(_r.get('post_month', ''))[:7],
+                                    "Amount": f"${_r['_amt']:,.2f}",
+                                    "Paid": f"${_r['_paid']:,.2f}",
+                                    "Balance": f"${_r['_bal']:,.2f}",
+                                    "Description": str(_r.get('description', ''))[:50],
+                                })
+
+                            if _ar_table_rows:
+                                _ar_table_df = pd.DataFrame(_ar_table_rows)
+
+                                # Month filter
+                                _ar_months = sorted(set(r["Post Month"] for r in _ar_table_rows if r["Post Month"]))
+                                if _ar_months:
+                                    _sel_ar_month = st.selectbox(
+                                        "Filter by post month:",
+                                        ["All"] + _ar_months,
+                                        index=0,
+                                        key="ar_month_filter",
+                                    )
+                                    if _sel_ar_month != "All":
+                                        _ar_table_df = _ar_table_df[_ar_table_df["Post Month"] == _sel_ar_month]
+
+                                st.markdown(f"**{len(_ar_table_df)}** transactions shown")
+                                _render_table(_ar_table_df, height=400)
+
+                                st.download_button(
+                                    "Download AR transactions",
+                                    data=_ar_display.to_csv(index=False),
+                                    file_name=f"ar_transactions_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    mime="text/csv",
+                                    key="dl_ar_inline",
+                                )
+                            else:
+                                st.info("No AR transactions found for this property.")
 
                 # ── 6. Collapsible Tables Section ───────────────────────
                 st.divider()
-                with st.expander("Show detailed tables (PetScreening impact breakdown & monthly revenue)", expanded=False):
+                # Developer-view only — hidden in the default client-facing view
+                if st.session_state.get("dev_view", False):
+                    with st.expander("Show detailed tables (PetScreening impact breakdown & monthly revenue)", expanded=False):
 
-                    # -- Impact Breakdown Table --
-                    if launch_analysis:
-                        st.subheader("PetScreening Impact by Property")
-                        st.caption(
-                            "Sorted by biggest monthly revenue increase after PetScreening launch. "
-                            "Properties launched before the lookback window show 'Live before window' (no pre-launch data to compare)."
-                        )
-
-                        la_rows = []
-                        for prop, a in launch_analysis.items():
-                            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-
-                            # Properties need observed pre-launch data and a meaningful baseline to compare.
-                            # A 1-2 month baseline is marked as low-data, but still contributes
-                            # so the table matches the top aggregate and individual chart lift badges.
-                            has_comparison = _launch_analysis_is_comparable(a)
-
-                            if has_comparison:
-                                sign_m = "+" if a["diff_monthly"] >= 0 else ""
-                                sign_t = "+" if a["diff_total"] >= 0 else ""
-                                arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
-                                la_rows.append({
-                                    "Property": short,
-                                    "Launch": a["launch_month"].strftime("%b %Y"),
-                                    "Pre-PS Avg ($/mo)": f"${a['pre_avg']:,.0f}",
-                                    "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
-                                    "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
-                                    "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
-                                    "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo completed post · {a['n_post']}mo total",
-                                    "_sort": a["diff_monthly"],
-                                    "_comparable": True,
-                                })
-                            else:
-                                la_rows.append({
-                                    "Property": short,
-                                    "Launch": a["launch_month"].strftime("%b %Y"),
-                                    "Pre-PS Avg ($/mo)": "Live before window",
-                                    "Current Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
-                                    "Monthly Lift": "—",
-                                    "Cumulative Impact": "—",
-                                    "Window": f"{a['n_post']}mo after (no pre data)",
-                                    "_sort": -999999,
-                                    "_comparable": False,
-                                })
-
-                        # Sort: comparable properties first (by monthly change desc),
-                        # then non-comparable at the bottom
-                        la_rows.sort(key=lambda r: (not r["_comparable"], -r["_sort"] if r["_comparable"] else 0))
-                        for r in la_rows:
-                            del r["_sort"]
-                            del r["_comparable"]
-
-                        la_df = pd.DataFrame(la_rows)
-                        _render_table(la_df, height=500)
-
-                        # Count how many are excluded from the aggregate
-                        n_no_pre = sum(1 for a in launch_analysis.values() if a["n_pre"] == 0)
-                        if n_no_pre > 0:
+                        # -- Impact Breakdown Table --
+                        if launch_analysis:
+                            st.subheader("PetScreening Impact by Property")
                             st.caption(
-                                f"**{n_no_pre}** propert{'y' if n_no_pre == 1 else 'ies'} launched before the "
-                                f"lookback window — shown as 'Live before window' and **excluded** from "
-                                f"aggregate impact numbers above (no pre-launch baseline to compare)."
+                                "Sorted by biggest monthly revenue increase after PetScreening launch. "
+                                "Properties launched before the lookback window show 'Live before window' (no pre-launch data to compare)."
                             )
 
-                    # -- Monthly Revenue Table --
-                    st.divider()
-                    st.subheader("Monthly Revenue Table")
-                    monthly_table = []
-                    for month in months:
-                        row = {"Month": month.strftime("%b %Y"),
-                               "Total Revenue": monthly_portfolio.get(month, 0),
-                               "# Charges": monthly_portfolio_count.get(month, 0)}
-                        for prop in sorted(monthly_by_prop.keys()):
-                            short = prop.split(" - ", 1)[-1] if " - " in prop else prop
-                            row[short] = monthly_by_prop[prop].get(month, 0)
-                        monthly_table.append(row)
+                            la_rows = []
+                            for prop, a in launch_analysis.items():
+                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
 
-                    monthly_df = pd.DataFrame(monthly_table)
-                    _render_table(monthly_df, height=500)
+                                # Properties need observed pre-launch data and a meaningful baseline to compare.
+                                # A 1-2 month baseline is marked as low-data, but still contributes
+                                # so the table matches the top aggregate and individual chart lift badges.
+                                has_comparison = _launch_analysis_is_comparable(a)
 
-                    st.download_button(
-                        "Download Selected Charges CSV",
-                        data=cd["filtered_csv"],
-                        file_name=f"pet_rent_{label.replace(' ', '_')}.csv",
-                        mime="text/csv",
-                    )
+                                if has_comparison:
+                                    sign_m = "+" if a["diff_monthly"] >= 0 else ""
+                                    sign_t = "+" if a["diff_total"] >= 0 else ""
+                                    arrow = "↑" if a["diff_monthly"] >= 0 else "↓"
+                                    la_rows.append({
+                                        "Property": short,
+                                        "Launch": a["launch_month"].strftime("%b %Y"),
+                                        "Pre-PS Avg ($/mo)": f"${a['pre_avg']:,.0f}",
+                                        "Current Avg ($/mo)": f"${a['post_recent_avg']:,.0f}",
+                                        "Monthly Lift": f"{arrow} {sign_m}${a['diff_monthly']:,.0f}/mo",
+                                        "Cumulative Impact": f"{sign_t}${a['diff_total']:,.0f}",
+                                        "Window": f"{a['n_pre']}mo pre · {a.get('n_recent_post', 0)}mo completed post · {a['n_post']}mo total",
+                                        "_sort": a["diff_monthly"],
+                                        "_comparable": True,
+                                    })
+                                else:
+                                    la_rows.append({
+                                        "Property": short,
+                                        "Launch": a["launch_month"].strftime("%b %Y"),
+                                        "Pre-PS Avg ($/mo)": "Live before window",
+                                        "Current Avg ($/mo)": f"${a['post_monthly_avg']:,.0f}",
+                                        "Monthly Lift": "—",
+                                        "Cumulative Impact": "—",
+                                        "Window": f"{a['n_post']}mo after (no pre data)",
+                                        "_sort": -999999,
+                                        "_comparable": False,
+                                    })
+
+                            # Sort: comparable properties first (by monthly change desc),
+                            # then non-comparable at the bottom
+                            la_rows.sort(key=lambda r: (not r["_comparable"], -r["_sort"] if r["_comparable"] else 0))
+                            for r in la_rows:
+                                del r["_sort"]
+                                del r["_comparable"]
+
+                            la_df = pd.DataFrame(la_rows)
+                            _render_table(la_df, height=500)
+
+                            # Count how many are excluded from the aggregate
+                            n_no_pre = sum(1 for a in launch_analysis.values() if a["n_pre"] == 0)
+                            if n_no_pre > 0:
+                                st.caption(
+                                    f"**{n_no_pre}** propert{'y' if n_no_pre == 1 else 'ies'} launched before the "
+                                    f"lookback window — shown as 'Live before window' and **excluded** from "
+                                    f"aggregate impact numbers above (no pre-launch baseline to compare)."
+                                )
+
+                        # -- Monthly Revenue Table --
+                        st.divider()
+                        st.subheader("Monthly Revenue Table")
+                        monthly_table = []
+                        for month in months:
+                            row = {"Month": month.strftime("%b %Y"),
+                                   "Total Revenue": monthly_portfolio.get(month, 0),
+                                   "# Charges": monthly_portfolio_count.get(month, 0)}
+                            for prop in sorted(monthly_by_prop.keys()):
+                                short = prop.split(" - ", 1)[-1] if " - " in prop else prop
+                                row[short] = monthly_by_prop[prop].get(month, 0)
+                            monthly_table.append(row)
+
+                        monthly_df = pd.DataFrame(monthly_table)
+                        _render_table(monthly_df, height=500)
+
+                        st.download_button(
+                            "Download Selected Charges CSV",
+                            data=cd["filtered_csv"],
+                            file_name=f"pet_rent_{label.replace(' ', '_')}.csv",
+                            mime="text/csv",
+                        )
 
                 # ── 6. Per-Property Data Explorer ───────────────────────
                 st.divider()
-                with st.expander("Property Data Explorer (debug / compare individual charge rows)", expanded=False):
-                    st.caption(
-                        "**to_date** = coalesce(charge_to_date, move_out, lease_to) for past tenants. "
-                        "Current tenants show ACTIVE. **to_date_src** shows which date field was used."
-                    )
-                    all_props_sorted = sorted(monthly_by_prop.keys())
-                    short_to_full = {(p.split(" - ", 1)[-1] if " - " in p else p): p for p in all_props_sorted}
-                    explorer_prop = st.selectbox(
-                        "Select a property to inspect:",
-                        [""] + sorted(short_to_full.keys()),
-                        key="explorer_prop",
-                    )
-                    if explorer_prop:
-                        full_prop = short_to_full[explorer_prop]
+                # Developer-view only — hidden in the default client-facing view
+                if st.session_state.get("dev_view", False):
+                    with st.expander("Property Data Explorer (debug / compare individual charge rows)", expanded=False):
+                        st.caption(
+                            "**to_date** = coalesce(charge_to_date, move_out, lease_to) for past tenants. "
+                            "Current tenants show ACTIVE. **to_date_src** shows which date field was used."
+                        )
+                        all_props_sorted = sorted(monthly_by_prop.keys())
+                        short_to_full = {(p.split(" - ", 1)[-1] if " - " in p else p): p for p in all_props_sorted}
+                        explorer_prop = st.selectbox(
+                            "Select a property to inspect:",
+                            [""] + sorted(short_to_full.keys()),
+                            key="explorer_prop",
+                        )
+                        if explorer_prop:
+                            full_prop = short_to_full[explorer_prop]
 
-                        # Filter charges for this property
-                        prop_charges = [
-                            r for r in cd["parsed_charges"]
-                            if r["property_name"] == full_prop and r.get("amount", 0) > 0
-                        ]
-                        raw_df = pd.DataFrame(prop_charges) if prop_charges else pd.DataFrame()
-
-                        if not raw_df.empty:
-                            # ── Summary by charge code ──
-                            st.markdown("##### Charge Code Breakdown")
-                            code_summary = (
-                                raw_df.groupby("charge_code")
-                                .agg(
-                                    tenants=("tenant_code", "nunique"),
-                                    rows=("charge_code", "size"),
-                                    total=("amount", "sum"),
-                                    avg_amt=("amount", "mean"),
-                                    min_amt=("amount", "min"),
-                                    max_amt=("amount", "max"),
-                                )
-                                .sort_values("total", ascending=False)
-                                .reset_index()
-                            )
-                            code_summary.columns = [
-                                "Charge Code", "Unique Tenants", "Rows",
-                                "Total $", "Avg $/charge", "Min $", "Max $",
+                            # Filter charges for this property
+                            prop_charges = [
+                                r for r in cd["parsed_charges"]
+                                if r["property_name"] == full_prop and r.get("amount", 0) > 0
                             ]
-                            for col in ["Total $", "Avg $/charge", "Min $", "Max $"]:
-                                code_summary[col] = code_summary[col].apply(lambda x: f"${x:,.2f}")
-                            _render_table(code_summary)
+                            raw_df = pd.DataFrame(prop_charges) if prop_charges else pd.DataFrame()
 
-                            # ── Monthly breakdown ──
-                            st.markdown("##### Monthly Revenue")
-                            prop_monthly = monthly_by_prop.get(full_prop, {})
-                            prop_table = []
-                            for m in months:
-                                # Count charges active in this month
-                                active_in_month = [
-                                    rec for rec in prop_charges
-                                    if rec["from_date"] is not None
-                                    and not pd.isna(rec["from_date"])
-                                    and datetime(int(rec["from_date"].year), int(rec["from_date"].month), 1) <= m
-                                    and (
-                                        datetime(int(rec["to_date"].year), int(rec["to_date"].month), 1) >= m
-                                        if rec["to_date"] is not None and not pd.isna(rec["to_date"]) and isinstance(rec["to_date"], datetime)
-                                        else window_end >= m
+                            if not raw_df.empty:
+                                # ── Summary by charge code ──
+                                st.markdown("##### Charge Code Breakdown")
+                                code_summary = (
+                                    raw_df.groupby("charge_code")
+                                    .agg(
+                                        tenants=("tenant_code", "nunique"),
+                                        rows=("charge_code", "size"),
+                                        total=("amount", "sum"),
+                                        avg_amt=("amount", "mean"),
+                                        min_amt=("amount", "min"),
+                                        max_amt=("amount", "max"),
                                     )
-                                ]
-                                # Break down by charge code
-                                code_breakdown = defaultdict(float)
-                                for rec in active_in_month:
-                                    code_breakdown[rec.get("charge_code", "?")] += rec["amount"]
-                                breakdown_str = ", ".join(
-                                    f"{code}: ${val:,.0f}" for code, val in sorted(code_breakdown.items())
-                                ) if code_breakdown else ""
-
-                                prop_table.append({
-                                    "Month": m.strftime("%b %Y"),
-                                    "Revenue": f"${prop_monthly.get(m, 0):,.2f}",
-                                    "# Charges": len(active_in_month),
-                                    "# Tenants": len(set(r.get("tenant_code", "") for r in active_in_month)),
-                                    "By Code": breakdown_str,
-                                })
-                            st.caption(f"**{explorer_prop}** — monthly revenue for display window ({len(months)} months)")
-                            _render_table(pd.DataFrame(prop_table), height=400)
-
-                            # ── Full charge rows with tenant info ──
-                            st.markdown("##### All Charge Line Items")
-
-                            # Show which globally-selected codes exist for this property
-                            available_codes = sorted(raw_df["charge_code"].dropna().unique().tolist())
-                            missing_codes = [c for c in selected_codes if c not in available_codes]
-                            if missing_codes:
-                                st.info(
-                                    f"This property only has **{', '.join(available_codes)}** from your selected codes. \n"
-                                    f"Not found here: {', '.join(f'`{c}`' for c in missing_codes)} "
-                                    f"(those codes may not apply to this property)."
+                                    .sort_values("total", ascending=False)
+                                    .reset_index()
                                 )
+                                code_summary.columns = [
+                                    "Charge Code", "Unique Tenants", "Rows",
+                                    "Total $", "Avg $/charge", "Min $", "Max $",
+                                ]
+                                for col in ["Total $", "Avg $/charge", "Min $", "Max $"]:
+                                    code_summary[col] = code_summary[col].apply(lambda x: f"${x:,.2f}")
+                                _render_table(code_summary)
 
-                            # Optional: filter by charge code within explorer
-                            filter_code = st.multiselect(
-                                "Filter by charge code:",
-                                available_codes,
-                                default=available_codes,
-                                key="explorer_code_filter",
-                            )
-                            display_df = raw_df[raw_df["charge_code"].isin(filter_code)].copy() if filter_code else raw_df.copy()
+                                # ── Monthly breakdown ──
+                                st.markdown("##### Monthly Revenue")
+                                prop_monthly = monthly_by_prop.get(full_prop, {})
+                                prop_table = []
+                                for m in months:
+                                    # Count charges active in this month
+                                    active_in_month = [
+                                        rec for rec in prop_charges
+                                        if rec["from_date"] is not None
+                                        and not pd.isna(rec["from_date"])
+                                        and datetime(int(rec["from_date"].year), int(rec["from_date"].month), 1) <= m
+                                        and (
+                                            datetime(int(rec["to_date"].year), int(rec["to_date"].month), 1) >= m
+                                            if rec["to_date"] is not None and not pd.isna(rec["to_date"]) and isinstance(rec["to_date"], datetime)
+                                            else window_end >= m
+                                        )
+                                    ]
+                                    # Break down by charge code
+                                    code_breakdown = defaultdict(float)
+                                    for rec in active_in_month:
+                                        code_breakdown[rec.get("charge_code", "?")] += rec["amount"]
+                                    breakdown_str = ", ".join(
+                                        f"{code}: ${val:,.0f}" for code, val in sorted(code_breakdown.items())
+                                    ) if code_breakdown else ""
 
-                            display_df = display_df.sort_values(
-                                ["charge_code", "tenant_code", "from_date"],
-                                ascending=[True, True, False],
-                            )
-                            # Format dates
-                            display_df["from_date"] = display_df["from_date"].apply(
-                                lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) else "")
-                            display_df["to_date"] = display_df["to_date"].apply(
-                                lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) and isinstance(d, datetime) else "ACTIVE")
-                            display_df["amount"] = display_df["amount"].apply(lambda x: f"${x:,.2f}")
+                                    prop_table.append({
+                                        "Month": m.strftime("%b %Y"),
+                                        "Revenue": f"${prop_monthly.get(m, 0):,.2f}",
+                                        "# Charges": len(active_in_month),
+                                        "# Tenants": len(set(r.get("tenant_code", "") for r in active_in_month)),
+                                        "By Code": breakdown_str,
+                                    })
+                                st.caption(f"**{explorer_prop}** — monthly revenue for display window ({len(months)} months)")
+                                _render_table(pd.DataFrame(prop_table), height=400)
 
-                            # Build tenant name column
-                            display_df["tenant"] = (
-                                display_df.get("first_name", pd.Series(dtype=str)).fillna("")
-                                + " "
-                                + display_df.get("last_name", pd.Series(dtype=str)).fillna("")
-                            ).str.strip()
+                                # ── Full charge rows with tenant info ──
+                                st.markdown("##### All Charge Line Items")
 
-                            # to_date source indicator: shows where the end date came from
-                            def _to_date_source(row):
-                                raw = row.get("_raw_to_date")
-                                mo = row.get("_move_out_dt")
-                                lt = row.get("_lease_to_dt")
-                                if raw is not None and not pd.isna(raw):
-                                    return "charge"
-                                if mo is not None and not pd.isna(mo):
-                                    return "move_out"
-                                if lt is not None and not pd.isna(lt):
-                                    return "lease_end"
-                                return ""
-                            if "_raw_to_date" in display_df.columns:
-                                display_df["to_date_src"] = display_df.apply(_to_date_source, axis=1)
+                                # Show which globally-selected codes exist for this property
+                                available_codes = sorted(raw_df["charge_code"].dropna().unique().tolist())
+                                missing_codes = [c for c in selected_codes if c not in available_codes]
+                                if missing_codes:
+                                    st.info(
+                                        f"This property only has **{', '.join(available_codes)}** from your selected codes. \n"
+                                        f"Not found here: {', '.join(f'`{c}`' for c in missing_codes)} "
+                                        f"(those codes may not apply to this property)."
+                                    )
+
+                                # Optional: filter by charge code within explorer
+                                filter_code = st.multiselect(
+                                    "Filter by charge code:",
+                                    available_codes,
+                                    default=available_codes,
+                                    key="explorer_code_filter",
+                                )
+                                display_df = raw_df[raw_df["charge_code"].isin(filter_code)].copy() if filter_code else raw_df.copy()
+
+                                display_df = display_df.sort_values(
+                                    ["charge_code", "tenant_code", "from_date"],
+                                    ascending=[True, True, False],
+                                )
+                                # Format dates
+                                display_df["from_date"] = display_df["from_date"].apply(
+                                    lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) else "")
+                                display_df["to_date"] = display_df["to_date"].apply(
+                                    lambda d: d.strftime("%Y-%m-%d") if d is not None and not pd.isna(d) and isinstance(d, datetime) else "ACTIVE")
+                                display_df["amount"] = display_df["amount"].apply(lambda x: f"${x:,.2f}")
+
+                                # Build tenant name column
+                                display_df["tenant"] = (
+                                    display_df.get("first_name", pd.Series(dtype=str)).fillna("")
+                                    + " "
+                                    + display_df.get("last_name", pd.Series(dtype=str)).fillna("")
+                                ).str.strip()
+
+                                # to_date source indicator: shows where the end date came from
+                                def _to_date_source(row):
+                                    raw = row.get("_raw_to_date")
+                                    mo = row.get("_move_out_dt")
+                                    lt = row.get("_lease_to_dt")
+                                    if raw is not None and not pd.isna(raw):
+                                        return "charge"
+                                    if mo is not None and not pd.isna(mo):
+                                        return "move_out"
+                                    if lt is not None and not pd.isna(lt):
+                                        return "lease_end"
+                                    return ""
+                                if "_raw_to_date" in display_df.columns:
+                                    display_df["to_date_src"] = display_df.apply(_to_date_source, axis=1)
+                                else:
+                                    display_df["to_date_src"] = ""
+
+                                show_cols = ["tenant_code", "tenant", "tenant_status",
+                                             "charge_code", "charge_type", "amount",
+                                             "from_date", "to_date", "to_date_src"]
+                                # Only show columns that exist
+                                show_cols = [c for c in show_cols if c in display_df.columns]
+
+                                st.caption(
+                                    f"**{explorer_prop}** — {len(display_df)} charge line items "
+                                    f"({display_df['tenant_code'].nunique() if 'tenant_code' in display_df.columns else '?'} unique tenants)"
+                                )
+                                _render_table(display_df[show_cols], height=500)
+
+                                # Download with all columns
+                                st.download_button(
+                                    f"Download {explorer_prop} charges",
+                                    data=display_df[show_cols].to_csv(index=False),
+                                    file_name=f"charges_{explorer_prop.replace(' ', '_')}.csv",
+                                    mime="text/csv",
+                                    key="explorer_dl",
+                                )
                             else:
-                                display_df["to_date_src"] = ""
-
-                            show_cols = ["tenant_code", "tenant", "tenant_status",
-                                         "charge_code", "charge_type", "amount",
-                                         "from_date", "to_date", "to_date_src"]
-                            # Only show columns that exist
-                            show_cols = [c for c in show_cols if c in display_df.columns]
-
-                            st.caption(
-                                f"**{explorer_prop}** — {len(display_df)} charge line items "
-                                f"({display_df['tenant_code'].nunique() if 'tenant_code' in display_df.columns else '?'} unique tenants)"
-                            )
-                            _render_table(display_df[show_cols], height=500)
-
-                            # Download with all columns
-                            st.download_button(
-                                f"Download {explorer_prop} charges",
-                                data=display_df[show_cols].to_csv(index=False),
-                                file_name=f"charges_{explorer_prop.replace(' ', '_')}.csv",
-                                mime="text/csv",
-                                key="explorer_dl",
-                            )
-                        else:
-                            st.info("No charge rows found for this property.")
+                                st.info("No charge rows found for this property.")
 
         # ─── TAB 2: Summary ──────────────────────────────────────
         with tab_next:
@@ -2512,8 +2758,8 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 _agg_diff_mo = sum(a["diff_monthly"] for a in _comparable.values()) if _comparable else 0
                 _agg_diff = sum(a["diff_total"] for a in _comparable.values()) if _comparable else 0
 
-                # Latest month revenue
-                _latest_month = _months[-1] if _months else None
+                # Latest observed month revenue
+                _latest_month = _latest_observed_revenue_month(_monthly_by_prop, _months) if _months else None
                 _current_monthly_rev = sum(
                     _monthly_by_prop[p].get(_latest_month, 0) for p in _monthly_by_prop
                 ) if _latest_month else 0
@@ -2525,9 +2771,24 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
 
                 # NOTE: property_doors_by_name is rebuilt AFTER the doors query below
 
-                # Determine adoption type from Charts tab overlay selection
+                # Adoption basis — an explicit control here instead of
+                # silently inheriting from the Charts overlay radio (which
+                # defaults to "None" → Unit without the user ever choosing).
                 _overlay_sel = st.session_state.get("adoption_overlay", "None")
-                if _overlay_sel == "Resident Adoption %":
+                _adopt_choice = st.radio(
+                    "Adoption basis for this summary and the PDF:",
+                    ["Unit Adoption", "Resident Adoption"],
+                    index=1 if _overlay_sel == "Resident Adoption %" else 0,
+                    horizontal=True,
+                    key="summary_adoption_basis",
+                    help=(
+                        "Unit adoption = % of units with a completed PetScreening "
+                        "profile; resident adoption = % of residents. Drives the "
+                        "adoption KPI and the projected-at-100% numbers everywhere "
+                        "in this summary and the generated reports."
+                    ),
+                )
+                if _adopt_choice == "Resident Adoption":
                     _adopt_key = "resident_adoption"
                     _adopt_type_label = "Resident"
                 else:
@@ -2569,7 +2830,11 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     / len(_projected_100)
                 ) if _projected_100 else None
 
-                # Missing pet rent summary (quick fetch if not cached)
+                # Missing pet rent summary. Previously this only read the
+                # session cache written by the Charts-tab toggles, so a user
+                # who never flipped "Show uncollected pet rent" got a PDF
+                # with no missing-rent tranche. Now the Summary tab computes
+                # it itself when absent (and shares the same cache keys).
                 _mr_total_profiles = 0
                 _mr_current_mo = 0
                 _mr_data = {}
@@ -2577,13 +2842,19 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     if k.startswith("missing_rent_") and isinstance(st.session_state[k], dict):
                         _mr_data = st.session_state[k]
                         break
+                if not _mr_data and selected_codes and _prop_ids:
+                    with st.spinner("Matching PetScreening tenants to charge data (uncollected pet rent)..."):
+                        _mr_data = fetch_missing_pet_rent_by_property(
+                            df, selected_codes, _prop_ids, _launch_dates, _months,
+                        )
+                    st.session_state[f"missing_rent_{hash(tuple(sorted(selected_codes)))}"] = _mr_data
                 if _mr_data:
                     _mr_total_profiles = sum(v["missing_count"] for v in _mr_data.values())
                     _mr_current_mo = sum(
                         v["monthly_missing"].get(_latest_month, 0) for v in _mr_data.values()
                     ) if _latest_month else 0
 
-                # Suspected undisclosed summary
+                # Suspected undisclosed summary — same auto-compute behavior.
                 _su_total_profiles = 0
                 _su_current_mo = 0
                 _su_data = {}
@@ -2591,6 +2862,12 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     if k.startswith("suspected_") and isinstance(st.session_state[k], dict):
                         _su_data = st.session_state[k]
                         break
+                if not _su_data and selected_codes and _prop_ids:
+                    with st.spinner("Computing suspected undisclosed pets..."):
+                        _su_data = fetch_suspected_undisclosed_by_property(
+                            df, selected_codes, _prop_ids, _launch_dates, _months,
+                        )
+                    st.session_state[f"suspected_{hash(tuple(sorted(selected_codes)))}"] = _su_data
                 if _su_data:
                     _su_total_profiles = sum(v["missing_count"] for v in _su_data.values())
                     _su_current_mo = sum(
@@ -2637,20 +2914,24 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     _prop_names_for_doors = list(_monthly_by_prop.keys())
                     _pid_list = [int(p) for p in st.session_state.get("property_ids", []) if str(p).strip()]
                     if _prop_names_for_doors or _pid_list:
+                        _doors_conn = get_snowflake_connection()
+                        _doors_cur = _doors_conn.cursor(snowflake.connector.DictCursor)
+
                         # Primary: QBR reporting table (most accurate unit counts)
                         if _prop_names_for_doors:
-                            _name_in = ", ".join(f"'{n.replace(chr(39), chr(39)+chr(39))}'" for n in _prop_names_for_doors)
-                            _doors_rows = run_query(f"""
+                            _name_placeholders = ", ".join(["%s"] * len(_prop_names_for_doors))
+                            _doors_cur.execute(f"""
                                 SELECT PROPERTY_NAME, PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
                                 FROM PROD.REPORTING.R_QUARTERLY_BUSINESS_REVIEW_REPORTING
-                                WHERE PROPERTY_NAME IN ({_name_in})
+                                WHERE PROPERTY_NAME IN ({_name_placeholders})
                                   AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
                                   AND PROPERTY_NUMBER_OF_DOORS > 0
                                 QUALIFY ROW_NUMBER() OVER (
                                     PARTITION BY PROPERTY_NAME
                                     ORDER BY PROPERTY_NUMBER_OF_DOORS DESC
                                 ) = 1
-                            """)
+                            """, _prop_names_for_doors)
+                            _doors_rows = _doors_cur.fetchall()
                             if _doors_rows:
                                 for r in _doors_rows:
                                     _pid = int(r["PROPERTY_ID"]) if r.get("PROPERTY_ID") else None
@@ -2666,19 +2947,21 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         # Fallback: D_PROPERTIES by property_id (less accurate but works)
                         if not _units_from_doors and _pid_list:
                             _doors_ids = ", ".join(str(p) for p in _pid_list)
-                            _doors_rows = run_query(f"""
+                            _doors_cur.execute(f"""
                                 SELECT PROPERTY_ID, PROPERTY_NUMBER_OF_DOORS AS NUM_DOORS
                                 FROM PROD.COMMON.D_PROPERTIES
                                 WHERE PROPERTY_ID IN ({_doors_ids})
                                   AND PROPERTY_NUMBER_OF_DOORS IS NOT NULL
                                   AND PROPERTY_NUMBER_OF_DOORS > 0
                             """)
+                            _doors_rows = _doors_cur.fetchall()
                             if _doors_rows:
                                 for r in _doors_rows:
                                     _property_doors[int(r["PROPERTY_ID"])] = int(r["NUM_DOORS"])
                                 _total_units = sum(_property_doors.values())
                                 _units_from_doors = True
 
+                        _doors_cur.close()
                 except Exception:
                     pass
                 if not _units_from_doors:
@@ -2884,7 +3167,7 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     _glance_row1.append({
                         "value": f"{_total_units:,}",
                         "label": "Live Units",
-                        "sub": f"Across {n_props_with_data} properties",
+                        "sub": f"Across {_n_props(n_props_with_data)}",
                         "color": _dark_blue,
                     })
                 else:
@@ -3251,6 +3534,72 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                 # ═══════════════════════════════════════════════════════════════
 
                 st.markdown("---")
+                # ═══════════════════════════════════════════════════════
+                #  PET RENT PRICING — what this portfolio charges (own data)
+                # ═══════════════════════════════════════════════════════
+                _benchmarks = None
+                _bm_key = f"benchmarks_{hash(tuple(sorted(str(p) for p in _prop_ids)))}_{hash(tuple(sorted(selected_codes or [])))}"
+                if _bm_key not in st.session_state:
+                    try:
+                        from benchmarks import build_pet_rent_pricing
+                        _bm_pet = df[df['charge_code'].isin(selected_codes)].copy()
+                        if not _bm_pet.empty:
+                            _bm_pet['_amt'] = pd.to_numeric(_bm_pet['charge_amount'], errors='coerce').fillna(0)
+                            _bm_pet['_from'] = _bm_pet['charge_from_date'].apply(parse_date)
+                            _bm_pet['_to'] = _bm_pet['charge_to_date'].apply(parse_date)
+                            _bm_class = _classify_pet_charge_codes(
+                                _bm_pet, st.session_state.get("pmc_system", "yardi"),
+                                st.session_state.get("charge_type_overrides", {}),
+                                system_by_pid=st.session_state.get("property_system_by_pid"),
+                            )
+                            _bm_rec_by_prop, _ = _estimate_property_fees(_bm_pet, _bm_class)
+                            _bm_recent = _recent_paying_charges(_bm_pet)
+                            _bm_rec_codes = {c for (_pn, c), cls in _bm_class.items() if cls == 'recurring'}
+                            _bm_paying = _bm_recent[_bm_recent['charge_code'].isin(_bm_rec_codes)]
+                            _bm_n_paying = (
+                                _bm_paying.groupby(['property_id', 'tenant_code']).ngroups
+                                if not _bm_paying.empty else 0
+                            )
+                            _bm_pricing = build_pet_rent_pricing(_bm_rec_by_prop, _bm_n_paying)
+                            st.session_state[_bm_key] = {"pricing": _bm_pricing} if _bm_pricing else None
+                        else:
+                            st.session_state[_bm_key] = None
+                    except Exception as _bm_exc:  # noqa: BLE001
+                        st.session_state[_bm_key] = None
+                        st.caption(f"Pricing summary unavailable: {str(_bm_exc)[:150]}")
+                _benchmarks = st.session_state.get(_bm_key)
+
+                if _benchmarks and _benchmarks.get("pricing"):
+                    _bmp = _benchmarks["pricing"]
+                    st.markdown(
+                        '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
+                        'color:#1F2257;margin:12px 0 4px 0">Pet Rent Pricing</p>'
+                        '<p style="font-family:Poppins,Arial,sans-serif;font-size:13px;color:#636569;'
+                        'margin:0 0 8px 0">What this portfolio charges for recurring pet rent, from its own data.</p>',
+                        unsafe_allow_html=True,
+                    )
+                    if _bmp["n_props"] > 1:
+                        _f1, _f2, _f3 = st.columns(3)
+                        _f1.metric("Typical pet rent", f"${_bmp['median']:,.0f}/mo",
+                                   help=f"Median across {_bmp['n_props']:,} properties with recurring pet rent.")
+                        _f2.metric("Full range", f"${_bmp['min']:,.0f}–${_bmp['max']:,.0f}",
+                                   help="Lowest to highest property typical fee.")
+                        _f3.metric("Middle 50%", f"${_bmp['p25']:,.0f}–${_bmp['p75']:,.0f}",
+                                   help="25th–75th percentile of property typical fees.")
+                        if _bmp["max"] - _bmp["min"] > 10:
+                            st.caption(
+                                f"Fees span ${_bmp['min']:,.0f}–${_bmp['max']:,.0f}/mo across "
+                                f"{_bmp['n_props']:,} properties. A wide spread can be a pricing "
+                                f"opportunity — low-end properties may support rates closer to the "
+                                f"portfolio median of ${_bmp['median']:,.0f}/mo."
+                            )
+                    else:
+                        st.metric("Typical pet rent", f"${_bmp['median']:,.0f}/mo",
+                                  help="Recurring pet rent at this property.")
+                    st.caption("Basis: recurring pet-rent charges pulled live from your property "
+                               "management system for this report.")
+                    st.divider()
+
                 st.markdown(
                     '<p style="font-family:Lora,Georgia,serif;font-size:20px;font-weight:700;'
                     'color:#1F2257;margin:0 0 4px 0">Download Impact Analysis</p>'
@@ -3274,6 +3623,14 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     help="Default uses simple lift (current - pre). Check this for portfolios "
                          "where current-month comparisons distort the story due to seasonality.",
                 )
+                _include_prop_charts = st.checkbox(
+                    "Include individual property charts in the PDF (appendix)",
+                    value=False,
+                    key="include_prop_charts_pdf",
+                    help="Appends the per-property before/after fee collection charts "
+                         "(same as the Fee Collection tab) for every comparable property, "
+                         "sorted by monthly lift. Adds ~1 page per 4 properties.",
+                )
 
                 _exec_col1, _exec_col2, _exec_col3 = st.columns(3)
 
@@ -3283,6 +3640,27 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                  key="gen_exec_btn",
                                  help="Build branded PDF and HTML reports"):
                         _pm_for_report = _pm_cache if _include_pm_in_report else None
+
+                        # Snapshot metrics (current + previous) — used for the
+                        # PDF "Progress Since Last Report" section and the
+                        # in-app delta table further below.
+                        _snap_label = f"{st.session_state.get('pmc_system', '')}::{_label}"
+                        _prev_snap, _prev_ts = (None, None)
+                        try:
+                            from fetch_cache import load_last_report_snapshot
+                            _prev_snap, _prev_ts = load_last_report_snapshot(_snap_label)
+                        except Exception:
+                            pass
+                        _simple_lift_now = _current_monthly_rev - _pre_baseline_total if _pre_baseline_total > 0 else 0
+                        _now_snap = {
+                            "current_monthly_rev": float(_current_monthly_rev or 0),
+                            "monthly_lift": float((_agg_diff_mo if _use_avg_lift else _simple_lift_now) or 0),
+                            "missing_tenants": int(_mr_total_profiles or 0),
+                            "missing_monthly": float(_mr_current_mo or 0),
+                            "suspected_tenants": int(_su_total_profiles or 0),
+                            "avg_adoption": float(_avg_adoption) if _avg_adoption is not None else None,
+                            "comparable_count": int(len(_comparable) if _comparable else 0),
+                        }
 
                         # Generate PDF
                         # Build monthly revenue series for PDF chart
@@ -3333,13 +3711,15 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                                         _interp = _prev_val + (_next_val - _prev_val) * _frac
                                         _pdf_monthly_series[_i] = (_pdf_monthly_series[_i][0], _interp)
 
-                        # Compute comparable-only current month revenue (apples-to-apples)
+                        # Compute comparable-only latest observed revenue (apples-to-apples)
                         _comp_current_rev_latest = 0
-                        if _comparable and _latest_month:
-                            _comp_current_rev_latest = sum(
-                                _monthly_by_prop.get(p, {}).get(_latest_month, 0)
-                                for p in _comparable
-                            )
+                        if _comparable:
+                            _comp_latest_month = _latest_observed_revenue_month(_monthly_by_prop, _months, _comparable.keys())
+                            if _comp_latest_month:
+                                _comp_current_rev_latest = sum(
+                                    _monthly_by_prop.get(p, {}).get(_comp_latest_month, 0)
+                                    for p in _comparable
+                                )
 
                         pdf_bytes = generate_tranche_pdf(
                             label=_label,
@@ -3374,6 +3754,18 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                             latest_month=_latest_month,
                             selected_charge_codes=selected_codes,
                             avg_pet_fee=_avg_fee,
+                            include_property_charts=_include_prop_charts,
+                            benchmarks=_benchmarks,
+                            prev_snapshot=_prev_snap,
+                            prev_snapshot_ts=_prev_ts,
+                            current_snapshot=_now_snap,
+                            realpage_prop_count=sum(
+                                1 for v in (st.session_state.get("property_system_by_pid") or {}).values()
+                                if v == "real_page"
+                            ) if st.session_state.get("pmc_system") == "all" else (
+                                len(st.session_state.get("property_ids", []))
+                                if st.session_state.get("pmc_system") == "real_page" else 0
+                            ),
                         )
                         st.session_state["exec_pdf"] = pdf_bytes
 
@@ -3417,6 +3809,164 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                         )
                         st.session_state["exec_html"] = exec_html
                         st.session_state["exec_label"] = _label
+
+                        # Also build the Missing / Suspected CSVs here so all
+                        # three outputs (PDF + both CSVs) download from one
+                        # place — no tab-hopping.
+                        with st.spinner("Building Missing Pet Rent CSV..."):
+                            try:
+                                _csv_missing_df = generate_missing_pet_rent_report(df, selected_codes, _prop_ids)
+                                st.session_state["exec_missing_csv"] = (
+                                    _csv_missing_df.to_csv(index=False)
+                                    if _csv_missing_df is not None and not _csv_missing_df.empty else ""
+                                )
+                            except Exception as _csv_err:
+                                st.session_state["exec_missing_csv"] = ""
+                                st.warning(f"Missing Pet Rent CSV failed: {str(_csv_err)[:200]}")
+                        with st.spinner("Building Suspected Undisclosed CSV..."):
+                            try:
+                                _csv_susp_df = generate_suspected_undisclosed_report(df, selected_codes, _prop_ids)
+                                st.session_state["exec_suspected_csv"] = (
+                                    _csv_susp_df.to_csv(index=False)
+                                    if _csv_susp_df is not None and not _csv_susp_df.empty else ""
+                                )
+                            except Exception as _csv_err:
+                                st.session_state["exec_suspected_csv"] = ""
+                                st.warning(f"Suspected Undisclosed CSV failed: {str(_csv_err)[:200]}")
+
+                        # ── "Since last report" deltas + snapshot ──
+                        try:
+                            from fetch_cache import save_report_snapshot
+                            if _prev_snap:
+                                _delta_specs = [
+                                    ("current_monthly_rev", "Current revenue", "${:,.0f}/mo"),
+                                    ("monthly_lift", "Monthly lift", "${:,.0f}/mo"),
+                                    ("missing_tenants", "Missing pet rent tenants", "{:,.0f}"),
+                                    ("missing_monthly", "Uncollected revenue", "${:,.0f}/mo"),
+                                    ("suspected_tenants", "Suspected undisclosed", "{:,.0f}"),
+                                    ("avg_adoption", "Avg adoption", "{:.1f}%"),
+                                ]
+                                _delta_rows = []
+                                for _dk, _dl, _df_fmt in _delta_specs:
+                                    _new_v = _now_snap.get(_dk)
+                                    _old_v = _prev_snap.get(_dk)
+                                    if _new_v is None or _old_v is None:
+                                        continue
+                                    try:
+                                        _old_v = float(_old_v)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    _d = _new_v - _old_v
+                                    _delta_rows.append({
+                                        "Metric": _dl,
+                                        "Last report": _df_fmt.format(_old_v),
+                                        "Now": _df_fmt.format(_new_v),
+                                        "Change": ("+" if _d >= 0 else "") + _df_fmt.format(_d).replace("$-", "-$"),
+                                    })
+                                if _delta_rows:
+                                    st.markdown(
+                                        f"**Since last report ({str(_prev_ts)[:10]}):**"
+                                    )
+                                    _render_table(pd.DataFrame(_delta_rows))
+                            save_report_snapshot(_snap_label, _now_snap)
+                        except Exception as _snap_err:
+                            st.caption(f"Report deltas unavailable: {str(_snap_err)[:120]}")
+
+                        # ── Flag cohort for the reclaim-rate OKR ──
+                        # Persist WHO was flagged (with reason) so the next
+                        # quarter's run can measure how many started paying.
+                        try:
+                            from fetch_cache import save_flagged_tenants
+                            _flag_rows = []
+                            for _fpn, _fv in (_mr_data or {}).items():
+                                _fpid = _pid_lookup.get(_fpn)
+                                for _ft in _fv.get("missing_tenants", []):
+                                    _flag_rows.append({
+                                        "property_id": _fpid,
+                                        "property_name": _fpn,
+                                        "email": str(_ft.get("email") or "").lower().strip(),
+                                        "name": _ft.get("name", ""),
+                                        "reason": "missing_pet_rent",
+                                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                                    })
+                            for _fpn, _fv in (_su_data or {}).items():
+                                _fpid = _pid_lookup.get(_fpn)
+                                for _ft in _fv.get("missing_tenants", []):
+                                    _flag_rows.append({
+                                        "property_id": _fpid,
+                                        "property_name": _fpn,
+                                        "email": str(_ft.get("email") or "").lower().strip(),
+                                        "name": _ft.get("name", ""),
+                                        "reason": _ft.get("suspected_reason", "Other suspected"),
+                                        "est_fee_mo": float(_fv.get("avg_recurring", 0) or 0),
+                                    })
+                            if _flag_rows:
+                                save_flagged_tenants(
+                                    _snap_label,
+                                    st.session_state.get("pmc_system", ""),
+                                    _prop_ids,
+                                    _flag_rows,
+                                )
+                                st.caption(
+                                    f"Reclaim tracking: {len(_flag_rows)} flagged tenants "
+                                    f"saved as this run's cohort."
+                                )
+                        except Exception as _flag_err:
+                            st.caption(f"Flag cohort not saved: {str(_flag_err)[:120]}")
+
+                        # ── Auto-append to the analytics snapshot tables ──
+                        # (RAW.MISC.PET_VALUE_*) — every Generate Report run
+                        # lands in Snowflake, same pattern as the fetch cache.
+                        try:
+                            import snapshot_tables as _snap_tbl
+                            _sel_parent_id = str(st.session_state.get("selected_ancestry_id") or "")
+                            _sel_parent_name = _label if _sel_parent_id else ""
+                            _n_users = _snap_tbl.append_users_snapshot(
+                                missing_df=locals().get("_csv_missing_df"),
+                                suspected_df=locals().get("_csv_susp_df"),
+                                pmc_system=st.session_state.get("pmc_system", ""),
+                                run_label=_snap_label,
+                                parent_id=_sel_parent_id,
+                                parent_name=_sel_parent_name,
+                            )
+                            _prop_rows = _snap_tbl.build_property_rows_from_report(
+                                st.session_state.get("pmc_system", ""),
+                                _mr_data, _su_data, _monthly_by_prop,
+                                _latest_month, _pid_lookup,
+                                doors_by_name=_property_doors_by_name,
+                                parent_id=_sel_parent_id,
+                                parent_name=_sel_parent_name,
+                            )
+                            _n_props_snap = _snap_tbl.append_property_snapshot(_prop_rows)
+                            if _sel_parent_id or st.session_state.get("selected_parent"):
+                                _snap_tbl.append_parent_snapshot({
+                                    "PMC": st.session_state.get("pmc_system", ""),
+                                    "PARENT_ID": _sel_parent_id,
+                                    "PARENT_NAME": _label,
+                                    "PROPERTY_COUNT": n_props_total,
+                                    "UNIT_COUNT": _total_units or None,
+                                    "COMPARABLE_COUNT": len(_comparable) if _comparable else None,
+                                    "PRE_REVENUE": _pre_baseline_total,
+                                    "CURRENT_REVENUE": _current_monthly_rev,
+                                    "MONTHLY_LIFT": _t1_mo,
+                                    "UNCOLLECTED_TENANTS": _t2_tenants,
+                                    "MISSING_MONTHLY_RENT": _t2_mo,
+                                    "SUSPECTED_UNDISCLOSED": _su_total_profiles,
+                                    "SUSPECTED_MONTHLY": _su_current_mo,
+                                    "AVG_UNIT_ADOPTION_PCT": _avg_adoption,
+                                    "PROPERTIES_WITH_LAUNCH": n_with_launch,
+                                    "PROPERTIES_WITH_DATA": n_props_with_data,
+                                    "TOTAL_PROPERTIES": n_props_total,
+                                    "ANNUALIZED_LIFT": (_t1_mo * 12) if _t1_mo else None,
+                                })
+                            if _n_users or _n_props_snap:
+                                st.caption(
+                                    f"Snapshot tables: +{_n_users} people, "
+                                    f"+{_n_props_snap} property rows appended to Snowflake."
+                                )
+                        except Exception as _snap_tbl_err:
+                            st.caption(f"Snapshot tables not appended: {str(_snap_tbl_err)[:120]}")
+
                         st.toast("Reports ready for download!")
 
                 # ── Enhanced PDF download ──
@@ -3453,6 +4003,47 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
                     else:
                         st.button("Download HTML", disabled=True,
                                   use_container_width=True, key="dl_html_disabled")
+
+                # ── Missing / Suspected CSVs (same outputs as the report tabs) ──
+                _csv_col1, _csv_col2 = st.columns(2)
+                _safe_csv_name = st.session_state.get("exec_label", "report").replace(" ", "_").replace("/", "-")
+                _csv_date = datetime.now().strftime('%Y%m%d')
+                with _csv_col1:
+                    if st.session_state.get("exec_missing_csv"):
+                        st.download_button(
+                            label="Missing Pet Rent CSV",
+                            data=st.session_state["exec_missing_csv"],
+                            file_name=f"missing_pet_rent_{_safe_csv_name}_{_csv_date}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_exec_missing_csv",
+                            help="Tenants with active household pet profiles who aren't paying the selected pet charges",
+                        )
+                    elif "exec_missing_csv" in st.session_state:
+                        st.button("Missing Pet Rent CSV — no rows", disabled=True,
+                                  use_container_width=True, key="dl_missing_csv_empty")
+                    else:
+                        st.button("Missing Pet Rent CSV", disabled=True,
+                                  use_container_width=True, key="dl_missing_csv_disabled",
+                                  help="Click 'Generate Report' first")
+                with _csv_col2:
+                    if st.session_state.get("exec_suspected_csv"):
+                        st.download_button(
+                            label="Suspected Undisclosed CSV",
+                            data=st.session_state["exec_suspected_csv"],
+                            file_name=f"suspected_undisclosed_{_safe_csv_name}_{_csv_date}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="dl_exec_suspected_csv",
+                            help="Residents whose PetScreening signals suggest an undisclosed pet",
+                        )
+                    elif "exec_suspected_csv" in st.session_state:
+                        st.button("Suspected Undisclosed CSV — no rows", disabled=True,
+                                  use_container_width=True, key="dl_suspected_csv_empty")
+                    else:
+                        st.button("Suspected Undisclosed CSV", disabled=True,
+                                  use_container_width=True, key="dl_suspected_csv_disabled",
+                                  help="Click 'Generate Report' first")
 
 
         # ─── TAB 3: Missing Pet Rent Report ─────────────────────────
@@ -3741,10 +4332,29 @@ At 100% adoption, that same per-{'unit' if _overlay == 'unit' else 'resident'} r
             st.header("Documentation & SQL Reference")
             st.markdown("Everything that happens behind the scenes. Organized by **Shared Logic**, **Yardi-specific**, **Entrata-specific**, and **RealPage-specific**.")
 
+            with st.expander("**What's new — July 2026 overhaul**", expanded=True):
+                st.markdown("""
+| Area | Change |
+|---|---|
+| **All Systems mode** | One pull combines Yardi + Entrata + RealPage for a parent company: one dataset, one PDF, one CSV set. Fetch Results shows each property's source system. |
+| **RealPage** | Live OneSite API, **current-state only** (2 calls per property). No synthetic history → no lift for RealPage until RealPage authorizes `getresidentledger`. Missing/suspected candidates are filtered against the live resident roster. |
+| **Fetch cache** | Every pull appends to `RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA` and is reused for 7 days (sidebar → *Data reuse*). Append-only, so it doubles as our own history of what the APIs returned on each date. |
+| **Pet rent pricing** | The portfolio's own recurring pet-rent distribution (median, middle 50%, full range across its properties) — Summary tab + PDF. Replaced the earlier network benchmark + assistance-animal ratio. |
+| **Progress deltas** | Every *Generate Report* snapshots the headline metrics; the next report on the same selection shows a *Since Last Report* table (app + PDF). |
+| **Data health checks** | Six automated sanity checks on the Charts tab (launch dates, duplicates, cross-property emails, ...). |
+| **Calculation fixes** | Per-tenant **median** fee estimation, per-person dollar dedup, 90-day recency rule for "paying" matching. |
+| **AppFolio** | Hidden until API access (MFA) is resolved; provider code kept as a placeholder. |
+| **Developer view** | Sidebar toggle reveals raw exports, AR reconciliation, detail tables, and the property data explorer. |
+
+Deep-dive write-ups live in the repo: `docs/realpage-accuracy-audit.md`,
+`docs/yardi-entrata-staging-audit.md`, `docs/calc-audit-2026-07.md`,
+`docs/property-manager-endpoints.md`.
+                """)
+
             # ══════════════════════════════════════════════════════════
             #  SECTION: BOTH SYSTEMS
             # ══════════════════════════════════════════════════════════
-            st.subheader("Both Systems — Shared Logic")
+            st.subheader("Shared Logic — All Systems")
 
             with st.expander("**Property Selection — How properties are loaded**", expanded=False):
                 st.markdown("""
@@ -3849,6 +4459,58 @@ or **one-time deposit**. This determines how uncollected revenue is estimated:
 The estimated uncollected amount per missing tenant uses the **average (mean)** charge
 amount from tenants who ARE paying at that specific property (with portfolio-wide
 average as fallback if no payers at that property).
+                """)
+
+            with st.expander("**Fetch Cache — `CACHED_PET_VALUE_DATA` (reuse + our own history)**"):
+                st.markdown("""
+Every per-property API pull is appended to an **append-only Snowflake
+table** and reused for 7 days (configurable in the sidebar → *Data
+reuse*). Errors are never cached; partial cache hits fetch only the
+missing properties. Because nothing is deleted, the table doubles as our
+own record of what each PMS API returned on each date — independent of
+the EKS/Airbyte staging jobs.
+
+Query it directly:
+
+```sql
+SELECT PROPERTY_ID, FETCHED_AT,
+       DATA:charge_code::STRING      AS charge_code,
+       DATA:charge_amount::FLOAT     AS amount,
+       DATA:charge_from_date::STRING AS month
+FROM RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA
+WHERE RECORD_TYPE = 'charge'
+QUALIFY FETCH_ID = FIRST_VALUE(FETCH_ID) OVER (
+    PARTITION BY PROPERTY_ID ORDER BY FETCHED_AT DESC);
+```
+
+Row types: `charge`, `ar_charge`, `raw_lease`, `meta` (one per
+property-fetch: log row + counts + the RealPage live resident roster),
+and `snapshot` (report metrics powering the *Since Last Report* deltas;
+`PMC_SYSTEM = '_report'`). Table name is the `PET_VALUE_CACHE_TABLE` env
+var — move it to `RAW.MISC` once DEVELOPER gets `CREATE TABLE` there.
+                """)
+
+            with st.expander("**Pet Rent Pricing — methodology**"):
+                st.markdown("""
+The Summary tab / PDF **Pet Rent Pricing** section is built entirely from
+the portfolio's **own pulled data** (`benchmarks.py` →
+`build_pet_rent_pricing`) — no external market pool:
+
+- Each property's **typical recurring pet fee** comes from the same
+  `_estimate_property_fees` per-tenant-median logic used for missing-rent
+  estimation ($5–$200 plausibility band).
+- Across those per-property fees the section reports the **median**, the
+  **middle 50%** (p25–p75), and the **full range** (min–max), always with
+  the property count.
+- Single-property reports show just the property's typical fee — a range
+  over one property would be meaningless.
+
+The earlier network benchmark ("your state's median is $Y") and the
+assistance-animal share comparison were removed in July 2026: the fee
+pool's provenance was hard to defend and one state number is misleading
+for multi-state parents. A future own-book benchmark (state/zip
+percentiles materialized from the `RAW.MISC` snapshot tables) is the
+planned replacement; the old pool SQL lives in git history.
                 """)
 
             with st.expander("**Launch Date Handling — Charts & Impact Calculation**"):
@@ -4099,24 +4761,34 @@ This matches the Yardi behavior. Properties without active integrations are skip
 
             with st.expander("**RealPage / OneSite — Where the data comes from**", expanded=True):
                 st.markdown("""
-Unlike Yardi (live SOAP) or Entrata (live REST), RealPage data is read from
-Snowflake staging tables that are populated by a daily EKS job calling the
-OneSite SOAP API:
+**RealPage is fetched LIVE from the OneSite SOAP API** — 2 calls per property:
 
-| What | Source |
+| Call | What it returns |
 |---|---|
-| Scheduled charges | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETSCHEDULEDCHARGES` |
-| Resident roster | `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST` |
+| `getscheduledcharges` | Current residents' scheduled charges (today's snapshot) |
+| `getresidentlist` | ALL residents — Current + Former + Applicants — incl. balance fields |
 
-**Why we don't call the API live:**
+**Current-state only, by design.** Empirical testing
+(`docs/realpage-accuracy-audit.md`) proved the API cannot return history:
+the `postmonth` parameter is silently ignored (byte-identical responses
+for any value) and Former residents' charges return zero rows. Charge
+rows are therefore emitted for the **current month only** (plus one
+future month when pet rent is scheduled to start), and RealPage
+properties are excluded from the before/after lift analysis.
 
-1. RealPage's `getscheduledcharges` endpoint requires one SOAP call per
-   `(property, post_month)`. For a 100-property parent across 12 months
-   that's 1,200 calls per refresh — too slow for an interactive app.
-2. The two staging tables already give us everything we need: scheduled
-   charges (with their full `BillStart`/`BillEnd` lifetime ranges) and
-   the resident roster.
-3. The EKS job runs daily, so the data is fresh enough for analyst use.
+**Live resident roster filtering:** missing/suspected candidates must
+match a current (non-Former, not-moved-out) resident from
+`getresidentlist` — the reports reflect who lives there *today*, with no
+stale staging dependency. The roster is persisted with the cache payload
+so cached runs produce identical reports.
+
+**History (July 2026):** the app previously read Snowflake staging tables
+populated by a daily EKS job; audits found stale ingestion and properties
+with zero usable rows. A hybrid staging+live mode was built and then
+retired in favor of honest current-state reporting. `getresidentledger`
+**exists** on the RealPage gateway but our license key is not authorized —
+once RealPage grants it, true per-month history (including former
+residents) unlocks lift for RealPage.
 
 **Property identifier is composite:** `pmcid` + `siteid`, both extracted
 from `D_PROPERTIES.property_source_id` JSON. `property_source_name` is
@@ -4131,9 +4803,9 @@ against the integration table.
 
             with st.expander("**RealPage — Charge ↔ Resident Join Logic**"):
                 st.markdown("""
-The two staging tables are joined in a single SQL roundtrip in
-`fetch_realpage_for_properties`. The join logic mirrors the canonical
-pet-signals query used internally:
+Charges and residents are joined in Python
+(`realpage_live_api._join_and_emit`) using the same priority order as the
+canonical pet-signals SQL used internally (shown here for reference):
 
 ```sql
 -- Pick the representative resident per (pmc, site, lease)
@@ -4210,43 +4882,6 @@ This excludes it from the comparable set.
 than typical launch dates, so the guard never triggers.
                 """)
 
-            with st.expander("**RealPage — BillEnd Clipping (Bug 1 Fix)**"):
-                st.markdown("""
-OneSite stores open-ended (currently active) charges with `BillEnd =
-'2099-12-31'`. Without clipping, the existing revenue spreading code
-would count those charges into perpetuity — inflating both "current
-revenue" and (for properties that did have pre-PS data) the lift
-calculation.
-
-In a sample of 43 pet charges at Drift at the Forum, **41 (95%)** had
-`BillEnd = 2099-12-31`. The fix clips the effective end date in the
-SQL itself:
-
-```sql
-TO_CHAR(
-    LEAST(
-        bill_end,
-        COALESCE(move_out_date::TIMESTAMP_NTZ, bill_end),
-        CURRENT_TIMESTAMP::TIMESTAMP_NTZ
-    ),
-    'YYYY-MM-DD'
-) AS charge_to_date
-```
-
-**For Past tenants:** charge_to_date is clipped to their `move_out_date`,
-preserving their real historical revenue contribution while preventing
-phantom revenue accruing post-moveout.
-
-**For Current tenants:** charge_to_date is clipped to today, so we never
-count future months as observed revenue.
-
-**Future scheduled charges are preserved carefully.** Applicant/pending
-residents are not counted as current revenue, but if RealPage returns a
-future scheduled `PETRENT` row, the app keeps one future-month row so a
-resident already set up for pet rent does not look missing just because
-billing begins after today.
-                """)
-
             with st.expander("**RealPage — Charge Code Filter (CatCode='C' only)**"):
                 st.markdown("""
 OneSite uses two `CatCode` values that look superficially similar but
@@ -4273,8 +4908,10 @@ as pet-related.
 
             with st.expander("**RealPage — Known DevOps / Pipeline Issues**"):
                 st.markdown("""
-Flagged for the data engineering team to address; the app code mitigates
-where possible:
+**Historical context** — since July 2026 the app calls the OneSite API
+live and no longer reads these staging tables. The pipeline issues below
+remain open for the data engineering team (they matter for anyone else
+building on the staging layer):
 
 1. **`getscheduledcharges` parameter is silently ignored.**
    The EKS job's `MONTHS_BACK=2` setting does nothing — calling the
@@ -4458,8 +5095,8 @@ The **Summary** tab is designed for **VP-level skimming** — high-level numbers
 - **Projected at 100% Adoption** — what total revenue could be if every property reached 100% adoption
 
 **KPIs shown (Row 2 — Compliance):**
-- **Average Adoption** — mean adoption across properties with both revenue and adoption data. The adoption type (unit/resident) **matches your Charts tab overlay selection**.
-- **Tenants Not Paying Pet Rent** — total count from the uncollected pet rent analysis (requires toggle on Charts tab)
+- **Average Adoption** — mean adoption across properties with both revenue and adoption data. The adoption type (unit/resident) is set by the **radio on the Summary tab** (it defaults from the Charts overlay).
+- **Tenants Not Paying Pet Rent** — total count from the uncollected pet rent analysis (computed automatically; the Charts-tab toggle only controls the orange chart overlay)
 
 **Natural language story:** Auto-generated paragraph summarizing the key numbers in plain English.
 
@@ -4480,7 +5117,7 @@ Where `projected_100` = properties that have **both**:
 1. Latest-month revenue > $0 (from selected charge codes)
 2. Latest-month adoption data (from `R_QUARTERLY_BUSINESS_REVIEW_REPORTING`)
 
-If they ever differ, it means the data changed between tab renders (e.g., Streamlit reran with different slider settings). The adoption type (unit vs. resident) is controlled by the Charts tab overlay radio button and applies to both tabs.
+If they ever differ, it means the data changed between tab renders (e.g., Streamlit reran with different slider settings). The adoption type (unit vs. resident) is set by the radio on the Summary tab, which defaults from the Charts overlay selection.
                 """)
 
             with st.expander("**What is the lookback window slider and how does it affect results?**"):
@@ -4558,7 +5195,7 @@ The estimated revenue methodology is the same as confirmed missing rent (orange 
 
             with st.expander("Data Sources & Key Tables"):
                 st.markdown("""
-**Shared tables (both Yardi & Entrata):**
+**Shared tables (all systems):**
 
 | Table | Purpose |
 |-------|---------|
@@ -4585,6 +5222,18 @@ The estimated revenue methodology is the same as confirmed missing rent (orange 
 | Table | Purpose |
 |-------|---------|
 | `RAW.PMC_EXTERNAL_INTEGRATIONS.ENTRATA_GETLEASES` | Raw Entrata getLeases responses (fallback historical data) |
+
+**RealPage-only:**
+
+| Table | Purpose |
+|-------|---------|
+| `PROD.STAGING.STG_PMC_INTEGRATIONS_REALPAGE__GETRESIDENTLIST` | SQL fallback for the current-resident check when no live roster is available (cache hits use the roster persisted with the payload) |
+
+**Written by this app:**
+
+| Table | Purpose |
+|-------|---------|
+| `RAW.PMC_EXTERNAL_INTEGRATIONS.CACHED_PET_VALUE_DATA` | Append-only per-property fetch cache + report snapshots (see the Fetch Cache expander above) |
                 """)
 
             with st.expander("Yardi GetRentroll API Call"):
@@ -4760,7 +5409,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        SIDEBAR SELECTION                            │
-│  User picks: System (Yardi/Entrata)                                 │
+│  User picks: System (All Systems / Yardi / Entrata / RealPage)      │
 │  + Parent Company Name / Ancestry ID / Property ID                  │
 └─────────────────┬───────────────────────────────────────────────────┘
                   │
@@ -4811,7 +5460,7 @@ For >30 PMs, a copy-to-clipboard fallback is shown instead.
             st.subheader("Assumptions & Limitations")
             st.markdown("""
 **Both Systems:**
-- **Live API data only:** All charge data comes from the PMC API in real-time (Yardi GetRentroll SOAP or Entrata getLeases REST). We do NOT use stale Snowflake staging tables. If the API returns incomplete data (e.g., during maintenance windows), charts will reflect that.
+- **Live API data only:** All charge data comes from the PMC APIs in real time (Yardi GetRentroll SOAP, Entrata getLeases REST, RealPage OneSite SOAP). We do NOT read the PMC staging tables. RealPage is a current-state snapshot (no history — see the RealPage section). If an API returns incomplete data (e.g., during maintenance windows), charts will reflect that.
 - **Charge duration assumption:** A charge is assumed active for every month between its `charge_from_date` and `charge_to_date`. If `charge_to_date` is null and the tenant is "Current", the charge is assumed ongoing.
 - **Adoption = linear proxy for revenue:** The "projected at 100%" calculation assumes revenue scales linearly with adoption. The last units to comply may have fewer pets, so actual revenue at 100% may be lower.
 - **Uncollected pet rent estimate:** Uses the **average (mean) charge amount** from tenants who ARE paying at each specific property. Falls back to portfolio-wide average if no payers at a property.

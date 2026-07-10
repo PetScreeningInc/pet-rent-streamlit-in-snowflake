@@ -1,17 +1,63 @@
-"""PetScreening brand CSS injection, logo URIs, and shared UI helpers."""
+"""Brand CSS, logo assets, password gate, and shared UI widgets."""
 
 import os
-import base64 as _b64
-
 import streamlit as st
 
+def require_app_password():
+    """Gate the app behind a simple shared password when configured.
 
-# ─── Logo URIs (computed at module load) ─────────────────────────────
+    Set PET_RENT_APP_PASSWORD in the deployment environment. Local dev remains
+    unlocked if the variable is absent.
+    """
+    expected_password = os.getenv("PET_RENT_APP_PASSWORD")
+    if not expected_password:
+        return
+
+    if st.session_state.get("password_ok"):
+        return
+
+    st.markdown("## PetScreening Value Report")
+    st.caption("Password protected")
+    entered_password = st.text_input("Password", type="password")
+
+    if entered_password:
+        if entered_password == expected_password:
+            st.session_state["password_ok"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password")
+
+    st.stop()
+
+
+def _auto_export_dir() -> str:
+    """Directory for crash-safe CSV auto-exports.
+
+    Prefers `auto_exports/` next to app.py (local dev). In
+    Streamlit-in-Snowflake the app stage is read-only, so fall back to the
+    runtime temp dir — those exports are a local-crash convenience only;
+    the Snowflake fetch cache is the durable record.
+    """
+    _preferred = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_exports")
+    try:
+        os.makedirs(_preferred, exist_ok=True)
+        _probe = os.path.join(_preferred, ".write_probe")
+        with open(_probe, "w") as _pf:
+            _pf.write("ok")
+        os.remove(_probe)
+        return _preferred
+    except OSError:
+        import tempfile
+        _fallback = os.path.join(tempfile.gettempdir(), "pet_rent_auto_exports")
+        os.makedirs(_fallback, exist_ok=True)
+        return _fallback
+# ─── PetScreening Brand Assets ───────────────────────────────────────
+import base64 as _b64
 
 def _load_logo_b64(fill_color=None):
     """Load logo SVG, optionally recolor, return base64 data URI."""
     try:
-        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logo.svg")
+        _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.svg")
         with open(_logo_path, "r") as _f:
             _svg = _f.read()
         if fill_color:
@@ -20,16 +66,11 @@ def _load_logo_b64(fill_color=None):
     except FileNotFoundError:
         return ""
 
-
 _PS_LOGO_WHITE_URI = _load_logo_b64()           # white for dark backgrounds
 _PS_LOGO_DARK_URI  = _load_logo_b64("#1F2257")  # Pack Blue for light backgrounds
-
-
-# ─── Brand CSS injection ──────────────────────────────────────────────
-
-def inject_brand_css():
-    """Inject PetScreening brand CSS + force-light-theme script into the page."""
-    st.markdown("""
+# ─── PetScreening Brand CSS ──────────────────────────────────────────
+# Force light theme and apply warm brand palette matching the HTML report
+_BRAND_CSS_BLOCK = """
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:wght@700&display=swap" rel="stylesheet">
 <style>
     /* ══════════════════════════════════════════════════════════════
@@ -85,20 +126,34 @@ def inject_brand_css():
     }
 
     /* ── Typography — Poppins everywhere, readable dark grey ── */
+    /* IMPORTANT: exclude Streamlit's Material icon spans, or their ligature
+       names render as literal text ("keyboard_double_arrow_right",
+       "arrow_right" on expanders). Newer Streamlit marks them with
+       data-testid="stIconMaterial" / stExpanderToggleIcon — the class no
+       longer contains "material", so testid exclusions are required. */
     html, body, [class*="css"], .stMarkdown, .stText,
     [data-testid="stMetricLabel"], .streamlit-expanderHeader,
     .stRadio label, [data-baseweb="select"],
-    p, span:not([class*="material"]), li, td, th, label, div {
+    p, li, td, th, label,
+    span:not([class*="material"]):not([data-testid="stIconMaterial"]):not([data-testid="stExpanderToggleIcon"]),
+    div:not([data-testid="stIconMaterial"]) {
         font-family: 'Poppins', Arial, sans-serif !important;
     }
     /* Preserve Material Symbols font for Streamlit's built-in icons */
-    span[class*="material"] {
+    span[class*="material"],
+    [data-testid="stIconMaterial"],
+    [data-testid="stExpanderToggleIcon"],
+    button[kind="headerNoPadding"] span,
+    [data-testid="stSidebarCollapseButton"] span,
+    [data-testid="stSidebarCollapsedControl"] span {
         font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', sans-serif !important;
         font-size: 1.2em !important;
     }
     /* Default text color — NOT on td/th (dataframe handled separately) */
-    html, body, p, span:not([class*="material"]), li, label, div,
-    .stMarkdown, .stMarkdown *:not([class*="material"]), .stText,
+    html, body, p, li, label,
+    span:not([class*="material"]):not([data-testid="stIconMaterial"]):not([data-testid="stExpanderToggleIcon"]),
+    div:not([data-testid="stIconMaterial"]),
+    .stMarkdown, .stMarkdown *:not([class*="material"]):not([data-testid="stIconMaterial"]), .stText,
     [class*="css"]:not([class*="material"]) {
         color: #4F5155 !important;
     }
@@ -119,6 +174,53 @@ def inject_brand_css():
     .stCaption, [data-testid="stCaptionContainer"],
     [data-testid="stCaptionContainer"] * {
         color: #636569 !important;
+    }
+
+    /* ── Tabs: sticky, full-width pill navigation ──
+       The four main tabs previously rendered as small links floating
+       mid-page. Now: evenly spread pills that stick below the header
+       while scrolling, with a clear active state. */
+    .stTabs [data-baseweb="tab-list"] {
+        position: sticky;
+        top: 3.75rem;
+        z-index: 99;
+        background: #FAFAF8;
+        gap: 8px;
+        padding: 10px 0;
+        border-bottom: 1px solid #E4E0D3;
+        width: 100%;
+    }
+    .stTabs [data-baseweb="tab"] {
+        flex: 1;
+        justify-content: center;
+        background: #F1EDE0;
+        border-radius: 10px;
+        padding: 10px 16px;
+        font-weight: 600 !important;
+        font-size: 15px !important;
+        border: 1.5px solid transparent;
+        transition: background 0.15s ease;
+    }
+    .stTabs [data-baseweb="tab"] p {
+        color: #4F5155 !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background: #E7E1CD;
+    }
+    /* Active tab: white card with a navy border — dark text on light
+       background in every state, so contrast can never break. */
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        background: #FFFFFF !important;
+        border: 1.5px solid #1F2257 !important;
+    }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] p {
+        color: #1F2257 !important;
+        font-weight: 700 !important;
+    }
+    /* Pill style replaces the default underline indicator */
+    .stTabs [data-baseweb="tab-highlight"],
+    .stTabs [data-baseweb="tab-border"] {
+        display: none;
     }
 
     /* ── Sidebar — Dog Bone White bg, dark readable text ── */
@@ -524,11 +626,14 @@ def inject_brand_css():
         } catch(e) {}
     })();
 </script>
-""", unsafe_allow_html=True)
+"""
 
 
-# ─── Styled HTML table helper ────────────────────────────────────────
 
+def inject_brand_css():
+    """Force light theme + warm brand palette (matches the HTML report)."""
+    st.markdown(_BRAND_CSS_BLOCK, unsafe_allow_html=True)
+# ─── Styled HTML table helper (replaces st.dataframe for visibility) ─
 def _render_table(df, height=None, hide_index=True, max_rows=1000):
     """Render a DataFrame as a styled HTML table with guaranteed white bg + dark text.
 
@@ -557,10 +662,7 @@ def _render_table(df, height=None, hide_index=True, max_rows=1000):
     )
     if truncated:
         st.caption(f"Showing first {max_rows:,} of {len(df):,} rows. Download CSV/Excel for full data.")
-
-
-# ─── Property Funnel ──────────────────────────────────────────────────
-
+# ─── Property Funnel — consistent cascade across all tabs ────────────
 def _render_property_funnel(
     n_total=None,
     n_api=None,
